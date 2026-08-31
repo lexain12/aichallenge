@@ -1,6 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 
 use terminal_size::{Width, terminal_size};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const RESET: &str = "\x1b[0m";
@@ -108,7 +109,7 @@ pub struct FullWidthBlock<'a, W: Write> {
     styled: bool,
     width: usize,
     column: usize,
-    line_text: String,
+    pending_grapheme: String,
     ansi_style: &'static str,
     last_was_newline: bool,
 }
@@ -129,11 +130,12 @@ impl<'a, W: Write> FullWidthBlock<'a, W> {
             styled,
             width,
             column: 0,
-            line_text: String::new(),
+            pending_grapheme: String::new(),
             ansi_style,
             last_was_newline: false,
         };
         block.write_text(prefix)?;
+        block.flush_pending_grapheme()?;
         block.writer.flush()?;
         Ok(block)
     }
@@ -164,37 +166,60 @@ impl<'a, W: Write> FullWidthBlock<'a, W> {
         for character in text.chars() {
             match character {
                 '\n' => {
+                    self.flush_pending_grapheme()?;
                     self.finish_line(true)?;
                     self.last_was_newline = true;
                 }
                 '\r' => {}
                 '\t' => {
+                    self.flush_pending_grapheme()?;
                     let spaces = 4 - self.column % 4;
                     for _ in 0..spaces {
-                        self.write_character(' ')?;
+                        self.write_grapheme(" ")?;
                     }
                 }
                 character if character.is_control() => {}
-                character => self.write_character(character)?,
+                character => self.queue_character(character)?,
             }
         }
         self.writer.flush()
     }
 
-    fn write_character(&mut self, character: char) -> io::Result<()> {
-        let previous_length = self.line_text.len();
-        self.line_text.push(character);
-        let mut new_width = UnicodeWidthStr::width(self.line_text.as_str());
+    fn queue_character(&mut self, character: char) -> io::Result<()> {
+        self.pending_grapheme.push(character);
+        let last_grapheme_start = self
+            .pending_grapheme
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(index, _)| index);
 
-        if new_width > self.width && previous_length > 0 {
-            self.line_text.truncate(previous_length);
+        if last_grapheme_start > 0 {
+            let completed = self.pending_grapheme[..last_grapheme_start].to_owned();
+            let pending = self.pending_grapheme[last_grapheme_start..].to_owned();
+            self.pending_grapheme = pending;
+            for grapheme in completed.graphemes(true) {
+                self.write_grapheme(grapheme)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_pending_grapheme(&mut self) -> io::Result<()> {
+        let pending = std::mem::take(&mut self.pending_grapheme);
+        for grapheme in pending.graphemes(true) {
+            self.write_grapheme(grapheme)?;
+        }
+        Ok(())
+    }
+
+    fn write_grapheme(&mut self, grapheme: &str) -> io::Result<()> {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if grapheme_width > 0 && self.column > 0 && self.column + grapheme_width > self.width {
             self.finish_line(true)?;
-            self.line_text.push(character);
-            new_width = UnicodeWidthStr::width(self.line_text.as_str());
         }
 
-        write!(self.writer, "{character}")?;
-        self.column = new_width.min(self.width);
+        write!(self.writer, "{grapheme}")?;
+        self.column = (self.column + grapheme_width).min(self.width);
         self.last_was_newline = false;
         Ok(())
     }
@@ -212,11 +237,11 @@ impl<'a, W: Write> FullWidthBlock<'a, W> {
             writeln!(self.writer)?;
         }
         self.column = 0;
-        self.line_text.clear();
         Ok(())
     }
 
     pub fn finish(mut self) -> io::Result<()> {
+        self.flush_pending_grapheme()?;
         if self.last_was_newline {
             if self.styled {
                 write!(self.writer, "{RESET}")?;
