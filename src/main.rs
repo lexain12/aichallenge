@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -6,6 +6,7 @@ use clap::Parser;
 use deepseek_cli::chat::{ChatHistory, InputAction, parse_input};
 use deepseek_cli::client::{ClientError, DeepSeekClient};
 use deepseek_cli::config::{Config, ConfigError};
+use deepseek_cli::terminal::{BlockStyle, TerminalUi};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -22,7 +23,14 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {error}");
+            let ui = TerminalUi::stderr();
+            let mut stderr = io::stderr();
+            if ui
+                .write_block(&mut stderr, BlockStyle::Error, &format!("error: {error}"))
+                .is_err()
+            {
+                eprintln!("error: {error}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -37,41 +45,45 @@ async fn run() -> Result<(), AppError> {
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    let stdout_ui = TerminalUi::stdout();
+    let stderr_ui = TerminalUi::stderr();
 
     loop {
-        write!(stdout, "you> ")?;
-        stdout.flush()?;
+        stdout_ui.write_input_prompt(&mut stdout)?;
 
         let Some(line) = lines.next_line().await? else {
-            writeln!(stdout)?;
+            stdout_ui.finish_empty_prompt(&mut stdout)?;
             break;
         };
+        stdout_ui.complete_input(&mut stdout, &line)?;
 
         match parse_input(&line) {
             InputAction::Ignore => {}
             InputAction::Exit => break,
             InputAction::Clear => {
                 history.clear();
-                writeln!(stdout, "Conversation cleared.")?;
+                stdout_ui.write_block(&mut stdout, BlockStyle::System, "Conversation cleared.")?;
             }
             InputAction::Send(user_message) => {
                 let request = history.request_messages(&user_message);
-                write!(stdout, "assistant> ")?;
-                stdout.flush()?;
+                let mut block =
+                    stdout_ui.start_block(&mut stdout, BlockStyle::Assistant, "assistant> ")?;
 
                 let result = client
-                    .stream_chat(&request, |fragment| {
-                        write!(stdout, "{fragment}")?;
-                        stdout.flush()
-                    })
+                    .stream_chat(&request, |fragment| block.write_text(fragment))
                     .await;
-                writeln!(stdout)?;
+                block.finish()?;
 
                 match result {
                     Ok(assistant_message) => {
                         history.commit_turn(user_message, assistant_message);
                     }
-                    Err(error) => eprintln!("error: {error}"),
+                    Err(error) => stderr_ui.write_block(
+                        &mut stderr,
+                        BlockStyle::Error,
+                        &format!("error: {error}"),
+                    )?,
                 }
             }
         }
