@@ -12,6 +12,7 @@ use crate::chat::Message;
 use crate::config::Config;
 
 const MAX_ERROR_BODY_BYTES: usize = 4096;
+const REDACTED: &str = "[REDACTED]";
 
 /// Direct HTTP client for DeepSeek Chat Completions.
 pub struct DeepSeekClient {
@@ -108,19 +109,39 @@ async fn read_error_body(
     response: reqwest::Response,
     api_key: &str,
 ) -> Result<String, ClientError> {
-    let mut bytes = Vec::with_capacity(MAX_ERROR_BODY_BYTES);
+    // Read enough overlap to recognize a key that starts just before the
+    // visible limit. Redaction happens before the body is bounded.
+    let read_limit = MAX_ERROR_BODY_BYTES.saturating_add(api_key.len().saturating_sub(1));
+    let mut bytes = Vec::with_capacity(read_limit);
     let mut stream = response.bytes_stream();
-    while bytes.len() < MAX_ERROR_BODY_BYTES {
+    while bytes.len() < read_limit {
         let Some(chunk) = stream.next().await else {
             break;
         };
         let chunk = chunk.map_err(ClientError::Request)?;
-        let remaining = MAX_ERROR_BODY_BYTES - bytes.len();
+        let remaining = read_limit - bytes.len();
         bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
 
-    let body = String::from_utf8_lossy(&bytes);
-    Ok(body.replace(api_key, "[REDACTED]"))
+    let mut body = String::from_utf8_lossy(&bytes).replace(api_key, REDACTED);
+    if body.len() > MAX_ERROR_BODY_BYTES {
+        let mut end = floor_char_boundary(&body, MAX_ERROR_BODY_BYTES);
+        if let Some((start, _)) = body
+            .match_indices(REDACTED)
+            .find(|(start, _)| *start < end && start + REDACTED.len() > end)
+        {
+            end = start + REDACTED.len();
+        }
+        body.truncate(end);
+    }
+    Ok(body)
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 #[derive(Serialize)]
@@ -140,10 +161,11 @@ struct StreamChunk {
 
 #[derive(Deserialize)]
 struct Choice {
+    #[serde(default)]
     delta: Delta,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct Delta {
     content: Option<String>,
 }

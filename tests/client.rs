@@ -88,6 +88,7 @@ async fn ignores_metadata_and_reasoning_only_chunks() {
         r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"private reasoning"},"finish_reason":null}]}"#,
         r#"data: {"choices":[{"index":0,"delta":{"content":null},"finish_reason":null}]}"#,
         r#"data: {"choices":[{"index":0,"delta":{"content":"Answer"},"finish_reason":"stop"}]}"#,
+        r#"data: {"choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#,
         "data: [DONE]",
     ]
     .join("\n\n")
@@ -187,6 +188,30 @@ async fn bounds_and_redacts_api_error_body() {
     assert!(error.contains("[REDACTED]"), "unexpected error: {error}");
     assert!(!error.contains(secret));
     assert!(!error.contains("THE-END"));
+    assert!(error.len() < 4300, "error body was not bounded");
+}
+
+#[tokio::test]
+async fn redacts_api_key_that_crosses_error_body_limit() {
+    let server = MockServer::start().await;
+    let secret = "secret-api-key";
+    let response_body = format!("{}{}after-key", "x".repeat(4090), secret);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(response_body))
+        .mount(&server)
+        .await;
+    let config = config_for(&server, secret);
+    let client = DeepSeekClient::new(&config).expect("create API client");
+
+    let error = client
+        .stream_chat(&request_messages(), |_| Ok(()))
+        .await
+        .expect_err("HTTP failure must be returned")
+        .to_string();
+
+    assert!(error.contains("[REDACTED]"), "unexpected error: {error}");
+    assert!(!error.contains("secret"), "key prefix leaked: {error}");
+    assert!(!error.contains("after-key"));
     assert!(error.len() < 4300, "error body was not bounded");
 }
 
