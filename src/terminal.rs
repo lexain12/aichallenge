@@ -1,7 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 
 use terminal_size::{Width, terminal_size};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 const RESET: &str = "\x1b[0m";
 const USER_STYLE: &str = "\x1b[48;2;20;45;80m\x1b[38;2;235;245;255m";
@@ -34,7 +34,7 @@ pub struct TerminalUi {
 
 impl TerminalUi {
     pub fn stdout() -> Self {
-        Self::new(io::stdout().is_terminal())
+        Self::new(io::stdout().is_terminal() && io::stdin().is_terminal())
     }
 
     pub fn stderr() -> Self {
@@ -42,8 +42,8 @@ impl TerminalUi {
     }
 
     fn new(is_terminal: bool) -> Self {
-        let color_allowed = std::env::var_os("NO_COLOR").is_none()
-            && std::env::var("TERM").is_ok_and(|term| term != "dumb");
+        let terminal_supports_color = !matches!(std::env::var("TERM").as_deref(), Ok("dumb"));
+        let color_allowed = std::env::var_os("NO_COLOR").is_none() && terminal_supports_color;
         Self {
             styled: is_terminal && color_allowed,
         }
@@ -64,7 +64,7 @@ impl TerminalUi {
         }
 
         let width = current_width();
-        let display_columns = visible_width("you> ") + visible_width(input);
+        let display_columns = visible_width(&format!("you> {input}"));
         let occupied_rows = display_columns.saturating_sub(1) / width + 1;
         write!(writer, "{RESET}\x1b[{occupied_rows}A\r")?;
 
@@ -108,8 +108,9 @@ pub struct FullWidthBlock<'a, W: Write> {
     styled: bool,
     width: usize,
     column: usize,
+    line_text: String,
     ansi_style: &'static str,
-    finished: bool,
+    last_was_newline: bool,
 }
 
 impl<'a, W: Write> FullWidthBlock<'a, W> {
@@ -128,8 +129,9 @@ impl<'a, W: Write> FullWidthBlock<'a, W> {
             styled,
             width,
             column: 0,
+            line_text: String::new(),
             ansi_style,
-            finished: false,
+            last_was_newline: false,
         };
         block.write_text(prefix)?;
         block.writer.flush()?;
@@ -138,36 +140,62 @@ impl<'a, W: Write> FullWidthBlock<'a, W> {
 
     pub fn write_text(&mut self, text: &str) -> io::Result<()> {
         if !self.styled {
-            write!(self.writer, "{text}")?;
+            for character in text.chars() {
+                match character {
+                    '\n' => {
+                        writeln!(self.writer)?;
+                        self.last_was_newline = true;
+                    }
+                    '\r' => {}
+                    '\t' => {
+                        write!(self.writer, "\t")?;
+                        self.last_was_newline = false;
+                    }
+                    character if character.is_control() => {}
+                    character => {
+                        write!(self.writer, "{character}")?;
+                        self.last_was_newline = false;
+                    }
+                }
+            }
             return self.writer.flush();
         }
 
         for character in text.chars() {
             match character {
-                '\n' => self.finish_line(true)?,
+                '\n' => {
+                    self.finish_line(true)?;
+                    self.last_was_newline = true;
+                }
                 '\r' => {}
                 '\t' => {
                     let spaces = 4 - self.column % 4;
                     for _ in 0..spaces {
-                        self.write_character(' ', 1)?;
+                        self.write_character(' ')?;
                     }
                 }
                 character if character.is_control() => {}
-                character => {
-                    let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-                    self.write_character(character, character_width)?;
-                }
+                character => self.write_character(character)?,
             }
         }
         self.writer.flush()
     }
 
-    fn write_character(&mut self, character: char, character_width: usize) -> io::Result<()> {
-        if character_width > 0 && self.column + character_width > self.width {
+    fn write_character(&mut self, character: char) -> io::Result<()> {
+        let previous_length = self.line_text.len();
+        self.line_text.push(character);
+        let mut new_width = UnicodeWidthStr::width(self.line_text.as_str());
+
+        if new_width > self.width && previous_length > 0 {
+            self.line_text.truncate(previous_length);
             self.finish_line(true)?;
+            self.line_text.push(character);
+            new_width = UnicodeWidthStr::width(self.line_text.as_str());
         }
+
         write!(self.writer, "{character}")?;
-        self.column = (self.column + character_width).min(self.width);
+        self.column = new_width.min(self.width);
+        self.last_was_newline = false;
         Ok(())
     }
 
@@ -184,13 +212,17 @@ impl<'a, W: Write> FullWidthBlock<'a, W> {
             writeln!(self.writer)?;
         }
         self.column = 0;
+        self.line_text.clear();
         Ok(())
     }
 
     pub fn finish(mut self) -> io::Result<()> {
-        if !self.finished {
+        if self.last_was_newline {
+            if self.styled {
+                write!(self.writer, "{RESET}")?;
+            }
+        } else {
             self.finish_line(false)?;
-            self.finished = true;
         }
         self.writer.flush()
     }
@@ -203,11 +235,13 @@ fn current_width() -> usize {
 }
 
 fn visible_width(text: &str) -> usize {
-    text.chars()
-        .map(|character| match character {
-            '\t' => 4,
-            character if character.is_control() => 0,
-            character => UnicodeWidthChar::width(character).unwrap_or(0),
-        })
-        .sum()
+    let mut printable = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\t' => printable.push_str("    "),
+            character if character.is_control() => {}
+            character => printable.push(character),
+        }
+    }
+    UnicodeWidthStr::width(printable.as_str())
 }
