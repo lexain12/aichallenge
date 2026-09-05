@@ -16,6 +16,12 @@ struct Args {
     /// Path to the TOML configuration file.
     #[arg(long, default_value = "deepseek.toml")]
     config: PathBuf,
+    /// Compare two answers; omit QUERY to enter queries interactively.
+    #[arg(long, num_args = 0..=1, value_name = "QUERY", conflicts_with = "unrestricted")]
+    compare: Option<Option<String>>,
+    /// Omit the system prompt and custom stops; use a 4096-token budget.
+    #[arg(long)]
+    unrestricted: bool,
 }
 
 #[tokio::main]
@@ -40,6 +46,15 @@ async fn run() -> Result<(), AppError> {
     let args = Args::parse();
     let env_api_key = std::env::var("DEEPSEEK_API_KEY").ok();
     let config = Config::load(&args.config, env_api_key)?;
+    let interactive_compare = args.compare.is_some();
+    if let Some(Some(query)) = args.compare {
+        return compare(&config, &query).await;
+    }
+    let config = if args.unrestricted {
+        config.unrestricted()
+    } else {
+        config
+    };
     let client = DeepSeekClient::new(&config)?;
     let mut history = ChatHistory::new(config.system_prompt().to_owned());
 
@@ -66,18 +81,36 @@ async fn run() -> Result<(), AppError> {
                 stdout_ui.write_block(&mut stdout, BlockStyle::System, "Conversation cleared.")?;
             }
             InputAction::Send(user_message) => {
+                if interactive_compare {
+                    if let Err(error) = compare(&config, &user_message).await {
+                        stderr_ui.write_block(
+                            &mut stderr,
+                            BlockStyle::Error,
+                            &format!("error: {error}"),
+                        )?;
+                    }
+                    continue;
+                }
                 let request = history.request_messages(&user_message);
                 let mut block =
                     stdout_ui.start_block(&mut stdout, BlockStyle::Assistant, "assistant> ")?;
 
                 let result = client
-                    .stream_chat(&request, |fragment| block.write_text(fragment))
+                    .stream_chat_detailed(&request, |fragment| block.write_text(fragment))
                     .await;
                 block.finish()?;
 
                 match result {
                     Ok(assistant_message) => {
-                        history.commit_turn(user_message, assistant_message);
+                        if assistant_message.finish_reason.as_deref() == Some("length") {
+                            stderr_ui.write_block(
+                                &mut stderr,
+                                BlockStyle::Error,
+                                "Ответ обрезан лимитом токенов; рецепт может быть неполным.",
+                            )?;
+                        } else {
+                            history.commit_turn(user_message, assistant_message.text);
+                        }
                     }
                     Err(error) => stderr_ui.write_block(
                         &mut stderr,
@@ -92,8 +125,59 @@ async fn run() -> Result<(), AppError> {
     Ok(())
 }
 
+async fn compare(config: &Config, query: &str) -> Result<(), AppError> {
+    if query.trim().is_empty() {
+        return Err(AppError::EmptyQuery);
+    }
+    let ui = TerminalUi::stdout();
+    let mut stdout = io::stdout();
+    ui.write_block(&mut stdout, BlockStyle::System, &format!("Запрос: {query}"))?;
+    for (label, settings) in [
+        ("Без ограничений формата", config.unrestricted()),
+        ("С ограничениями", config.clone()),
+    ] {
+        ui.write_block(
+            &mut stdout,
+            BlockStyle::System,
+            &format!(
+                "{label} (max_tokens={}, stop={:?})",
+                settings.max_tokens(),
+                settings.stop()
+            ),
+        )?;
+        let history = ChatHistory::new(settings.system_prompt().to_owned());
+        let client = DeepSeekClient::new(&settings)?;
+        let mut block = ui.start_block(&mut stdout, BlockStyle::Assistant, "assistant> ")?;
+        let result = client
+            .stream_chat_detailed(&history.request_messages(query), |fragment| {
+                block.write_text(fragment)
+            })
+            .await;
+        block.finish()?;
+        let answer = result?;
+        ui.write_block(
+            &mut stdout,
+            BlockStyle::System,
+            &format!(
+                "Слов: {}; символов: {}; finish_reason: {}{}",
+                answer.text.split_whitespace().count(),
+                answer.text.chars().count(),
+                answer.finish_reason.as_deref().unwrap_or("unknown"),
+                if answer.finish_reason.as_deref() == Some("length") {
+                    "; ответ обрезан лимитом токенов"
+                } else {
+                    ""
+                },
+            ),
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 enum AppError {
+    #[error("comparison query must not be blank")]
+    EmptyQuery,
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]

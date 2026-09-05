@@ -22,6 +22,7 @@ pub struct DeepSeekClient {
     model: String,
     temperature: f64,
     max_tokens: u32,
+    stop: Vec<String>,
 }
 
 impl DeepSeekClient {
@@ -43,14 +44,26 @@ impl DeepSeekClient {
             model: config.model().to_owned(),
             temperature: config.temperature(),
             max_tokens: config.max_tokens(),
+            stop: config.stop().to_vec(),
         })
     }
 
     pub async fn stream_chat<F>(
         &self,
         messages: &[Message],
-        mut on_text: F,
+        on_text: F,
     ) -> Result<String, ClientError>
+    where
+        F: FnMut(&str) -> io::Result<()>,
+    {
+        Ok(self.stream_chat_detailed(messages, on_text).await?.text)
+    }
+
+    pub async fn stream_chat_detailed<F>(
+        &self,
+        messages: &[Message],
+        mut on_text: F,
+    ) -> Result<ChatResponse, ClientError>
     where
         F: FnMut(&str) -> io::Result<()>,
     {
@@ -64,6 +77,8 @@ impl DeepSeekClient {
                 temperature: self.temperature,
                 max_tokens: self.max_tokens,
                 stream: true,
+                stop: &self.stop,
+                thinking: Thinking { r#type: "disabled" },
             })
             .send()
             .await
@@ -78,6 +93,7 @@ impl DeepSeekClient {
         let mut events = response.bytes_stream().eventsource();
         let mut answer = String::new();
         let mut saw_done = false;
+        let mut finish_reason = None;
         while let Some(event) = events.next().await {
             let event = event.map_err(|error| ClientError::Stream(error.to_string()))?;
             if event.data == "[DONE]" {
@@ -88,6 +104,9 @@ impl DeepSeekClient {
             let chunk: StreamChunk =
                 serde_json::from_str(&event.data).map_err(ClientError::Json)?;
             for choice in chunk.choices {
+                if choice.finish_reason.is_some() {
+                    finish_reason = choice.finish_reason;
+                }
                 if let Some(content) = choice.delta.content
                     && !content.is_empty()
                 {
@@ -98,11 +117,19 @@ impl DeepSeekClient {
         }
 
         if saw_done {
-            Ok(answer)
+            Ok(ChatResponse {
+                text: answer,
+                finish_reason,
+            })
         } else {
             Err(ClientError::IncompleteStream)
         }
     }
+}
+
+pub struct ChatResponse {
+    pub text: String,
+    pub finish_reason: Option<String>,
 }
 
 async fn read_error_body(
@@ -151,6 +178,14 @@ struct ChatRequest<'a> {
     temperature: f64,
     max_tokens: u32,
     stream: bool,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    stop: &'a [String],
+    thinking: Thinking,
+}
+
+#[derive(Serialize)]
+struct Thinking {
+    r#type: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -161,6 +196,7 @@ struct StreamChunk {
 
 #[derive(Deserialize)]
 struct Choice {
+    finish_reason: Option<String>,
     #[serde(default)]
     delta: Delta,
 }

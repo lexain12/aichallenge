@@ -20,9 +20,13 @@ fn applies_defaults_and_reads_file_key() {
     assert_eq!(config.api_key(), "file-key");
     assert_eq!(config.base_url().as_str(), "https://api.deepseek.com/");
     assert_eq!(config.model(), "deepseek-v4-flash");
-    assert_eq!(config.system_prompt(), "You are a helpful assistant.");
+    assert_eq!(
+        config.system_prompt(),
+        include_str!("../src/recipe_prompt.txt")
+    );
+    assert_eq!(config.stop(), ["Готово"]);
     assert_eq!(config.temperature(), 1.0);
-    assert_eq!(config.max_tokens(), 4096);
+    assert_eq!(config.max_tokens(), 1200);
     assert_eq!(config.timeout_seconds(), 120);
 }
 
@@ -150,4 +154,38 @@ fn reports_missing_config_path() {
 
     assert!(error.contains("read"));
     assert!(error.contains("deepseek.toml"));
+}
+
+#[test]
+fn validates_custom_stop_sequences() {
+    for stops in [
+        "[\"\"]".to_owned(),
+        "[\"  \"]".to_owned(),
+        format!("[{}]", vec!["\"end\""; 17].join(",")),
+    ] {
+        let file = write_config(&format!("api_key = \"key\"\nstop = {stops}"));
+        assert!(
+            Config::load(file.path(), None)
+                .unwrap_err()
+                .to_string()
+                .contains("stop")
+        );
+    }
+    let file = write_config("api_key = \"key\"\nstop = []");
+    assert!(Config::load(file.path(), None).unwrap().stop().is_empty());
+}
+
+#[test]
+fn unrestricted_preserves_connection_and_sampling_but_removes_controls() {
+    let file = write_config("api_key = \"key\"\ntemperature = 0.25");
+    let original = Config::load(file.path(), None).unwrap();
+    let baseline = original.unrestricted();
+    assert!(baseline.system_prompt().is_empty());
+    assert!(baseline.stop().is_empty());
+    assert_eq!(baseline.max_tokens(), 4096);
+    assert_eq!(baseline.model(), original.model());
+    assert_eq!(baseline.base_url(), original.base_url());
+    assert_eq!(baseline.api_key(), original.api_key());
+    assert_eq!(baseline.temperature(), original.temperature());
+    assert!(!original.stop().is_empty());
 }

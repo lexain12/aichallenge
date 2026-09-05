@@ -55,7 +55,9 @@ async fn streams_content_and_sends_expected_request() {
             ],
             "temperature": 0.5,
             "max_tokens": 128,
-            "stream": true
+            "stream": true,
+            "stop": ["Готово"],
+            "thinking": {"type": "disabled"}
         })))
         .respond_with(
             ResponseTemplate::new(200)

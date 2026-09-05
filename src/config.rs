@@ -8,9 +8,9 @@ use url::Url;
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
-const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+const DEFAULT_SYSTEM_PROMPT: &str = include_str!("recipe_prompt.txt");
 const DEFAULT_TEMPERATURE: f64 = 1.0;
-const DEFAULT_MAX_TOKENS: u32 = 4096;
+const DEFAULT_MAX_TOKENS: u32 = 1200;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 
 #[derive(Deserialize, Default)]
@@ -22,10 +22,12 @@ struct RawConfig {
     system_prompt: Option<String>,
     temperature: Option<f64>,
     max_tokens: Option<u32>,
+    stop: Option<Vec<String>>,
     timeout_seconds: Option<u64>,
 }
 
 /// Validated settings used by the API client.
+#[derive(Clone)]
 pub struct Config {
     api_key: String,
     base_url: Url,
@@ -33,6 +35,7 @@ pub struct Config {
     system_prompt: String,
     temperature: f64,
     max_tokens: u32,
+    stop: Vec<String>,
     timeout_seconds: u64,
 }
 
@@ -95,6 +98,14 @@ impl Config {
             });
         }
 
+        let stop = raw.stop.unwrap_or_else(|| vec!["Готово".to_owned()]);
+        if stop.len() > 16 || stop.iter().any(|sequence| sequence.trim().is_empty()) {
+            return Err(ConfigError::InvalidField {
+                field: "stop",
+                reason: "must contain at most 16 non-blank sequences",
+            });
+        }
+
         let timeout_seconds = raw.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
         if timeout_seconds == 0 {
             return Err(ConfigError::InvalidField {
@@ -112,6 +123,7 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned()),
             temperature,
             max_tokens,
+            stop,
             timeout_seconds,
         })
     }
@@ -140,6 +152,19 @@ impl Config {
         self.max_tokens
     }
 
+    pub fn stop(&self) -> &[String] {
+        &self.stop
+    }
+
+    /// Baseline for the same query without recipe instructions or custom stops.
+    pub fn unrestricted(&self) -> Self {
+        let mut config = self.clone();
+        config.system_prompt.clear();
+        config.stop.clear();
+        config.max_tokens = 4096;
+        config
+    }
+
     pub fn timeout_seconds(&self) -> u64 {
         self.timeout_seconds
     }
@@ -155,6 +180,7 @@ impl fmt::Debug for Config {
             .field("system_prompt", &self.system_prompt)
             .field("temperature", &self.temperature)
             .field("max_tokens", &self.max_tokens)
+            .field("stop", &self.stop)
             .field("timeout_seconds", &self.timeout_seconds)
             .finish()
     }
