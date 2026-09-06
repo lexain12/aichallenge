@@ -1,3 +1,5 @@
+mod day3;
+
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -16,6 +18,9 @@ struct Args {
     /// Path to the TOML configuration file.
     #[arg(long, default_value = "deepseek.toml")]
     config: PathBuf,
+    /// Open four terminal panels for the Day 3 reasoning experiment.
+    #[arg(long)]
+    day3: bool,
 }
 
 #[tokio::main]
@@ -40,6 +45,9 @@ async fn run() -> Result<(), AppError> {
     let args = Args::parse();
     let env_api_key = std::env::var("DEEPSEEK_API_KEY").ok();
     let config = Config::load(&args.config, env_api_key)?;
+    if args.day3 {
+        return day3::run(config).map_err(AppError::Tui);
+    }
     let client = DeepSeekClient::new(&config)?;
     let mut history = ChatHistory::new(config.system_prompt().to_owned());
 
@@ -94,6 +102,8 @@ async fn run() -> Result<(), AppError> {
 
 #[derive(Debug, Error)]
 enum AppError {
+    #[error("terminal interface failed: {0}")]
+    Tui(String),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]

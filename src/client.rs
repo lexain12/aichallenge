@@ -22,6 +22,7 @@ pub struct DeepSeekClient {
     model: String,
     temperature: f64,
     max_tokens: u32,
+    disable_thinking: bool,
 }
 
 impl DeepSeekClient {
@@ -43,7 +44,14 @@ impl DeepSeekClient {
             model: config.model().to_owned(),
             temperature: config.temperature(),
             max_tokens: config.max_tokens(),
+            disable_thinking: false,
         })
+    }
+
+    /// Keep the reasoning experiment in the same non-thinking API mode.
+    pub fn without_thinking(mut self) -> Self {
+        self.disable_thinking = true;
+        self
     }
 
     pub async fn stream_chat<F>(
@@ -53,6 +61,21 @@ impl DeepSeekClient {
     ) -> Result<String, ClientError>
     where
         F: FnMut(&str) -> io::Result<()>,
+    {
+        self.stream_chat_events(messages, |event| match event {
+            StreamEvent::Text(text) => on_text(text),
+            StreamEvent::Usage(_) => Ok(()),
+        })
+        .await
+    }
+
+    pub async fn stream_chat_events<F>(
+        &self,
+        messages: &[Message],
+        mut on_event: F,
+    ) -> Result<String, ClientError>
+    where
+        F: FnMut(StreamEvent<'_>) -> io::Result<()>,
     {
         let response = self
             .http
@@ -64,6 +87,12 @@ impl DeepSeekClient {
                 temperature: self.temperature,
                 max_tokens: self.max_tokens,
                 stream: true,
+                stream_options: StreamOptions {
+                    include_usage: true,
+                },
+                thinking: self
+                    .disable_thinking
+                    .then_some(Thinking { r#type: "disabled" }),
             })
             .send()
             .await
@@ -87,12 +116,19 @@ impl DeepSeekClient {
 
             let chunk: StreamChunk =
                 serde_json::from_str(&event.data).map_err(ClientError::Json)?;
+            if let Some(usage) = chunk.usage {
+                on_event(StreamEvent::Usage(usage)).map_err(ClientError::Output)?;
+            }
             for choice in chunk.choices {
+                let truncated = choice.finish_reason.as_deref() == Some("length");
                 if let Some(content) = choice.delta.content
                     && !content.is_empty()
                 {
-                    on_text(&content).map_err(ClientError::Output)?;
+                    on_event(StreamEvent::Text(&content)).map_err(ClientError::Output)?;
                     answer.push_str(&content);
+                }
+                if truncated {
+                    return Err(ClientError::Truncated);
                 }
             }
         }
@@ -151,16 +187,44 @@ struct ChatRequest<'a> {
     temperature: f64,
     max_tokens: u32,
     stream: bool,
+    stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Thinking>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+/// Provider-reported usage for one request; not an estimate from text length.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+pub enum StreamEvent<'a> {
+    Text(&'a str),
+    Usage(TokenUsage),
+}
+
+#[derive(Serialize)]
+struct Thinking {
+    r#type: &'static str,
 }
 
 #[derive(Deserialize)]
 struct StreamChunk {
+    usage: Option<TokenUsage>,
     #[serde(default)]
     choices: Vec<Choice>,
 }
 
 #[derive(Deserialize)]
 struct Choice {
+    finish_reason: Option<String>,
     #[serde(default)]
     delta: Delta,
 }
@@ -172,6 +236,10 @@ struct Delta {
 
 #[derive(Debug, Error)]
 pub enum ClientError {
+    #[error("ответ обрезан лимитом токенов; увеличьте max_tokens")]
+    Truncated,
+    #[error("модель вернула пустой ответ")]
+    EmptyAnswer,
     #[error("failed to build HTTP client")]
     Build(#[source] reqwest::Error),
     #[error("failed to construct API endpoint")]
