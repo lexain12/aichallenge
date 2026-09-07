@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 pub enum Mode {
     Reasoning,
     Temperatures,
+    Models,
 }
 
 pub const TEMPERATURES: [f64; 4] = [0.0, 0.7, 1.2, 1.0];
@@ -27,12 +28,13 @@ impl Mode {
     fn methods(self) -> [Method; 4] {
         match self {
             Self::Reasoning => Method::ALL,
-            Self::Temperatures => [Method::Direct; 4],
+            Self::Temperatures | Self::Models => [Method::Direct; 4],
         }
     }
 
     fn title(self) -> &'static str {
         match self {
+            Self::Models => "ДЕНЬ 5 · Сравнение моделей",
             Self::Reasoning => "ДЕНЬ 3 · Четыре способа решения",
             Self::Temperatures => "СРАВНЕНИЕ ТЕМПЕРАТУР · Один запрос, четыре ответа",
         }
@@ -60,6 +62,8 @@ struct Answer {
     method: Method,
     title: String,
     settings: String,
+    model: String,
+    rates: (Option<f64>, Option<f64>),
     prompt: String,
     text: String,
     status: String,
@@ -71,11 +75,25 @@ struct Answer {
 }
 
 impl Answer {
+    fn cost_summary(&self) -> String {
+        match (self.tokens.total(), self.rates) {
+            (Some(usage), (Some(input), Some(output))) => format!(
+                "Стоимость ≈ ${:.6} (по учтённым токенам, без скидок за кэш)",
+                (usage.prompt_tokens as f64 * input + usage.completion_tokens as f64 * output)
+                    / 1_000_000.0
+            ),
+            (None, _) => "Стоимость: нет данных API о токенах".into(),
+            _ => "Стоимость: тариф не задан (F3)".into(),
+        }
+    }
+
     fn new(method: Method) -> Self {
         Self {
             method,
             title: method.title().into(),
             settings: String::new(),
+            model: String::new(),
+            rates: (None, None),
             prompt: String::new(),
             text: String::new(),
             status: "Ожидание".into(),
@@ -93,7 +111,7 @@ enum Update {
     Finished(usize, Result<String, String>, f64),
 }
 
-const EDIT_FIELDS: [&str; 11] = [
+const EDIT_FIELDS: [&str; 14] = [
     "temperature",
     "model",
     "base_url",
@@ -105,6 +123,9 @@ const EDIT_FIELDS: [&str; 11] = [
     "stop",
     "thinking",
     "include_usage",
+    "enabled",
+    "input_usd_per_million",
+    "output_usd_per_million",
 ];
 
 struct ConfigEditor {
@@ -221,7 +242,9 @@ impl App {
     fn label_answers(&mut self) {
         for (index, answer) in self.answers.iter_mut().enumerate() {
             let config = &self.window_config.windows[index];
-            answer.title = if self.mode == Mode::Temperatures {
+            answer.title = if self.mode == Mode::Models {
+                format!("Панель {}", index + 1)
+            } else if self.mode == Mode::Temperatures {
                 format!(
                     "{}. temperature = {} · {}",
                     index + 1,
@@ -232,6 +255,12 @@ impl App {
                 format!("{} · {}", answer.method.title(), config.model)
             };
             answer.settings = config.public_summary();
+            answer.model = config.model.clone();
+            answer.rates = (config.input_usd_per_million, config.output_usd_per_million);
+            if !config.enabled {
+                answer.status = "Панель отключена".into();
+                answer.finished = true;
+            }
         }
     }
 
@@ -258,6 +287,13 @@ impl App {
                 serde_json::to_string(&w.stop).unwrap(),
                 w.thinking.clone().unwrap_or_default(),
                 w.include_usage.to_string(),
+                w.enabled.to_string(),
+                w.input_usd_per_million
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                w.output_usd_per_million
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
             ],
         });
     }
@@ -276,6 +312,20 @@ impl App {
                     .map_err(|_| format!("{}: введи число", EDIT_FIELDS[i]))
             };
             let settings = crate::window_config::WindowSettings {
+                enabled: v[11]
+                    .trim()
+                    .parse()
+                    .map_err(|_| "enabled: true или false")?,
+                input_usd_per_million: if v[12].trim().is_empty() {
+                    None
+                } else {
+                    Some(parse(12)?)
+                },
+                output_usd_per_million: if v[13].trim().is_empty() {
+                    None
+                } else {
+                    Some(parse(13)?)
+                },
                 temperature: parse(0)?,
                 model: v[1].trim().into(),
                 base_url: v[2].trim().into(),
@@ -463,6 +513,10 @@ impl App {
             10 => {
                 "true — запрашивать токены через stream_options; false — не отправлять этот параметр."
             }
+            11 => "false — не отправлять запрос из этой панели.",
+            12 | 13 => {
+                "USD за миллион токенов. Пусто — тариф неизвестен. Оценка без скидок за кэш; укажи актуальный тариф для времени запроса."
+            }
             _ => "Изменения действуют на следующий запрос. Esc — отменить.",
         };
         frame.render_widget(
@@ -489,6 +543,10 @@ impl App {
     }
 
     fn start(&mut self) {
+        if self.window_config.windows.iter().all(|w| !w.enabled) {
+            self.notice = "Включи хотя бы одну панель через F3".into();
+            return;
+        }
         self.task = self.input.trim().to_owned();
         self.answers = self.mode.answers();
         self.label_answers();
@@ -500,6 +558,9 @@ impl App {
         self.auto_saved = false;
         self.jobs.clear();
         for (index, method) in self.mode.methods().into_iter().enumerate() {
+            if !self.window_config.windows[index].enabled {
+                continue;
+            }
             let sender = self.sender.clone();
             let client = self.clients[index].clone();
             let task = self.task.clone();
@@ -748,6 +809,13 @@ impl App {
         } else {
             &answer.text
         };
+        let metrics = format!(
+            "Модель: {}\nВремя: {:.2} с\n{}\n{}",
+            answer.model,
+            seconds,
+            answer.tokens.summary(answer.method),
+            answer.cost_summary()
+        );
         let content = format!(
             "{} · Оценка: {}{}\n{}\n\n{}",
             answer.status,
@@ -757,7 +825,7 @@ impl App {
             } else {
                 ""
             },
-            answer.tokens.summary(answer.method),
+            metrics,
             text
         );
         let paragraph = Paragraph::new(content).wrap(Wrap { trim: false });
@@ -862,9 +930,10 @@ fn save_report(app: &App) -> io::Result<String> {
             VERDICTS[answer.verdict]
         ));
         report.push_str(&format!(
-            "{}\n\n{}\n\n",
+            "{}\n\n{}\n\n{}\n\n",
             answer.settings,
-            answer.tokens.summary(answer.method)
+            answer.tokens.summary(answer.method),
+            answer.cost_summary()
         ));
         if !answer.prompt.is_empty() {
             report.push_str(&format!(
@@ -882,6 +951,8 @@ fn save_report(app: &App) -> io::Result<String> {
     std::fs::create_dir_all("reports")?;
     let prefix = if app.mode == Mode::Reasoning {
         "day3"
+    } else if app.mode == Mode::Models {
+        "models"
     } else {
         "temperatures"
     };
@@ -1140,5 +1211,75 @@ mod tests {
         app.config_editor.as_mut().unwrap().values[0] = "0.9".into();
         app.editor_key(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(app.window_config.windows[2].temperature, 0.3);
+    }
+    #[tokio::test]
+    async fn models_send_only_enabled_panels_and_keep_cost_snapshot() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)
+            .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150}}\n\ndata: [DONE]\n\n"))
+            .expect(3).mount(&server).await;
+        let config = Config::from_toml("api_key = \"test\"", None).unwrap();
+        let mut app = App::new(&config, Mode::Models).unwrap();
+        let mut windows = WindowConfig::from_base(&config, [0.7; 4]);
+        for (i, w) in windows.windows.iter_mut().enumerate() {
+            w.base_url = server.uri();
+            w.model = format!("model-{i}");
+            w.enabled = i < 3;
+            w.input_usd_per_million = Some(1.0);
+            w.output_usd_per_million = Some(2.0);
+        }
+        app.apply_windows(windows).unwrap();
+        app.input = "Same question".into();
+        app.start();
+        app.auto_saved = true;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while app.running() {
+                app.drain();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.answers[3].status, "Панель отключена");
+        assert!(app.answers[3].tokens.total().is_none());
+        for answer in &app.answers[..3] {
+            assert!(answer.cost_summary().contains("$0.000200"));
+            assert!(answer.seconds > 0.0);
+        }
+        app.window_config.windows[0].input_usd_per_million = Some(900.0);
+        assert!(app.answers[0].cost_summary().contains("$0.000200"));
+        for request in server.received_requests().await.unwrap() {
+            let body: serde_json::Value = request.body_json().unwrap();
+            assert_eq!(body["messages"][0]["content"], "Same question");
+            assert!(body.get("enabled").is_none());
+            assert!(body.get("input_usd_per_million").is_none());
+        }
+        let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for label in ["Модель: model-0", "Время:", "всего 150", "$0.000200"] {
+            assert!(text.contains(label), "missing {label}");
+        }
+    }
+
+    #[test]
+    fn unknown_cost_is_not_zero_and_all_disabled_does_not_start() {
+        let config = Config::from_toml("api_key = \"test\"", None).unwrap();
+        let mut app = App::new(&config, Mode::Models).unwrap();
+        assert!(app.answers[0].cost_summary().contains("нет данных"));
+        for w in &mut app.window_config.windows {
+            w.enabled = false;
+        }
+        app.start();
+        assert!(app.started.is_none());
+        assert!(app.editing);
     }
 }

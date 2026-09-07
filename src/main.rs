@@ -20,11 +20,14 @@ struct Args {
     #[arg(long, default_value = "deepseek.toml")]
     config: PathBuf,
     /// Open four terminal panels for the Day 3 reasoning experiment.
-    #[arg(long, conflicts_with = "temperatures")]
+    #[arg(long, conflicts_with_all = ["temperatures", "models"])]
     day3: bool,
     /// Compare the same query at temperatures 0, 0.7, 1.2 and 1.0.
     #[arg(long)]
     temperatures: bool,
+    /// Compare models using independent panel configurations.
+    #[arg(long, conflicts_with = "temperatures")]
+    models: bool,
     /// Directory containing window-1.toml through window-4.toml.
     #[arg(long, alias = "panels-dir", default_value = "panels")]
     windows_config: PathBuf,
@@ -55,6 +58,9 @@ async fn run() -> Result<(), AppError> {
     if args.day3 {
         return day3::run(config, day3::Mode::Reasoning, args.windows_config)
             .map_err(AppError::Tui);
+    }
+    if args.models {
+        return day3::run(config, day3::Mode::Models, args.windows_config).map_err(AppError::Tui);
     }
     if args.temperatures {
         return day3::run(config, day3::Mode::Temperatures, args.windows_config)

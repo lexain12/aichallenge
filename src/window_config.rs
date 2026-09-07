@@ -9,6 +9,12 @@ use std::{
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WindowSettings {
+    #[serde(default = "default_usage")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_usd_per_million: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_usd_per_million: Option<f64>,
     pub api_key: String,
     pub base_url: String,
     pub model: String,
@@ -32,6 +38,9 @@ fn default_usage() -> bool {
 impl WindowSettings {
     pub fn from_base(base: &Config, temperature: f64) -> Self {
         Self {
+            enabled: true,
+            input_usd_per_million: None,
+            output_usd_per_million: None,
             api_key: base.api_key().into(),
             base_url: base.base_url().to_string(),
             model: base.model().into(),
@@ -46,11 +55,26 @@ impl WindowSettings {
         }
     }
     pub fn config(&self) -> Result<Config, String> {
-        let text = toml::to_string(self).map_err(|_| "Не удалось сериализовать настройки")?;
+        for rate in [self.input_usd_per_million, self.output_usd_per_million]
+            .into_iter()
+            .flatten()
+        {
+            if !rate.is_finite() || rate < 0.0 {
+                return Err("Тариф должен быть конечным неотрицательным числом".into());
+            }
+        }
+        let mut value =
+            toml::Value::try_from(self).map_err(|_| "Не удалось сериализовать настройки")?;
+        let table = value.as_table_mut().unwrap();
+        for field in ["enabled", "input_usd_per_million", "output_usd_per_million"] {
+            table.remove(field);
+        }
+        let text = toml::to_string(&value).map_err(|_| "Не удалось сериализовать настройки")?;
         Config::from_toml(&text, None).map_err(|e| e.to_string())
     }
     pub fn public_summary(&self) -> String {
-        format!("model={} · temperature={} · max_tokens={} · timeout={}s · top_p={:?} · stop={:?} · thinking={} · include_usage={}\nAPI: {}\nSystem prompt:\n{}",
+        format!("enabled={} · input_usd_per_million={:?} · output_usd_per_million={:?}\nmodel={} · temperature={} · max_tokens={} · timeout={}s · top_p={:?} · stop={:?} · thinking={} · include_usage={}\nAPI: {}\nSystem prompt:\n{}",
+            self.enabled, self.input_usd_per_million, self.output_usd_per_million,
             self.model, self.temperature, self.max_tokens, self.timeout_seconds, self.top_p, self.stop,
             self.thinking.as_deref().unwrap_or("не отправлять"), self.include_usage,
             self.base_url, self.system_prompt).replace(&self.api_key, "[REDACTED]")

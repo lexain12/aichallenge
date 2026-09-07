@@ -1,0 +1,16 @@
+# Day 5. Peak USD tariffs, 2026-09-07, no cache discounts.
+# https://api-docs.deepseek.com/quick_start/pricing/
+api_key = "YOUR_API_KEY"
+base_url = "https://api.deepseek.com/"
+model = "deepseek-v4-pro"
+system_prompt = ""
+temperature = 0.7
+max_tokens = 4096
+timeout_seconds = 180
+stop = []
+thinking = "disabled"
+include_usage = true
+
+enabled = true
+input_usd_per_million = 1.32
+output_usd_per_million = 3.96
