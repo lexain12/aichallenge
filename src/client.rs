@@ -23,6 +23,10 @@ pub struct DeepSeekClient {
     temperature: f64,
     max_tokens: u32,
     disable_thinking: bool,
+    thinking: Option<String>,
+    top_p: Option<f64>,
+    stop: Vec<String>,
+    include_usage: bool,
 }
 
 impl DeepSeekClient {
@@ -45,6 +49,10 @@ impl DeepSeekClient {
             temperature: config.temperature(),
             max_tokens: config.max_tokens(),
             disable_thinking: false,
+            thinking: config.thinking().map(str::to_owned),
+            top_p: config.top_p(),
+            stop: config.stop().to_vec(),
+            include_usage: config.include_usage(),
         })
     }
 
@@ -87,12 +95,18 @@ impl DeepSeekClient {
                 temperature: self.temperature,
                 max_tokens: self.max_tokens,
                 stream: true,
-                stream_options: StreamOptions {
+                stream_options: self.include_usage.then_some(StreamOptions {
                     include_usage: true,
+                }),
+                thinking: if self.disable_thinking {
+                    Some(Thinking { r#type: "disabled" })
+                } else {
+                    self.thinking
+                        .as_deref()
+                        .map(|value| Thinking { r#type: value })
                 },
-                thinking: self
-                    .disable_thinking
-                    .then_some(Thinking { r#type: "disabled" }),
+                top_p: self.top_p,
+                stop: &self.stop,
             })
             .send()
             .await
@@ -187,9 +201,14 @@ struct ChatRequest<'a> {
     temperature: f64,
     max_tokens: u32,
     stream: bool,
-    stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<Thinking>,
+    stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    stop: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Thinking<'a>>,
 }
 
 #[derive(Serialize)]
@@ -211,8 +230,8 @@ pub enum StreamEvent<'a> {
 }
 
 #[derive(Serialize)]
-struct Thinking {
-    r#type: &'static str,
+struct Thinking<'a> {
+    r#type: &'a str,
 }
 
 #[derive(Deserialize)]

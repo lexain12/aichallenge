@@ -1,0 +1,12 @@
+api_key = "replace-with-your-key"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+system_prompt = ""
+temperature = 1
+max_tokens = 4096
+timeout_seconds = 120
+# top_p = 0.9
+stop = []
+# Remove thinking for APIs that do not support it.
+thinking = "disabled"
+include_usage = true

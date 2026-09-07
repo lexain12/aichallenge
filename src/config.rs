@@ -23,9 +23,14 @@ struct RawConfig {
     temperature: Option<f64>,
     max_tokens: Option<u32>,
     timeout_seconds: Option<u64>,
+    top_p: Option<f64>,
+    stop: Option<Vec<String>>,
+    thinking: Option<String>,
+    include_usage: Option<bool>,
 }
 
 /// Validated settings used by the API client.
+#[derive(Clone)]
 pub struct Config {
     api_key: String,
     base_url: Url,
@@ -34,6 +39,10 @@ pub struct Config {
     temperature: f64,
     max_tokens: u32,
     timeout_seconds: u64,
+    top_p: Option<f64>,
+    stop: Vec<String>,
+    thinking: Option<String>,
+    include_usage: bool,
 }
 
 impl Config {
@@ -43,8 +52,12 @@ impl Config {
             path: path.to_owned(),
             source,
         })?;
+        Self::from_toml(&contents, env_api_key)
+    }
+
+    pub fn from_toml(contents: &str, env_api_key: Option<String>) -> Result<Self, ConfigError> {
         let raw: RawConfig =
-            toml::from_str(&contents).map_err(|source| ConfigError::Parse { source })?;
+            toml::from_str(contents).map_err(|source| ConfigError::Parse { source })?;
         Self::from_raw(raw, env_api_key)
     }
 
@@ -103,7 +116,34 @@ impl Config {
             });
         }
 
+        if raw.top_p.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+            return Err(ConfigError::InvalidField {
+                field: "top_p",
+                reason: "must be between 0 and 1",
+            });
+        }
+        let stop = raw.stop.unwrap_or_default();
+        if stop.len() > 16 || stop.iter().any(|s| s.is_empty()) {
+            return Err(ConfigError::InvalidField {
+                field: "stop",
+                reason: "at most 16 non-empty strings",
+            });
+        }
+        if raw
+            .thinking
+            .as_deref()
+            .is_some_and(|s| !matches!(s, "enabled" | "disabled"))
+        {
+            return Err(ConfigError::InvalidField {
+                field: "thinking",
+                reason: "must be enabled or disabled, or omitted",
+            });
+        }
         Ok(Self {
+            top_p: raw.top_p,
+            stop,
+            thinking: raw.thinking,
+            include_usage: raw.include_usage.unwrap_or(true),
             api_key,
             base_url,
             model,
@@ -114,6 +154,19 @@ impl Config {
             max_tokens,
             timeout_seconds,
         })
+    }
+
+    pub fn top_p(&self) -> Option<f64> {
+        self.top_p
+    }
+    pub fn stop(&self) -> &[String] {
+        &self.stop
+    }
+    pub fn thinking(&self) -> Option<&str> {
+        self.thinking.as_deref()
+    }
+    pub fn include_usage(&self) -> bool {
+        self.include_usage
     }
 
     pub fn api_key(&self) -> &str {
@@ -130,6 +183,17 @@ impl Config {
 
     pub fn system_prompt(&self) -> &str {
         &self.system_prompt
+    }
+
+    pub fn with_temperature(mut self, temperature: f64) -> Result<Self, ConfigError> {
+        if !(0.0..=2.0).contains(&temperature) {
+            return Err(ConfigError::InvalidField {
+                field: "temperature",
+                reason: "must be between 0 and 2",
+            });
+        }
+        self.temperature = temperature;
+        Ok(self)
     }
 
     pub fn temperature(&self) -> f64 {

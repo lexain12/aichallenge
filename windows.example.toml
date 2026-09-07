@@ -1,0 +1,13 @@
+# Порядок секций соответствует панелям 1–4.
+# F3 или кнопка «Настройки» открывает редактор в терминале.
+[[windows]]
+temperature = 0.0
+
+[[windows]]
+temperature = 0.7
+
+[[windows]]
+temperature = 1.2
+
+[[windows]]
+temperature = 1.0

@@ -1,3 +1,11 @@
 /target
 /deepseek.toml
 /.worktrees
+
+/windows.toml
+
+/panels/
+
+/panels-day5/
+
+/reports/*.md

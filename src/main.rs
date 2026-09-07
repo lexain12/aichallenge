@@ -1,4 +1,5 @@
 mod day3;
+mod window_config;
 
 use std::io;
 use std::path::PathBuf;
@@ -19,8 +20,14 @@ struct Args {
     #[arg(long, default_value = "deepseek.toml")]
     config: PathBuf,
     /// Open four terminal panels for the Day 3 reasoning experiment.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "temperatures")]
     day3: bool,
+    /// Compare the same query at temperatures 0, 0.7, 1.2 and 1.0.
+    #[arg(long)]
+    temperatures: bool,
+    /// Directory containing window-1.toml through window-4.toml.
+    #[arg(long, alias = "panels-dir", default_value = "panels")]
+    windows_config: PathBuf,
 }
 
 #[tokio::main]
@@ -46,7 +53,12 @@ async fn run() -> Result<(), AppError> {
     let env_api_key = std::env::var("DEEPSEEK_API_KEY").ok();
     let config = Config::load(&args.config, env_api_key)?;
     if args.day3 {
-        return day3::run(config).map_err(AppError::Tui);
+        return day3::run(config, day3::Mode::Reasoning, args.windows_config)
+            .map_err(AppError::Tui);
+    }
+    if args.temperatures {
+        return day3::run(config, day3::Mode::Temperatures, args.windows_config)
+            .map_err(AppError::Tui);
     }
     let client = DeepSeekClient::new(&config)?;
     let mut history = ChatHistory::new(config.system_prompt().to_owned());

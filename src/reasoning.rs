@@ -107,9 +107,19 @@ pub async fn solve(
     client: &DeepSeekClient,
     task: &str,
     method: Method,
+    emit: impl FnMut(Event),
+) -> Result<String, ClientError> {
+    solve_with_system(client, task, method, "", emit).await
+}
+
+pub async fn solve_with_system(
+    client: &DeepSeekClient,
+    task: &str,
+    method: Method,
+    system_prompt: &str,
     mut emit: impl FnMut(Event),
 ) -> Result<String, ClientError> {
-    let history = ChatHistory::new(String::new());
+    let history = ChatHistory::new(system_prompt.to_owned());
     let phase = if method == Method::GeneratedPrompt {
         Phase::Prompt
     } else {
