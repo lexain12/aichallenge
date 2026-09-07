@@ -8,3 +8,6 @@
 /panels-day5/
 
 /reports/*.md
+
+/target
+/.worktrees
