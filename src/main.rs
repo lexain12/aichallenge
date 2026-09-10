@@ -1,13 +1,11 @@
-mod day3;
-mod window_config;
-
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use deepseek_cli::chat::{ChatHistory, InputAction, parse_input};
-use deepseek_cli::client::{ClientError, DeepSeekClient};
+use deepseek_cli::agent::Agent;
+use deepseek_cli::chat::{InputAction, parse_input};
+use deepseek_cli::client::{ClientError, StreamEvent};
 use deepseek_cli::config::{Config, ConfigError};
 use deepseek_cli::terminal::{BlockStyle, TerminalUi};
 use thiserror::Error;
@@ -19,18 +17,6 @@ struct Args {
     /// Path to the TOML configuration file.
     #[arg(long, default_value = "deepseek.toml")]
     config: PathBuf,
-    /// Open four terminal panels for the Day 3 reasoning experiment.
-    #[arg(long, conflicts_with_all = ["temperatures", "models"])]
-    day3: bool,
-    /// Compare the same query at temperatures 0, 0.7, 1.2 and 1.0.
-    #[arg(long)]
-    temperatures: bool,
-    /// Compare models using independent panel configurations.
-    #[arg(long, conflicts_with = "temperatures")]
-    models: bool,
-    /// Directory containing window-1.toml through window-4.toml.
-    #[arg(long, alias = "panels-dir", default_value = "panels")]
-    windows_config: PathBuf,
 }
 
 #[tokio::main]
@@ -55,19 +41,7 @@ async fn run() -> Result<(), AppError> {
     let args = Args::parse();
     let env_api_key = std::env::var("DEEPSEEK_API_KEY").ok();
     let config = Config::load(&args.config, env_api_key)?;
-    if args.day3 {
-        return day3::run(config, day3::Mode::Reasoning, args.windows_config)
-            .map_err(AppError::Tui);
-    }
-    if args.models {
-        return day3::run(config, day3::Mode::Models, args.windows_config).map_err(AppError::Tui);
-    }
-    if args.temperatures {
-        return day3::run(config, day3::Mode::Temperatures, args.windows_config)
-            .map_err(AppError::Tui);
-    }
-    let client = DeepSeekClient::new(&config)?;
-    let mut history = ChatHistory::new(config.system_prompt().to_owned());
+    let mut agent = Agent::new(&config)?;
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = io::stdout();
@@ -88,23 +62,23 @@ async fn run() -> Result<(), AppError> {
             InputAction::Ignore => {}
             InputAction::Exit => break,
             InputAction::Clear => {
-                history.clear();
+                agent.clear_history();
                 stdout_ui.write_block(&mut stdout, BlockStyle::System, "Conversation cleared.")?;
             }
             InputAction::Send(user_message) => {
-                let request = history.request_messages(&user_message);
                 let mut block =
                     stdout_ui.start_block(&mut stdout, BlockStyle::Assistant, "assistant> ")?;
 
-                let result = client
-                    .stream_chat(&request, |fragment| block.write_text(fragment))
+                let result = agent
+                    .run_streaming(&user_message, |event| match event {
+                        StreamEvent::Text(fragment) => block.write_text(fragment),
+                        StreamEvent::Usage(_) => Ok(()),
+                    })
                     .await;
                 block.finish()?;
 
                 match result {
-                    Ok(assistant_message) => {
-                        history.commit_turn(user_message, assistant_message);
-                    }
+                    Ok(_) => {}
                     Err(error) => stderr_ui.write_block(
                         &mut stderr,
                         BlockStyle::Error,
@@ -120,8 +94,6 @@ async fn run() -> Result<(), AppError> {
 
 #[derive(Debug, Error)]
 enum AppError {
-    #[error("terminal interface failed: {0}")]
-    Tui(String),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]

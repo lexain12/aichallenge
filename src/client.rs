@@ -15,6 +15,7 @@ const MAX_ERROR_BODY_BYTES: usize = 4096;
 const REDACTED: &str = "[REDACTED]";
 
 /// Direct HTTP client for DeepSeek Chat Completions.
+#[derive(Clone)]
 pub struct DeepSeekClient {
     http: reqwest::Client,
     endpoint: Url,

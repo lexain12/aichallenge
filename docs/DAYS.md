@@ -10,10 +10,11 @@
 | `Day-3` | Четыре способа решения, панели ratatui, сумма токенов двойного промпта | `cargo run -- --day3` |
 | `Day-4` | Сравнение температур, отдельные конфиги и редактор панелей | `cargo run -- --temperatures` |
 | `Day-5` | Сравнение моделей, время, токены и оценка стоимости | `cargo run -- --models --panels-dir panels-day5` |
+| `Day-6` | Класс агента: вызовы API, промпты и собственная история диалога | `cargo run` |
 
 ```bash
-git switch Day-5
-cargo run -- --models --panels-dir panels-day5
+git switch Day-6
+cargo run
 ```
 
 На новой копии репозитория сначала создай `deepseek.toml` из
@@ -22,7 +23,7 @@ cargo run -- --models --panels-dir panels-day5
 в каждом файле. На Day 4 файлы `panels/` создаются при первом запуске.
 
 `main` — навигация по заданиям. Day 2 и Day 3 развиваются от Day 1;
-Day 4 продолжает Day 3, Day 5 продолжает Day 4. Поздние дни могут сохранять
+Day 4 продолжает Day 3, Day 5 продолжает Day 4, Day 6 продолжает Day 5. Поздние дни могут сохранять
 режимы предыдущих дней, но соответствующая ветка фиксирует свой этап.
 
 Локальные `deepseek.toml`, `windows.toml`, `panels/`, `panels-day5/` и новые
