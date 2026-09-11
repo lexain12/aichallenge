@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use deepseek_cli::agent::Agent;
-use deepseek_cli::chat::{InputAction, parse_input};
+use deepseek_cli::agent::{Agent, AgentError};
+use deepseek_cli::chat::{InputAction, Role, parse_input};
 use deepseek_cli::client::{ClientError, StreamEvent};
 use deepseek_cli::config::{Config, ConfigError};
+use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::terminal::{BlockStyle, TerminalUi};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -17,6 +18,18 @@ struct Args {
     /// Path to the TOML configuration file.
     #[arg(long, default_value = "deepseek.toml")]
     config: PathBuf,
+    /// SQLite database containing saved dialogs.
+    #[arg(long, default_value = "dialogs.sqlite3")]
+    db: PathBuf,
+    /// Continue the dialog with the most recent saved message.
+    #[arg(long, conflicts_with_all = ["resume", "list_dialogs"])]
+    resume_last: bool,
+    /// Continue a saved dialog by ID.
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..), conflicts_with = "list_dialogs")]
+    resume: Option<i64>,
+    /// List saved dialogs without calling the API or loading its configuration.
+    #[arg(long)]
+    list_dialogs: bool,
 }
 
 #[tokio::main]
@@ -39,14 +52,68 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), AppError> {
     let args = Args::parse();
+    let store = DialogStore::open(&args.db)?;
+    let mut stdout = io::stdout();
+    let stdout_ui = TerminalUi::stdout();
+    if args.list_dialogs {
+        let dialogs = store.list()?;
+        if dialogs.is_empty() {
+            stdout_ui.write_block(&mut stdout, BlockStyle::System, "No saved dialogs.")?;
+        } else {
+            stdout_ui.write_block(
+                &mut stdout,
+                BlockStyle::System,
+                "ID | Updated (UTC) | Messages | First message",
+            )?;
+            for dialog in dialogs {
+                let title = dialog
+                    .title
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                stdout_ui.write_block(
+                    &mut stdout,
+                    BlockStyle::System,
+                    &format!(
+                        "{} | {} | {} | {}",
+                        dialog.id, dialog.updated_at, dialog.message_count, title
+                    ),
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    let resume = if args.resume_last {
+        Some(store.latest_id()?.ok_or(AppError::NoDialogs)?)
+    } else {
+        args.resume
+    };
     let env_api_key = std::env::var("DEEPSEEK_API_KEY").ok();
     let config = Config::load(&args.config, env_api_key)?;
-    let mut agent = Agent::new(&config)?;
+    let mut agent = match resume {
+        Some(id) => Agent::from_dialog(&config, store, id)?,
+        None => Agent::with_store(&config, store)?,
+    };
+    if let Some(id) = resume {
+        stdout_ui.write_block(
+            &mut stdout,
+            BlockStyle::System,
+            &format!("Resumed dialog #{id}."),
+        )?;
+        for message in agent.history().messages() {
+            let (style, prefix) = match message.role() {
+                Role::User => (BlockStyle::User, "you> "),
+                Role::Assistant => (BlockStyle::Assistant, "assistant> "),
+                Role::System => (BlockStyle::System, "system> "),
+            };
+            let mut block = stdout_ui.start_block(&mut stdout, style, prefix)?;
+            block.write_text(message.content())?;
+            block.finish()?;
+        }
+    }
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = io::stdout();
     let mut stderr = io::stderr();
-    let stdout_ui = TerminalUi::stdout();
     let stderr_ui = TerminalUi::stderr();
 
     loop {
@@ -79,6 +146,8 @@ async fn run() -> Result<(), AppError> {
 
                 match result {
                     Ok(_) => {}
+                    // Stop on persistence errors: never continue an unsaved session silently.
+                    Err(error @ AgentError::Store(_)) => return Err(error.into()),
                     Err(error) => stderr_ui.write_block(
                         &mut stderr,
                         BlockStyle::Error,
@@ -94,6 +163,12 @@ async fn run() -> Result<(), AppError> {
 
 #[derive(Debug, Error)]
 enum AppError {
+    #[error("no saved dialogs; start a new chat without --resume-last")]
+    NoDialogs,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Agent(#[from] AgentError),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]

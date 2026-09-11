@@ -4,4 +4,5 @@ pub mod agent;
 pub mod chat;
 pub mod client;
 pub mod config;
+pub mod dialog;
 pub mod terminal;

@@ -12,6 +12,7 @@ const ERROR_STYLE: &str = "\x1b[48;2;90;25;25m\x1b[38;2;255;235;235m";
 
 #[derive(Clone, Copy)]
 pub enum BlockStyle {
+    User,
     Assistant,
     System,
     Error,
@@ -20,6 +21,7 @@ pub enum BlockStyle {
 impl BlockStyle {
     fn ansi(self) -> &'static str {
         match self {
+            Self::User => USER_STYLE,
             Self::Assistant => ASSISTANT_STYLE,
             Self::System => SYSTEM_STYLE,
             Self::Error => ERROR_STYLE,

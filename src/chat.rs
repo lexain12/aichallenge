@@ -17,7 +17,7 @@ pub struct Message {
 }
 
 impl Message {
-    fn new(role: Role, content: String) -> Self {
+    pub(crate) fn new(role: Role, content: String) -> Self {
         Self { role, content }
     }
 
@@ -49,13 +49,31 @@ pub fn parse_input(input: &str) -> InputAction {
     }
 }
 
-/// Committed turns from the current process only.
+/// Ordered dialog messages, optionally restored from persistent storage.
 pub struct ChatHistory {
     system_message: Option<Message>,
     messages: Vec<Message>,
 }
 
 impl ChatHistory {
+    pub(crate) fn from_messages(system_prompt: String, messages: Vec<Message>) -> Self {
+        let mut history = Self::new(system_prompt);
+        history.messages = messages;
+        history
+    }
+
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    pub(crate) fn system_prompt(&self) -> &str {
+        self.system_message.as_ref().map_or("", Message::content)
+    }
+
+    pub(crate) fn push(&mut self, role: Role, content: String) {
+        self.messages.push(Message::new(role, content));
+    }
+
     pub fn new(system_prompt: String) -> Self {
         let system_message = if system_prompt.trim().is_empty() {
             None
@@ -92,6 +110,9 @@ impl ChatHistory {
     }
 
     pub fn turn_count(&self) -> usize {
-        self.messages.len() / 2
+        self.messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .count()
     }
 }
