@@ -6,6 +6,7 @@ fn recognizes_commands_and_ignores_blank_input() {
     assert_eq!(parse_input("/exit"), InputAction::Exit);
     assert_eq!(parse_input(" /quit "), InputAction::Exit);
     assert_eq!(parse_input("/clear"), InputAction::Clear);
+    assert_eq!(parse_input(" /stats "), InputAction::Stats);
     assert_eq!(
         parse_input(" hello world "),
         InputAction::Send("hello world".into())

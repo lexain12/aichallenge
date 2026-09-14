@@ -144,21 +144,74 @@ async fn run() -> Result<(), AppError> {
                 agent.clear_history();
                 stdout_ui.write_block(&mut stdout, BlockStyle::System, "Conversation cleared.")?;
             }
+            InputAction::Stats => {
+                stdout_ui.write_context_stats(&mut stdout, agent.context_stats())?;
+            }
             InputAction::Send(user_message) => {
                 show_usage = true;
-                let mut block = stdout_ui.start_response(&mut stdout)?;
+                let mut block = Some(stdout_ui.start_response(&mut stdout)?);
+                let mut deferred_warnings = Vec::new();
 
                 let result = agent
                     .run_streaming(&user_message, |event| match event {
-                        AgentEvent::Text(fragment) => block.write_text(fragment),
-                        AgentEvent::Usage(_)
-                        | AgentEvent::CompactionStarted { .. }
-                        | AgentEvent::CompactionCompleted { .. }
-                        | AgentEvent::CompactionFailed { .. }
-                        | AgentEvent::DebugLogFailed { .. } => Ok(()),
+                        AgentEvent::Text(fragment) => block
+                            .as_mut()
+                            .expect("compaction starts after ordinary response text")
+                            .write_text(fragment),
+                        AgentEvent::Usage(_) => Ok(()),
+                        AgentEvent::CompactionStarted {
+                            covered_message_count,
+                            kept_message_count,
+                            ..
+                        } => {
+                            if let Some(response) = block.take() {
+                                response.finish()?;
+                            }
+                            if stderr_ui.is_interactive() {
+                                stderr_ui.write_status(
+                                    &mut stderr,
+                                    &format!(
+                                        "Контекст · сжимаю до {covered_message_count}, оставляю {kept_message_count} сообщений"
+                                    ),
+                                )?;
+                            }
+                            Ok(())
+                        }
+                        AgentEvent::CompactionCompleted {
+                            covered_message_count,
+                            ..
+                        } => {
+                            if stderr_ui.is_interactive() {
+                                stderr_ui.write_status(
+                                    &mut stderr,
+                                    &format!(
+                                        "Контекст · summary обновлено до сообщения {covered_message_count}"
+                                    ),
+                                )?;
+                            }
+                            Ok(())
+                        }
+                        AgentEvent::CompactionFailed { error } => stderr_ui.write_block(
+                            &mut stderr,
+                            BlockStyle::Error,
+                            &format!("context compaction failed: {error}"),
+                        ),
+                        AgentEvent::DebugLogFailed { error } => {
+                            if block.is_some() {
+                                deferred_warnings.push(error);
+                                Ok(())
+                            } else {
+                                stderr_ui.write_block(&mut stderr, BlockStyle::Error, &error)
+                            }
+                        }
                     })
                     .await;
-                block.finish()?;
+                if let Some(response) = block.take() {
+                    response.finish()?;
+                }
+                for warning in deferred_warnings {
+                    stderr_ui.write_block(&mut stderr, BlockStyle::Error, &warning)?;
+                }
 
                 match result {
                     Ok(_) => {}

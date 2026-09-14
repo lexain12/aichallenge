@@ -57,6 +57,7 @@ pub enum InputAction {
     Ignore,
     Exit,
     Clear,
+    Stats,
     Send(String),
 }
 
@@ -66,6 +67,7 @@ pub fn parse_input(input: &str) -> InputAction {
         "" => InputAction::Ignore,
         "/exit" | "/quit" => InputAction::Exit,
         "/clear" => InputAction::Clear,
+        "/stats" => InputAction::Stats,
         message => InputAction::Send(message.to_owned()),
     }
 }

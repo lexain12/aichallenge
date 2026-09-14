@@ -1,12 +1,14 @@
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 
 use deepseek_cli::dialog::DialogStore;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn write_config(base_url: &str) -> NamedTempFile {
     let mut file = NamedTempFile::new().expect("create temporary config");
@@ -21,6 +23,56 @@ timeout_seconds = 5
     )
     .expect("write temporary config");
     file
+}
+
+fn write_compression_config(base_url: &str) -> NamedTempFile {
+    let mut file = NamedTempFile::new().expect("create temporary config");
+    write!(
+        file,
+        r#"
+api_key = "test-key"
+base_url = "{base_url}"
+model = "test-model"
+timeout_seconds = 5
+
+[context]
+enabled = true
+compact_after_prompt_tokens = 3
+keep_last_messages = 2
+summary_max_tokens = 64
+"#
+    )
+    .unwrap();
+    file
+}
+
+#[derive(Clone)]
+struct SequenceResponder {
+    responses: Arc<Mutex<VecDeque<ResponseTemplate>>>,
+}
+
+impl Respond for SequenceResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected extra request")
+    }
+}
+
+fn sse(answer: &str, prompt: u64, completion: u64, total: u64) -> ResponseTemplate {
+    let chunk = json!({
+        "choices": [{"delta": {"content": answer}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total
+        }
+    });
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n"))
 }
 
 fn run_cli(config_path: &Path, input: &str) -> Output {
@@ -78,6 +130,57 @@ async fn shows_one_final_usage_line_for_multiple_messages_and_restored_dialog() 
     assert_eq!(stdout.matches("Токены").count(), 1);
     assert!(stdout.ends_with(&format!("{footer}\n")));
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_report_persisted_compression_without_making_an_api_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(
+                [
+                    sse("a1", 2, 1, 3),
+                    sse("a2", 4, 2, 6),
+                    sse("summary", 7, 2, 9),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        })
+        .mount(&server)
+        .await;
+    let config = write_compression_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+
+    let output = run_cli_args(config.path(), &database, &[], "u1\nu2\n/stats\n/exit\n");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Контекст · полная история: 4 · покрыто summary: 2 · дословно: 2"));
+    assert!(stdout.contains("Ответы · вход: 6 · выход: 3 · всего: 9"));
+    assert!(stdout.contains("Сжатие · вход: 7 · выход: 2 · всего: 9"));
+    assert!(stdout.contains("API всего · 18"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+
+    let resumed = run_cli_args(
+        config.path(),
+        &database,
+        &["--resume-last"],
+        "/stats\n/exit\n",
+    );
+    assert!(resumed.status.success());
+    let resumed_stdout = String::from_utf8(resumed.stdout).unwrap();
+    assert!(
+        resumed_stdout.contains("Контекст · полная история: 4 · покрыто summary: 2 · дословно: 2")
+    );
+    assert!(resumed_stdout.contains("API всего · 18"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

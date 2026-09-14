@@ -1,6 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 
 use crate::client::TokenUsage;
+use crate::context::{ContextStats, UsageTotals};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use terminal_size::{Height, Width, terminal_size};
 use unicode_segmentation::UnicodeSegmentation;
@@ -115,6 +116,42 @@ impl TerminalUi {
         self.write_status(writer, &text)
     }
 
+    pub fn write_context_stats<W: Write>(
+        &self,
+        writer: &mut W,
+        stats: ContextStats,
+    ) -> io::Result<()> {
+        self.write_block(
+            writer,
+            BlockStyle::System,
+            &format!(
+                "Контекст · полная история: {} · покрыто summary: {} · дословно: {}",
+                stats.full_message_count, stats.covered_message_count, stats.raw_message_count
+            ),
+        )?;
+        self.write_block(
+            writer,
+            BlockStyle::System,
+            &format_usage_totals("Ответы", stats.ordinary_usage),
+        )?;
+        self.write_block(
+            writer,
+            BlockStyle::System,
+            &format_usage_totals("Сжатие", stats.compaction_usage),
+        )?;
+        self.write_block(
+            writer,
+            BlockStyle::System,
+            &format!(
+                "API всего · {}",
+                stats
+                    .ordinary_usage
+                    .total_tokens()
+                    .saturating_add(stats.compaction_usage.total_tokens())
+            ),
+        )
+    }
+
     pub fn stdout() -> Self {
         Self::new(io::stdout().is_terminal() && io::stdin().is_terminal())
     }
@@ -192,6 +229,22 @@ impl TerminalUi {
         block.write_text(text)?;
         block.finish()
     }
+}
+
+fn format_usage_totals(label: &str, usage: UsageTotals) -> String {
+    let mut text = format!(
+        "{label} · вход: {} · выход: {} · всего: {}",
+        usage.prompt_tokens(),
+        usage.completion_tokens(),
+        usage.total_tokens()
+    );
+    if usage.missing_usage_count() > 0 {
+        text.push_str(&format!(
+            " · без данных API: {}",
+            usage.missing_usage_count()
+        ));
+    }
+    text
 }
 
 pub struct FullWidthBlock<'a, W: Write> {
@@ -462,7 +515,24 @@ fn input_rows(input: &str, width: usize) -> usize {
 mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD};
 
+    use crate::client::TokenUsage;
+    use crate::context::{ContextStats, UsageTotals};
+
     use super::{FullWidthBlock, TerminalUi, fit_line, input_rows};
+
+    fn totals(prompt: u64, completion: u64, total: u64, missing: bool) -> UsageTotals {
+        let mut result = UsageTotals::default();
+        result.record(Some(TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: total,
+            completion_tokens_details: None,
+        }));
+        if missing {
+            result.record(None);
+        }
+        result
+    }
 
     #[test]
     fn waiting_indicator_lasts_until_first_nonempty_text() {
@@ -616,5 +686,53 @@ mod tests {
         assert_eq!(fit_line("abc界def", 6), "abc界…");
         assert_eq!(fit_line("e\u{301}xyz", 2), "e\u{301}…");
         assert_eq!(fit_line("abc", 0), "");
+    }
+
+    #[test]
+    fn context_stats_show_raw_boundary_and_separate_api_costs() {
+        let ui = TerminalUi {
+            styled: false,
+            interactive: false,
+            inline_images: false,
+        };
+        let stats = ContextStats {
+            full_message_count: 24,
+            covered_message_count: 14,
+            raw_message_count: 10,
+            ordinary_usage: totals(12000, 2000, 14000, false),
+            compaction_usage: totals(5000, 600, 5600, false),
+        };
+        let mut output = Vec::new();
+
+        ui.write_context_stats(&mut output, stats).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Контекст · полная история: 24 · покрыто summary: 14 · дословно: 10\n\
+             Ответы · вход: 12000 · выход: 2000 · всего: 14000\n\
+             Сжатие · вход: 5000 · выход: 600 · всего: 5600\n\
+             API всего · 19600\n"
+        );
+    }
+
+    #[test]
+    fn context_stats_mark_calls_without_provider_usage() {
+        let ui = TerminalUi {
+            styled: false,
+            interactive: false,
+            inline_images: false,
+        };
+        let stats = ContextStats {
+            ordinary_usage: totals(1, 2, 3, true),
+            compaction_usage: totals(4, 5, 9, true),
+            ..ContextStats::default()
+        };
+        let mut output = Vec::new();
+
+        ui.write_context_stats(&mut output, stats).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("Ответы · вход: 1 · выход: 2 · всего: 3 · без данных API: 1"));
+        assert!(output.contains("Сжатие · вход: 4 · выход: 5 · всего: 9 · без данных API: 1"));
     }
 }
