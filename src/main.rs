@@ -115,26 +115,38 @@ async fn run() -> Result<(), AppError> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stderr = io::stderr();
     let stderr_ui = TerminalUi::stderr();
+    let mut show_usage = resume.is_some();
+    let mut footer_visible = show_usage && stdout_ui.is_interactive();
+    if footer_visible {
+        stdout_ui.write_usage(&mut stdout, agent.last_usage())?;
+    }
 
     loop {
         stdout_ui.write_input_prompt(&mut stdout)?;
 
         let Some(line) = lines.next_line().await? else {
             stdout_ui.finish_empty_prompt(&mut stdout)?;
+            if footer_visible {
+                stdout_ui.erase_usage_before_input(&mut stdout, "")?;
+            }
             break;
         };
+        if footer_visible {
+            stdout_ui.erase_usage_before_input(&mut stdout, &line)?;
+        }
         stdout_ui.complete_input(&mut stdout, &line)?;
 
         match parse_input(&line) {
             InputAction::Ignore => {}
             InputAction::Exit => break,
             InputAction::Clear => {
+                show_usage = true;
                 agent.clear_history();
                 stdout_ui.write_block(&mut stdout, BlockStyle::System, "Conversation cleared.")?;
             }
             InputAction::Send(user_message) => {
-                let mut block =
-                    stdout_ui.start_block(&mut stdout, BlockStyle::Assistant, "assistant> ")?;
+                show_usage = true;
+                let mut block = stdout_ui.start_response(&mut stdout)?;
 
                 let result = agent
                     .run_streaming(&user_message, |event| match event {
@@ -156,6 +168,14 @@ async fn run() -> Result<(), AppError> {
                 }
             }
         }
+        footer_visible = show_usage && stdout_ui.is_interactive();
+        if footer_visible {
+            stdout_ui.write_usage(&mut stdout, agent.last_usage())?;
+        }
+    }
+
+    if show_usage {
+        stdout_ui.write_usage(&mut stdout, agent.last_usage())?;
     }
 
     Ok(())

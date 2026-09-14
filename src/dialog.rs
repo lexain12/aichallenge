@@ -5,6 +5,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 
 use crate::chat::{Message, Role};
+use crate::client::TokenUsage;
 
 pub struct DialogStore {
     connection: Connection,
@@ -44,7 +45,11 @@ impl DialogStore {
                  content TEXT NOT NULL,
                  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
              );
-             CREATE INDEX IF NOT EXISTS messages_by_dialog ON messages(dialog_id, id);",
+             CREATE INDEX IF NOT EXISTS messages_by_dialog ON messages(dialog_id, id);
+             CREATE TABLE IF NOT EXISTS message_usage (
+                 message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+                 usage_json TEXT NOT NULL
+             );",
         )?;
         Ok(Self { connection })
     }
@@ -80,6 +85,31 @@ impl DialogStore {
         role: Role,
         content: &str,
     ) -> Result<(), StoreError> {
+        self.append_with_usage(id, expected_count, role, content, None)
+    }
+
+    /// The answer and its provider statistics either both commit or neither does.
+    pub fn append_answer(
+        &mut self,
+        id: i64,
+        expected_count: usize,
+        content: &str,
+        usage: Option<TokenUsage>,
+    ) -> Result<(), StoreError> {
+        self.append_with_usage(id, expected_count, Role::Assistant, content, usage)
+    }
+
+    fn append_with_usage(
+        &mut self,
+        id: i64,
+        expected_count: usize,
+        role: Role,
+        content: &str,
+        usage: Option<TokenUsage>,
+    ) -> Result<(), StoreError> {
+        let usage_json = usage
+            .map(|value| serde_json::to_string(&value))
+            .transpose()?;
         let role = match role {
             Role::User => "user",
             Role::Assistant => "assistant",
@@ -108,7 +138,14 @@ impl DialogStore {
             "INSERT INTO messages (dialog_id, role, content) VALUES (?1, ?2, ?3)",
             params![id, role, content],
         )?;
-        tx.execute("UPDATE dialogs SET last_message_id = ?1, updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = ?2", params![tx.last_insert_rowid(), id])?;
+        let message_id = tx.last_insert_rowid();
+        if let Some(usage_json) = usage_json {
+            tx.execute(
+                "INSERT INTO message_usage (message_id, usage_json) VALUES (?1, ?2)",
+                params![message_id, usage_json],
+            )?;
+        }
+        tx.execute("UPDATE dialogs SET last_message_id = ?1, updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = ?2", params![message_id, id])?;
         tx.commit()?;
         Ok(())
     }
@@ -126,7 +163,7 @@ impl DialogStore {
             .ok_or(StoreError::NotFound(id))?;
         let messages = {
             let mut statement =
-                tx.prepare("SELECT role, content FROM messages WHERE dialog_id = ?1 ORDER BY id")?;
+                tx.prepare("SELECT m.role, m.content, u.usage_json FROM messages m LEFT JOIN message_usage u ON u.message_id = m.id WHERE m.dialog_id = ?1 ORDER BY m.id")?;
             statement
                 .query_map([id], |row| {
                     let role: String = row.get(0)?;
@@ -135,7 +172,18 @@ impl DialogStore {
                         "assistant" => Role::Assistant,
                         _ => return Err(rusqlite::Error::InvalidQuery),
                     };
-                    Ok(Message::new(role, row.get(1)?))
+                    let usage_json: Option<String> = row.get(2)?;
+                    let usage = usage_json
+                        .map(|value| serde_json::from_str(&value))
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    Ok(Message::new(role, row.get(1)?).with_usage(usage))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -178,6 +226,8 @@ impl DialogStore {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("invalid token statistics: {0}")]
+    Usage(#[from] serde_json::Error),
     #[error("dialog database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("dialog {0} was not found")]

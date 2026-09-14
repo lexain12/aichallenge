@@ -293,3 +293,101 @@ async fn output_failure_does_not_commit_a_turn() {
     ));
     assert_eq!(agent.history().turn_count(), 0);
 }
+
+#[tokio::test]
+async fn usage_is_replaced_per_call_persisted_and_never_sent_as_context() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dialogs.sqlite3");
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Answer\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":25,\"total_tokens\":125,\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n";
+    mount(
+        &server,
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(body),
+    )
+    .await;
+    let mut agent = Agent::with_store(&config(&server), DialogStore::open(&path).unwrap()).unwrap();
+    agent.run_with_prompt("Question").await.unwrap();
+    let usage = agent.last_usage().unwrap();
+    assert_eq!(
+        (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens
+        ),
+        (100, 25, 125)
+    );
+    assert_eq!(
+        usage.completion_tokens_details.unwrap().reasoning_tokens,
+        Some(5)
+    );
+    let id = agent.dialog_id().unwrap();
+    drop(agent);
+    let mut agent =
+        Agent::from_dialog(&config(&server), DialogStore::open(&path).unwrap(), id).unwrap();
+    assert_eq!(agent.last_usage(), Some(usage));
+    assert_eq!(agent.history().messages()[1].usage(), Some(usage));
+    server.reset().await;
+    mount(
+        &server,
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"No usage\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+    )
+    .await;
+    agent.run_with_prompt("Next").await.unwrap();
+    assert_eq!(agent.last_usage(), None);
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests[0].body_json().unwrap();
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role":"system","content":"Be concise."},
+            {"role":"user","content":"Question"},
+            {"role":"assistant","content":"Answer"},
+            {"role":"user","content":"Next"}
+        ])
+    );
+    drop(agent);
+    let mut agent =
+        Agent::from_dialog(&config(&server), DialogStore::open(&path).unwrap(), id).unwrap();
+    assert_eq!(agent.last_usage(), None);
+    agent.clear_history();
+    assert_eq!(agent.last_usage(), None);
+}
+
+#[tokio::test]
+async fn failed_request_usage_is_not_saved_or_reused_by_next_attempt() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dialogs.sqlite3");
+    let mut agent = Agent::with_store(&config(&server), DialogStore::open(&path).unwrap()).unwrap();
+    mount(&server, ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+        .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n")).await;
+    assert!(matches!(
+        agent.run_with_prompt("Question").await,
+        Err(AgentError::Client(ClientError::Truncated))
+    ));
+    assert_eq!(agent.last_usage().unwrap().total_tokens, 15);
+    let restored = Agent::from_dialog(
+        &config(&server),
+        DialogStore::open(&path).unwrap(),
+        agent.dialog_id().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restored.last_usage(), None);
+    assert_eq!(restored.history().messages().len(), 1);
+    server.reset().await;
+    mount(&server, ResponseTemplate::new(500)).await;
+    assert!(agent.run_with_prompt("Retry").await.is_err());
+    assert_eq!(agent.last_usage(), None);
+    server.reset().await;
+    mount(&server, response("Success", true)).await;
+    agent.run_with_prompt("Retry again").await.unwrap();
+    assert_eq!(agent.last_usage().unwrap().total_tokens, 3);
+    agent.clear_history();
+    assert_eq!(agent.last_usage(), None);
+}

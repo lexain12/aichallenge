@@ -51,6 +51,36 @@ fn run_cli_args(config_path: &Path, database: &Path, args: &[&str], input: &str)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shows_one_final_usage_line_for_multiple_messages_and_restored_dialog() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+            .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"Answer\"}}],\"usage\":{\"prompt_tokens\":2400,\"completion_tokens\":350,\"total_tokens\":2750,\"completion_tokens_details\":{\"reasoning_tokens\":50}}}\n\ndata: [DONE]\n\n"))
+        .mount(&server).await;
+    let config = write_config(&server.uri());
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("dialogs.sqlite3");
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &[],
+        "Question\nFollow up\n/exit\n",
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.matches("Токены").count(), 1);
+    assert!(!stdout.contains("\x1b["));
+    let footer = "Токены · Вход: 2400 · Выход: 350 · Всего: 2750 · Рассуждения: 50";
+    assert!(stdout.ends_with(&format!("{footer}\n")), "{stdout}");
+    let output = run_cli_args(config.path(), &database, &["--resume-last"], "/exit\n");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.matches("Токены").count(), 1);
+    assert!(stdout.ends_with(&format!("{footer}\n")));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumes_across_processes_and_lists_without_api_config() {
     let server = MockServer::start().await;
     Mock::given(method("POST")).and(path("/chat/completions"))
@@ -205,7 +235,7 @@ async fn clear_and_api_error_leave_cli_ready_for_more_input() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout is UTF-8"),
-        "you> Conversation cleared.\nyou> assistant> \nyou> "
+        "you> Conversation cleared.\nyou> assistant> \nyou> Токены · нет данных API\n"
     );
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(stderr.contains("HTTP 500 Internal Server Error"));

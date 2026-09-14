@@ -1,4 +1,5 @@
 use deepseek_cli::chat::Role;
+use deepseek_cli::client::TokenUsage;
 use deepseek_cli::dialog::{DialogStore, StoreError};
 
 #[test]
@@ -60,4 +61,41 @@ fn stale_writer_cannot_append_or_change_latest_dialog() {
     assert_eq!(first.load(id).unwrap().messages.len(), 2);
     assert_eq!(first.latest_id().unwrap(), Some(newest));
     assert!(matches!(first.load(9999), Err(StoreError::NotFound(9999))));
+}
+
+#[test]
+fn upgrades_day7_database_and_writes_answer_usage_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dialogs.sqlite3");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch("CREATE TABLE dialogs (id INTEGER PRIMARY KEY AUTOINCREMENT, system_prompt TEXT NOT NULL, title TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '', last_message_id INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, dialog_id INTEGER NOT NULL REFERENCES dialogs(id), role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT '');
+        INSERT INTO dialogs (id, system_prompt, title, last_message_id) VALUES (1, 'Old system', 'Old question', 2);
+        INSERT INTO messages (dialog_id, role, content) VALUES (1, 'user', 'Old question'), (1, 'assistant', 'Old answer');").unwrap();
+    let mut store = DialogStore::open(&path).unwrap();
+    let old = store.load(1).unwrap();
+    assert_eq!(old.messages[1].content(), "Old answer");
+    assert_eq!(old.messages[1].usage(), None);
+    store
+        .append_message(1, 2, Role::User, "New question")
+        .unwrap();
+    let usage: TokenUsage =
+        serde_json::from_str(r#"{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}"#)
+            .unwrap();
+    connection.execute_batch("CREATE TRIGGER reject_usage BEFORE INSERT ON message_usage BEGIN SELECT RAISE(ABORT, 'usage write failed'); END;").unwrap();
+    assert!(
+        store
+            .append_answer(1, 3, "New answer", Some(usage))
+            .is_err()
+    );
+    assert_eq!(store.load(1).unwrap().messages.len(), 3);
+    connection
+        .execute_batch("DROP TRIGGER reject_usage;")
+        .unwrap();
+    store
+        .append_answer(1, 3, "New answer", Some(usage))
+        .unwrap();
+    drop(store);
+    let store = DialogStore::open(&path).unwrap();
+    assert_eq!(store.load(1).unwrap().messages[3].usage(), Some(usage));
 }

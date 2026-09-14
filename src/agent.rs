@@ -3,7 +3,7 @@ use std::io;
 use thiserror::Error;
 
 use crate::chat::{ChatHistory, Role};
-use crate::client::{ClientError, DeepSeekClient, StreamEvent};
+use crate::client::{ClientError, DeepSeekClient, StreamEvent, TokenUsage};
 use crate::config::Config;
 use crate::dialog::{DialogStore, StoreError};
 
@@ -14,6 +14,7 @@ pub struct Agent {
     prompt: Option<String>,
     store: Option<DialogStore>,
     dialog_id: Option<i64>,
+    last_usage: Option<TokenUsage>,
 }
 
 impl Agent {
@@ -29,6 +30,7 @@ impl Agent {
     pub fn from_dialog(config: &Config, store: DialogStore, id: i64) -> Result<Self, AgentError> {
         let dialog = store.load(id)?;
         let mut agent = Self::with_store(config, store)?;
+        agent.last_usage = dialog.messages.last().and_then(|message| message.usage());
         agent.history = ChatHistory::from_messages(dialog.system_prompt, dialog.messages);
         agent.dialog_id = Some(dialog.id);
         Ok(agent)
@@ -36,6 +38,11 @@ impl Agent {
 
     pub fn dialog_id(&self) -> Option<i64> {
         self.dialog_id
+    }
+
+    /// Statistics for the latest request, not a sum over the conversation.
+    pub fn last_usage(&self) -> Option<TokenUsage> {
+        self.last_usage
     }
 
     pub fn new(config: &Config) -> Result<Self, ClientError> {
@@ -53,6 +60,7 @@ impl Agent {
             prompt: None,
             store: None,
             dialog_id: None,
+            last_usage: None,
         }
     }
 
@@ -79,11 +87,12 @@ impl Agent {
     pub async fn run_streaming<F>(
         &mut self,
         prompt: &str,
-        on_event: F,
+        mut on_event: F,
     ) -> Result<String, AgentError>
     where
         F: FnMut(StreamEvent<'_>) -> io::Result<()>,
     {
+        self.last_usage = None;
         if prompt.trim().is_empty() {
             return Err(AgentError::EmptyPrompt);
         }
@@ -99,17 +108,28 @@ impl Agent {
             }
             self.history.push(Role::User, prompt.to_owned());
         }
-        let answer = self.client.stream_chat_events(&request, on_event).await?;
+        let mut usage = None;
+        let result = self
+            .client
+            .stream_chat_events(&request, |event| {
+                if let StreamEvent::Usage(value) = &event {
+                    usage = Some(*value);
+                }
+                on_event(event)
+            })
+            .await;
+        self.last_usage = usage;
+        let answer = result?;
         if answer.trim().is_empty() {
             return Err(ClientError::EmptyAnswer.into());
         }
         if let Some(store) = &mut self.store {
             let id = self.dialog_id.expect("persistent input created a dialog");
-            store.append_message(id, self.history.messages().len(), Role::Assistant, &answer)?;
-            self.history.push(Role::Assistant, answer.clone());
+            store.append_answer(id, self.history.messages().len(), &answer, usage)?;
         } else {
-            self.history.commit_turn(prompt.to_owned(), answer.clone());
+            self.history.push(Role::User, prompt.to_owned());
         }
+        self.history.push_answer(answer.clone(), usage);
         Ok(answer)
     }
 
@@ -121,6 +141,7 @@ impl Agent {
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.dialog_id = None;
+        self.last_usage = None;
     }
 }
 

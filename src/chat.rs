@@ -1,3 +1,4 @@
+use crate::client::TokenUsage;
 use serde::Serialize;
 
 /// A role accepted by the DeepSeek Chat Completions API.
@@ -14,11 +15,27 @@ pub enum Role {
 pub struct Message {
     role: Role,
     content: String,
+    /// Local metadata; never part of a Chat Completions request.
+    #[serde(skip)]
+    usage: Option<TokenUsage>,
 }
 
 impl Message {
     pub(crate) fn new(role: Role, content: String) -> Self {
-        Self { role, content }
+        Self {
+            role,
+            content,
+            usage: None,
+        }
+    }
+
+    pub(crate) fn with_usage(mut self, usage: Option<TokenUsage>) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    pub fn usage(&self) -> Option<TokenUsage> {
+        self.usage
     }
 
     pub fn role(&self) -> Role {
@@ -72,6 +89,11 @@ impl ChatHistory {
 
     pub(crate) fn push(&mut self, role: Role, content: String) {
         self.messages.push(Message::new(role, content));
+    }
+
+    pub(crate) fn push_answer(&mut self, content: String, usage: Option<TokenUsage>) {
+        self.messages
+            .push(Message::new(Role::Assistant, content).with_usage(usage));
     }
 
     pub fn new(system_prompt: String) -> Self {
