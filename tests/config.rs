@@ -151,3 +151,67 @@ fn reports_missing_config_path() {
     assert!(error.contains("read"));
     assert!(error.contains("deepseek.toml"));
 }
+
+#[test]
+fn applies_context_and_debug_defaults() {
+    let config = Config::from_toml("api_key = \"key\"", None).unwrap();
+
+    assert!(config.context().enabled());
+    assert_eq!(config.context().compact_after_prompt_tokens(), 6000);
+    assert_eq!(config.context().keep_last_messages(), 10);
+    assert_eq!(config.context().summary_max_tokens(), 1024);
+    assert_eq!(config.debug().log_path(), None);
+    assert!(!config.debug().log_payloads());
+}
+
+#[test]
+fn reads_context_and_debug_overrides() {
+    let config = Config::from_toml(
+        r#"
+api_key = "key"
+
+[context]
+enabled = false
+compact_after_prompt_tokens = 321
+keep_last_messages = 4
+summary_max_tokens = 77
+
+[debug]
+log_path = "logs/context.jsonl"
+log_payloads = true
+"#,
+        None,
+    )
+    .unwrap();
+
+    assert!(!config.context().enabled());
+    assert_eq!(config.context().compact_after_prompt_tokens(), 321);
+    assert_eq!(config.context().keep_last_messages(), 4);
+    assert_eq!(config.context().summary_max_tokens(), 77);
+    assert_eq!(
+        config.debug().log_path(),
+        Some(Path::new("logs/context.jsonl"))
+    );
+    assert!(config.debug().log_payloads());
+}
+
+#[test]
+fn rejects_zero_context_limits_and_unknown_nested_fields() {
+    for field in [
+        "compact_after_prompt_tokens",
+        "keep_last_messages",
+        "summary_max_tokens",
+    ] {
+        let text = format!("api_key = \"key\"\n[context]\n{field} = 0");
+        let error = Config::from_toml(&text, None).unwrap_err().to_string();
+        assert!(error.contains(field), "unexpected error: {error}");
+    }
+
+    let error = Config::from_toml(
+        "api_key = \"key\"\n[context]\nunknown = 1",
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("parse"));
+}

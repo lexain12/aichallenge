@@ -12,6 +12,25 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 const DEFAULT_TEMPERATURE: f64 = 1.0;
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_COMPACT_AFTER_PROMPT_TOKENS: u64 = 6000;
+const DEFAULT_KEEP_LAST_MESSAGES: usize = 10;
+const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 1024;
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawContextConfig {
+    enabled: Option<bool>,
+    compact_after_prompt_tokens: Option<u64>,
+    keep_last_messages: Option<usize>,
+    summary_max_tokens: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawDebugConfig {
+    log_path: Option<PathBuf>,
+    log_payloads: Option<bool>,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +46,52 @@ struct RawConfig {
     stop: Option<Vec<String>>,
     thinking: Option<String>,
     include_usage: Option<bool>,
+    #[serde(default)]
+    context: RawContextConfig,
+    #[serde(default)]
+    debug: RawDebugConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContextConfig {
+    enabled: bool,
+    compact_after_prompt_tokens: u64,
+    keep_last_messages: usize,
+    summary_max_tokens: u32,
+}
+
+impl ContextConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn compact_after_prompt_tokens(&self) -> u64 {
+        self.compact_after_prompt_tokens
+    }
+
+    pub fn keep_last_messages(&self) -> usize {
+        self.keep_last_messages
+    }
+
+    pub fn summary_max_tokens(&self) -> u32 {
+        self.summary_max_tokens
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DebugConfig {
+    log_path: Option<PathBuf>,
+    log_payloads: bool,
+}
+
+impl DebugConfig {
+    pub fn log_path(&self) -> Option<&Path> {
+        self.log_path.as_deref()
+    }
+
+    pub fn log_payloads(&self) -> bool {
+        self.log_payloads
+    }
 }
 
 /// Validated settings used by the API client.
@@ -43,6 +108,8 @@ pub struct Config {
     stop: Vec<String>,
     thinking: Option<String>,
     include_usage: bool,
+    context: ContextConfig,
+    debug: DebugConfig,
 }
 
 impl Config {
@@ -139,6 +206,36 @@ impl Config {
                 reason: "must be enabled or disabled, or omitted",
             });
         }
+        let compact_after_prompt_tokens = raw
+            .context
+            .compact_after_prompt_tokens
+            .unwrap_or(DEFAULT_COMPACT_AFTER_PROMPT_TOKENS);
+        if compact_after_prompt_tokens == 0 {
+            return Err(ConfigError::InvalidField {
+                field: "compact_after_prompt_tokens",
+                reason: "must be greater than zero",
+            });
+        }
+        let keep_last_messages = raw
+            .context
+            .keep_last_messages
+            .unwrap_or(DEFAULT_KEEP_LAST_MESSAGES);
+        if keep_last_messages == 0 {
+            return Err(ConfigError::InvalidField {
+                field: "keep_last_messages",
+                reason: "must be greater than zero",
+            });
+        }
+        let summary_max_tokens = raw
+            .context
+            .summary_max_tokens
+            .unwrap_or(DEFAULT_SUMMARY_MAX_TOKENS);
+        if summary_max_tokens == 0 {
+            return Err(ConfigError::InvalidField {
+                field: "summary_max_tokens",
+                reason: "must be greater than zero",
+            });
+        }
         Ok(Self {
             top_p: raw.top_p,
             stop,
@@ -153,6 +250,16 @@ impl Config {
             temperature,
             max_tokens,
             timeout_seconds,
+            context: ContextConfig {
+                enabled: raw.context.enabled.unwrap_or(true),
+                compact_after_prompt_tokens,
+                keep_last_messages,
+                summary_max_tokens,
+            },
+            debug: DebugConfig {
+                log_path: raw.debug.log_path,
+                log_payloads: raw.debug.log_payloads.unwrap_or(false),
+            },
         })
     }
 
@@ -167,6 +274,14 @@ impl Config {
     }
     pub fn include_usage(&self) -> bool {
         self.include_usage
+    }
+
+    pub fn context(&self) -> &ContextConfig {
+        &self.context
+    }
+
+    pub fn debug(&self) -> &DebugConfig {
+        &self.debug
     }
 
     pub fn api_key(&self) -> &str {
@@ -220,6 +335,8 @@ impl fmt::Debug for Config {
             .field("temperature", &self.temperature)
             .field("max_tokens", &self.max_tokens)
             .field("timeout_seconds", &self.timeout_seconds)
+            .field("context", &self.context)
+            .field("debug", &self.debug)
             .finish()
     }
 }
