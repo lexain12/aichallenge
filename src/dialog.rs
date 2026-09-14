@@ -7,6 +7,7 @@ use thiserror::Error;
 use crate::chat::{Message, Role};
 use crate::client::TokenUsage;
 use crate::context::{ContextState, ContextSummary, UsageTotals};
+use crate::facts::{Facts, FactsState};
 
 pub struct DialogStore {
     connection: Connection,
@@ -17,6 +18,7 @@ pub struct StoredDialog {
     pub system_prompt: String,
     pub messages: Vec<Message>,
     pub context: ContextState,
+    pub facts: FactsState,
 }
 
 pub struct DialogSummary {
@@ -57,6 +59,17 @@ impl DialogStore {
                  summary TEXT NOT NULL,
                  covered_message_count INTEGER NOT NULL CHECK (covered_message_count > 0),
                  compaction_count INTEGER NOT NULL DEFAULT 0,
+                 known_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                 known_completion_tokens INTEGER NOT NULL DEFAULT 0,
+                 known_total_tokens INTEGER NOT NULL DEFAULT 0,
+                 missing_usage_count INTEGER NOT NULL DEFAULT 0,
+                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+             );
+             CREATE TABLE IF NOT EXISTS dialog_facts (
+                 dialog_id INTEGER PRIMARY KEY REFERENCES dialogs(id),
+                 facts_json TEXT NOT NULL,
+                 covered_message_count INTEGER NOT NULL CHECK (covered_message_count > 0),
+                 update_count INTEGER NOT NULL DEFAULT 0,
                  known_prompt_tokens INTEGER NOT NULL DEFAULT 0,
                  known_completion_tokens INTEGER NOT NULL DEFAULT 0,
                  known_total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -253,6 +266,94 @@ impl DialogStore {
         Ok(state)
     }
 
+    pub fn replace_facts(
+        &mut self,
+        id: i64,
+        expected_message_count: usize,
+        facts: Facts,
+        usage: Option<TokenUsage>,
+    ) -> Result<FactsState, StoreError> {
+        if expected_message_count == 0 {
+            return Err(StoreError::InvalidFacts(
+                "facts boundary must cover an existing non-empty prefix",
+            ));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let count: i64 = tx.query_row(
+            "SELECT count(*) FROM messages WHERE dialog_id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(count).ok() != Some(expected_message_count) {
+            return Err(StoreError::Conflict(id));
+        }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dialogs WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::NotFound(id));
+        }
+        let stored = tx
+            .query_row(
+                "SELECT facts_json, covered_message_count, update_count,
+                        known_prompt_tokens, known_completion_tokens,
+                        known_total_tokens, missing_usage_count
+                 FROM dialog_facts WHERE dialog_id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let state = decode_facts(stored, expected_message_count)?.updated(
+            facts,
+            expected_message_count,
+            usage,
+        );
+        let facts_json = serde_json::to_string(state.facts())?;
+        let totals = state.update_usage();
+        tx.execute(
+            "INSERT INTO dialog_facts (
+                 dialog_id, facts_json, covered_message_count, update_count,
+                 known_prompt_tokens, known_completion_tokens,
+                 known_total_tokens, missing_usage_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(dialog_id) DO UPDATE SET
+                 facts_json = excluded.facts_json,
+                 covered_message_count = excluded.covered_message_count,
+                 update_count = excluded.update_count,
+                 known_prompt_tokens = excluded.known_prompt_tokens,
+                 known_completion_tokens = excluded.known_completion_tokens,
+                 known_total_tokens = excluded.known_total_tokens,
+                 missing_usage_count = excluded.missing_usage_count,
+                 updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
+            params![
+                id,
+                facts_json,
+                to_i64(state.covered_message_count())?,
+                to_i64(totals.call_count())?,
+                to_i64(totals.prompt_tokens())?,
+                to_i64(totals.completion_tokens())?,
+                to_i64(totals.total_tokens())?,
+                to_i64(totals.missing_usage_count())?,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(state)
+    }
+
     pub fn load(&self, id: i64) -> Result<StoredDialog, StoreError> {
         // Read metadata and messages from a single SQLite snapshot.
         let tx = self.connection.unchecked_transaction()?;
@@ -311,12 +412,34 @@ impl DialogStore {
             )
             .optional()?;
         let context = decode_context(stored_context)?;
+        let stored_facts = tx
+            .query_row(
+                "SELECT facts_json, covered_message_count, update_count,
+                        known_prompt_tokens, known_completion_tokens,
+                        known_total_tokens, missing_usage_count
+                 FROM dialog_facts WHERE dialog_id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let facts = decode_facts(stored_facts, messages.len())?;
         tx.commit()?;
         Ok(StoredDialog {
             id,
             system_prompt,
             messages,
             context,
+            facts,
         })
     }
 
@@ -350,6 +473,7 @@ impl DialogStore {
 }
 
 type StoredContextRow = (String, i64, i64, i64, i64, i64, i64);
+type StoredFactsRow = (String, i64, i64, i64, i64, i64, i64);
 
 fn decode_context(row: Option<StoredContextRow>) -> Result<ContextState, StoreError> {
     let Some((summary, covered, calls, prompt, completion, total, missing)) = row else {
@@ -363,6 +487,39 @@ fn decode_context(row: Option<StoredContextRow>) -> Result<ContextState, StoreEr
     }
     Ok(ContextState::restored(
         Some(ContextSummary::new(summary, covered)),
+        UsageTotals::from_parts(
+            calls as u64,
+            prompt as u64,
+            completion as u64,
+            total as u64,
+            missing as u64,
+        ),
+    ))
+}
+
+fn decode_facts(
+    row: Option<StoredFactsRow>,
+    message_count: usize,
+) -> Result<FactsState, StoreError> {
+    let Some((facts_json, covered, calls, prompt, completion, total, missing)) = row else {
+        return Ok(FactsState::default());
+    };
+    let facts: Facts = serde_json::from_str(&facts_json)
+        .map_err(|_| StoreError::InvalidFacts("facts_json must be a string-to-string object"))?;
+    let covered = usize::try_from(covered)
+        .map_err(|_| StoreError::InvalidFacts("negative facts boundary"))?;
+    if covered == 0 || covered > message_count {
+        return Err(StoreError::InvalidFacts(
+            "facts boundary exceeds dialog history",
+        ));
+    }
+    let values = [calls, prompt, completion, total, missing];
+    if values.iter().any(|value| *value < 0) {
+        return Err(StoreError::InvalidFacts("negative facts metric"));
+    }
+    Ok(FactsState::restored(
+        facts,
+        covered,
         UsageTotals::from_parts(
             calls as u64,
             prompt as u64,
@@ -393,4 +550,6 @@ pub enum StoreError {
     InvalidRole,
     #[error("invalid dialog context: {0}")]
     InvalidContext(&'static str),
+    #[error("invalid dialog facts: {0}")]
+    InvalidFacts(&'static str),
 }

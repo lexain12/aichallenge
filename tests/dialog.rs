@@ -4,6 +4,7 @@ use deepseek_cli::chat::Role;
 use deepseek_cli::client::TokenUsage;
 use deepseek_cli::context::ContextSummary;
 use deepseek_cli::dialog::{DialogStore, StoreError};
+use deepseek_cli::facts::Facts;
 
 #[test]
 fn reopens_messages_in_order_and_lists_latest_activity() {
@@ -205,4 +206,89 @@ fn stale_or_failed_context_replacement_keeps_previous_state() {
             .is_err()
     );
     assert_eq!(store.load(1).unwrap().context, first);
+}
+
+#[test]
+fn replaces_and_restores_facts_with_cumulative_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    create_day8_database_with_four_messages(&path);
+    let mut store = DialogStore::open(&path).unwrap();
+    let usage = TokenUsage {
+        prompt_tokens: 10,
+        completion_tokens: 2,
+        total_tokens: 12,
+        completion_tokens_details: None,
+    };
+
+    let first = store
+        .replace_facts(
+            1,
+            4,
+            Facts::from([("goal".into(), "ship CLI".into())]),
+            Some(usage),
+        )
+        .unwrap();
+    assert_eq!(first.covered_message_count(), 4);
+    assert_eq!(first.update_usage().call_count(), 1);
+
+    store
+        .append_message(1, 4, Role::User, "deadline Monday")
+        .unwrap();
+    let second = store
+        .replace_facts(
+            1,
+            5,
+            Facts::from([
+                ("goal".into(), "ship CLI".into()),
+                ("deadline".into(), "Monday".into()),
+            ]),
+            None,
+        )
+        .unwrap();
+    drop(store);
+
+    let restored = DialogStore::open(&path).unwrap().load(1).unwrap().facts;
+    assert_eq!(restored, second);
+    assert_eq!(restored.facts()["deadline"], "Monday");
+    assert_eq!(restored.update_usage().call_count(), 2);
+    assert_eq!(restored.update_usage().total_tokens(), 12);
+    assert_eq!(restored.update_usage().missing_usage_count(), 1);
+}
+
+#[test]
+fn stale_failed_or_malformed_facts_never_replace_valid_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    create_day8_database_with_four_messages(&path);
+    let mut store = DialogStore::open(&path).unwrap();
+    let first = store
+        .replace_facts(1, 4, Facts::from([("goal".into(), "ship".into())]), None)
+        .unwrap();
+
+    assert!(matches!(
+        store.replace_facts(1, 3, Facts::new(), None),
+        Err(StoreError::Conflict(1))
+    ));
+    assert_eq!(store.load(1).unwrap().facts, first);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_facts BEFORE UPDATE OF facts_json ON dialog_facts
+             BEGIN SELECT RAISE(ABORT, 'facts write failed'); END;",
+        )
+        .unwrap();
+    assert!(store.replace_facts(1, 4, Facts::new(), None).is_err());
+    assert_eq!(store.load(1).unwrap().facts, first);
+    connection
+        .execute_batch("DROP TRIGGER reject_facts;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE dialog_facts SET facts_json = '[1]' WHERE dialog_id = 1",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(store.load(1), Err(StoreError::InvalidFacts(_))));
 }
