@@ -207,11 +207,8 @@ fn rejects_zero_context_limits_and_unknown_nested_fields() {
         assert!(error.contains(field), "unexpected error: {error}");
     }
 
-    let error = Config::from_toml(
-        "api_key = \"key\"\n[context]\nunknown = 1",
-        None,
-    )
-    .unwrap_err()
-    .to_string();
+    let error = Config::from_toml("api_key = \"key\"\n[context]\nunknown = 1", None)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("parse"));
 }

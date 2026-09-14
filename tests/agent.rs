@@ -1,13 +1,15 @@
+use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 
-use deepseek_cli::agent::{Agent, AgentError};
-use deepseek_cli::client::{ClientError, StreamEvent};
+use deepseek_cli::agent::{Agent, AgentError, AgentEvent};
+use deepseek_cli::client::ClientError;
 use deepseek_cli::config::Config;
 use deepseek_cli::dialog::DialogStore;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn config(server: &MockServer) -> Config {
     let mut file = NamedTempFile::new().unwrap();
@@ -22,6 +24,83 @@ fn config(server: &MockServer) -> Config {
 
 fn agent(server: &MockServer) -> Agent {
     Agent::new(&config(server)).unwrap()
+}
+
+fn compression_config(server: &MockServer, threshold: u64, keep: usize) -> Config {
+    let mut file = NamedTempFile::new().unwrap();
+    write!(
+        file,
+        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[context]\nenabled = true\ncompact_after_prompt_tokens = {threshold}\nkeep_last_messages = {keep}\nsummary_max_tokens = 64\n",
+        server.uri(),
+    )
+    .unwrap();
+    Config::load(file.path(), None).unwrap()
+}
+
+#[derive(Clone)]
+struct SequenceResponder {
+    responses: Arc<Mutex<VecDeque<ResponseTemplate>>>,
+}
+
+impl Respond for SequenceResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected extra request")
+    }
+}
+
+async fn mount_sequence(
+    server: &MockServer,
+    responses: impl IntoIterator<Item = ResponseTemplate>,
+) {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+        })
+        .mount(server)
+        .await;
+}
+
+fn sse(
+    answer: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+) -> ResponseTemplate {
+    let chunk = json!({
+        "choices": [{"delta": {"content": answer}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens
+        }
+    });
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Seen {
+    CompactionStarted,
+    CompactionCompleted,
+    CompactionFailed,
+    Other,
+}
+
+fn seen(event: AgentEvent<'_>) -> Seen {
+    match event {
+        AgentEvent::CompactionStarted { .. } => Seen::CompactionStarted,
+        AgentEvent::CompactionCompleted { .. } => Seen::CompactionCompleted,
+        AgentEvent::CompactionFailed { .. } => Seen::CompactionFailed,
+        AgentEvent::Text(_) | AgentEvent::Usage(_) | AgentEvent::DebugLogFailed { .. } => {
+            Seen::Other
+        }
+    }
 }
 
 #[tokio::test]
@@ -143,7 +222,7 @@ async fn answer_storage_failure_is_reported_without_claiming_it_was_saved() {
     let mut text = String::new();
     let result = agent
         .run_streaming("Question", |event| {
-            if let StreamEvent::Text(fragment) = event {
+            if let AgentEvent::Text(fragment) = event {
                 text.push_str(fragment);
             }
             Ok(())
@@ -214,8 +293,12 @@ async fn agents_do_not_share_history_and_forward_stream_events() {
     first
         .run_streaming("First", |event| {
             match event {
-                StreamEvent::Text(fragment) => text.push_str(fragment),
-                StreamEvent::Usage(value) => usage = Some(value),
+                AgentEvent::Text(fragment) => text.push_str(fragment),
+                AgentEvent::Usage(value) => usage = Some(value),
+                AgentEvent::CompactionStarted { .. }
+                | AgentEvent::CompactionCompleted { .. }
+                | AgentEvent::CompactionFailed { .. }
+                | AgentEvent::DebugLogFailed { .. } => {}
             }
             Ok(())
         })
@@ -390,4 +473,141 @@ async fn failed_request_usage_is_not_saved_or_reused_by_next_attempt() {
     assert_eq!(agent.last_usage().unwrap().total_tokens, 3);
     agent.clear_history();
     assert_eq!(agent.last_usage(), None);
+}
+
+#[tokio::test]
+async fn crossing_request_is_saved_then_compacted_and_next_request_uses_summary_tail() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("answer one", 2, 1, 3),
+            sse("answer two", 4, 2, 6),
+            sse("summary one", 7, 2, 9),
+            sse("answer three", 2, 2, 4),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialog.sqlite3");
+    let mut agent = Agent::with_store(
+        &compression_config(&server, 3, 2),
+        DialogStore::open(&database).unwrap(),
+    )
+    .unwrap();
+
+    agent.run_with_prompt("u1").await.unwrap();
+    let mut events = Vec::new();
+    agent
+        .run_streaming("u2", |event| {
+            events.push(seen(event));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    agent.run_with_prompt("u3").await.unwrap();
+
+    assert!(events.contains(&Seen::CompactionStarted));
+    assert!(events.contains(&Seen::CompactionCompleted));
+    assert_eq!(agent.history().messages().len(), 6);
+    let stats = agent.context_stats();
+    assert_eq!(stats.covered_message_count, 2);
+    assert_eq!(stats.raw_message_count, 4);
+    assert_eq!(stats.ordinary_usage.total_tokens(), 13);
+    assert_eq!(stats.compaction_usage.total_tokens(), 9);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 4);
+    let summary: Value = requests[2].body_json().unwrap();
+    assert_eq!(summary["messages"].as_array().unwrap().len(), 2);
+    assert!(
+        summary["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("user: u1\nassistant: answer one")
+    );
+    let follow_up: Value = requests[3].body_json().unwrap();
+    assert_eq!(
+        follow_up["messages"],
+        json!([
+            {"role":"system","content":"Be concise."},
+            {"role":"system","content":"Summary of earlier conversation:\nsummary one"},
+            {"role":"user","content":"u2"},
+            {"role":"assistant","content":"answer two"},
+            {"role":"user","content":"u3"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn repeated_compaction_sends_previous_summary_with_only_new_prefix() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("a1", 2, 1, 3),
+            sse("a2", 4, 1, 5),
+            sse("summary one", 5, 2, 7),
+            sse("a3", 4, 1, 5),
+            sse("summary two", 6, 2, 8),
+        ],
+    )
+    .await;
+    let mut agent = Agent::new(&compression_config(&server, 3, 2)).unwrap();
+
+    agent.run_with_prompt("u1").await.unwrap();
+    agent.run_with_prompt("u2").await.unwrap();
+    agent.run_with_prompt("u3").await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 5);
+    let second_summary: Value = requests[4].body_json().unwrap();
+    let input = second_summary["messages"][1]["content"].as_str().unwrap();
+    assert!(input.contains("Previous summary:\nsummary one"));
+    assert!(input.contains("New messages:\nuser: u2\nassistant: a2"));
+    assert!(!input.contains("user: u1"));
+    assert!(!input.contains("user: u3"));
+    assert_eq!(agent.context_stats().covered_message_count, 4);
+    assert_eq!(agent.context_stats().compaction_usage.call_count(), 2);
+}
+
+#[tokio::test]
+async fn failed_compaction_keeps_full_history_and_does_not_fail_user_answer() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("answer", 4, 1, 5),
+            ResponseTemplate::new(500),
+            sse("next answer", 2, 1, 3),
+        ],
+    )
+    .await;
+    let mut agent = Agent::new(&compression_config(&server, 3, 1)).unwrap();
+    let mut events = Vec::new();
+
+    let answer = agent
+        .run_streaming("first", |event| {
+            events.push(seen(event));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(answer, "answer");
+    assert_eq!(agent.context_stats().covered_message_count, 0);
+    assert_eq!(agent.history().messages().len(), 2);
+    assert!(events.contains(&Seen::CompactionFailed));
+    agent.run_with_prompt("second").await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let retry: Value = requests[2].body_json().unwrap();
+    assert_eq!(
+        retry["messages"],
+        json!([
+            {"role":"system","content":"Be concise."},
+            {"role":"user","content":"first"},
+            {"role":"assistant","content":"answer"},
+            {"role":"user","content":"second"}
+        ])
+    );
 }

@@ -61,6 +61,15 @@ pub struct ContextConfig {
 }
 
 impl ContextConfig {
+    pub(crate) fn disabled() -> Self {
+        Self {
+            enabled: false,
+            compact_after_prompt_tokens: DEFAULT_COMPACT_AFTER_PROMPT_TOKENS,
+            keep_last_messages: DEFAULT_KEEP_LAST_MESSAGES,
+            summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+        }
+    }
+
     pub fn enabled(&self) -> bool {
         self.enabled
     }

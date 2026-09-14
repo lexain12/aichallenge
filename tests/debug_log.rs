@@ -6,10 +6,7 @@ fn payload_content_is_opt_in_and_api_key_is_always_redacted() {
     let directory = tempfile::tempdir().unwrap();
     let safe_path = directory.path().join("safe.jsonl");
     let full_path = directory.path().join("full.jsonl");
-    let messages = vec![Message::for_request(
-        Role::User,
-        "private text secret-key",
-    )];
+    let messages = vec![Message::for_request(Role::User, "private text secret-key")];
 
     let mut safe = DebugLog::new(Some(safe_path.clone()), false, "secret-key");
     assert_eq!(safe.log_request("chat", &messages, 0), None);

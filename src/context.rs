@@ -106,21 +106,14 @@ impl ContextState {
         }
     }
 
-    pub(crate) fn restored(
-        summary: Option<ContextSummary>,
-        compaction_usage: UsageTotals,
-    ) -> Self {
+    pub(crate) fn restored(summary: Option<ContextSummary>, compaction_usage: UsageTotals) -> Self {
         Self {
             summary,
             compaction_usage,
         }
     }
 
-    pub(crate) fn replace_summary(
-        &mut self,
-        summary: ContextSummary,
-        usage: Option<TokenUsage>,
-    ) {
+    pub(crate) fn replace_summary(&mut self, summary: ContextSummary, usage: Option<TokenUsage>) {
         self.summary = Some(summary);
         self.compaction_usage.record(usage);
     }

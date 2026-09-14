@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use deepseek_cli::agent::{Agent, AgentError};
+use deepseek_cli::agent::{Agent, AgentError, AgentEvent};
 use deepseek_cli::chat::{InputAction, Role, parse_input};
-use deepseek_cli::client::{ClientError, StreamEvent};
+use deepseek_cli::client::ClientError;
 use deepseek_cli::config::{Config, ConfigError};
 use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::terminal::{BlockStyle, TerminalUi};
@@ -150,8 +150,12 @@ async fn run() -> Result<(), AppError> {
 
                 let result = agent
                     .run_streaming(&user_message, |event| match event {
-                        StreamEvent::Text(fragment) => block.write_text(fragment),
-                        StreamEvent::Usage(_) => Ok(()),
+                        AgentEvent::Text(fragment) => block.write_text(fragment),
+                        AgentEvent::Usage(_)
+                        | AgentEvent::CompactionStarted { .. }
+                        | AgentEvent::CompactionCompleted { .. }
+                        | AgentEvent::CompactionFailed { .. }
+                        | AgentEvent::DebugLogFailed { .. } => Ok(()),
                     })
                     .await;
                 block.finish()?;
