@@ -4,7 +4,7 @@
 
 Add configurable conversation-history compression to the existing DeepSeek CLI.
 The agent must keep the complete original dialog in SQLite, create and persist
-separate summaries, send only the active summary plus the most recent raw
+a separate current summary, send only that summary plus the most recent raw
 messages to DeepSeek, and expose enough metrics and diagnostics to compare a
 compressed run with an uncompressed run manually.
 
@@ -43,7 +43,8 @@ default. Validation rules are:
 
 When compression is disabled, the agent sends the complete original history,
 does not create new summaries, and ignores stored summaries for request
-construction. Stored summaries and their usage remain available to `/stats`.
+construction. The stored summary and cumulative compaction usage remain
+available to `/stats`.
 
 ## Compression Trigger
 
@@ -90,9 +91,10 @@ and `stop` settings do not apply to the summarizer because they can truncate or
 distort the summary contract.
 
 An empty, truncated, incomplete, or otherwise failed summary never becomes
-active. The already saved user answer remains successful, the full history is
-preserved, an interactive warning and debug event are emitted, and the agent
-can retry after a later qualifying response.
+active. The previous summary stays active until its replacement and metrics
+commit successfully. The already saved user answer remains successful, the
+full history is preserved, an interactive warning and debug event are emitted,
+and the agent can retry after a later qualifying response.
 
 ## Request Construction
 
@@ -122,32 +124,36 @@ summary directly from the preserved full history.
 
 ## Persistence
 
-SQLite gains a `context_compactions` table without altering or deleting rows in
+SQLite gains a `dialog_context` table without altering or deleting rows in
 `dialogs`, `messages`, or `message_usage`:
 
 ```sql
-CREATE TABLE IF NOT EXISTS context_compactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    dialog_id INTEGER NOT NULL REFERENCES dialogs(id),
+CREATE TABLE IF NOT EXISTS dialog_context (
+    dialog_id INTEGER PRIMARY KEY REFERENCES dialogs(id),
     summary TEXT NOT NULL,
     covered_message_count INTEGER NOT NULL CHECK (covered_message_count > 0),
-    usage_json TEXT,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+    compaction_count INTEGER NOT NULL DEFAULT 0,
+    known_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    known_completion_tokens INTEGER NOT NULL DEFAULT 0,
+    known_total_tokens INTEGER NOT NULL DEFAULT 0,
+    missing_usage_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
 );
-
-CREATE INDEX IF NOT EXISTS context_compactions_by_dialog
-ON context_compactions(dialog_id, id);
 ```
 
-Every successful compaction creates a new audit row. Old summaries remain in
-the database; the newest compatible row is active. `covered_message_count` is
-an exclusive prefix length in the stable message order, not a mutable database
-row ID. The summary and its provider usage commit atomically. Missing usage is
-stored as `NULL`, never as zero.
+There is at most one row per dialog. `covered_message_count` is an exclusive
+prefix length in the stable message order, not a mutable database row ID. A
+successful compaction atomically replaces the active summary and boundary,
+increments `compaction_count`, and adds provider usage to the known cumulative
+fields. If usage is missing, the known totals are unchanged and
+`missing_usage_count` is incremented; missing usage is never presented as zero.
+The previous row remains untouched if the transaction fails.
 
-Restoring a dialog loads all original messages plus its compaction history.
+Restoring a dialog loads all original messages plus its current context row.
 `/clear` starts a new dialog context while leaving the previous dialog's raw
-messages and summaries on disk.
+messages and current summary on disk. Older summary texts are intentionally not
+kept in SQLite because the full raw history is authoritative and can regenerate
+them. Per-operation diagnostics belong in the optional JSONL log.
 
 ## Token Accounting
 
@@ -192,11 +198,12 @@ status updates.
 
 When `debug.log_path` is configured, the application writes append-only JSONL
 events for request preparation, ordinary completion, compaction decisions,
-compaction completion, and failures. By default request records contain roles,
-message counts, character lengths, summary boundary, and usage but not message
-contents. With `debug.log_payloads = true`, they additionally contain the exact
-DeepSeek `messages` payload. Authorization headers and the API key are never
-logged.
+compaction completion, and failures. This log is the audit trail for individual
+compaction operations even though SQLite retains only the active summary and
+cumulative metrics. By default request records contain roles, message counts,
+character lengths, summary boundary, and usage but not message contents. With
+`debug.log_payloads = true`, they additionally contain the exact DeepSeek
+`messages` payload. Authorization headers and the API key are never logged.
 
 A debug-log write failure emits one warning, disables further file logging for
 that process, and does not fail or interrupt the dialog.
@@ -248,9 +255,10 @@ DeepSeek service.
   answer completes before compaction, summary output is hidden, the next request
   contains summary plus the exact raw tail, and summary failures preserve the
   full-history path.
-- Persistence tests upgrade a Day-8 database, retain every raw message, append
-  multiple summary rows, restore the latest compatible row, keep usage nullable,
-  and reject stale summary writes.
+- Persistence tests upgrade a Day-8 database, retain every raw message,
+  atomically replace the single current summary, accumulate known usage and
+  missing-usage counts, restore only the current context row, and reject stale
+  summary writes.
 - Metrics tests separate ordinary and summary usage, include both in the grand
   total, and expose missing-usage counts.
 - Logging tests prove payloads are opt-in and API keys never appear.
