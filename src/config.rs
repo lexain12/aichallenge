@@ -17,9 +17,10 @@ const DEFAULT_KEEP_LAST_MESSAGES: usize = 10;
 const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 1024;
 const DEFAULT_FACTS_MAX_TOKENS: u32 = 512;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextStrategy {
+    #[default]
     Summary,
     SlidingWindow,
     StickyFacts,
@@ -34,12 +35,6 @@ impl ContextStrategy {
             Self::StickyFacts => "sticky_facts",
             Self::Branching => "branching",
         }
-    }
-}
-
-impl Default for ContextStrategy {
-    fn default() -> Self {
-        Self::Summary
     }
 }
 
