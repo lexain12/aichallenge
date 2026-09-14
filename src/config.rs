@@ -2,7 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
@@ -17,13 +17,30 @@ const DEFAULT_KEEP_LAST_MESSAGES: usize = 10;
 const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 1024;
 const DEFAULT_FACTS_MAX_TOKENS: u32 = 512;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextStrategy {
     Summary,
     SlidingWindow,
     StickyFacts,
     Branching,
+}
+
+impl ContextStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Summary => "summary",
+            Self::SlidingWindow => "sliding_window",
+            Self::StickyFacts => "sticky_facts",
+            Self::Branching => "branching",
+        }
+    }
+}
+
+impl Default for ContextStrategy {
+    fn default() -> Self {
+        Self::Summary
+    }
 }
 
 #[derive(Deserialize, Default)]

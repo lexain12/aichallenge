@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use crate::chat::{ChatHistory, Message, Role};
 use crate::client::TokenUsage;
 use crate::config::{ContextConfig, ContextStrategy};
+use crate::facts::FactsState;
 use crate::system_context::{SystemBlock, SystemContext};
 
 const SUMMARY_CONTEXT_PREFIX: &str = "Summary of earlier conversation:\n";
@@ -151,11 +152,18 @@ impl CompactionPlan {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ContextStats {
+    pub strategy: ContextStrategy,
     pub full_message_count: usize,
     pub covered_message_count: usize,
     pub raw_message_count: usize,
+    pub selected_message_count: usize,
+    pub facts_count: usize,
+    pub facts_covered_message_count: usize,
     pub ordinary_usage: UsageTotals,
     pub compaction_usage: UsageTotals,
+    pub facts_usage: UsageTotals,
+    pub dialog_id: Option<i64>,
+    pub branch_group_id: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -329,8 +337,10 @@ pub fn plan_compaction(
 pub fn stats(
     history: &ChatHistory,
     state: &ContextState,
-    enabled: bool,
-    keep_last_messages: usize,
+    facts: &FactsState,
+    config: &ContextConfig,
+    dialog_id: Option<i64>,
+    branch_group_id: Option<i64>,
 ) -> ContextStats {
     let mut ordinary_usage = UsageTotals::default();
     for message in history
@@ -340,14 +350,38 @@ pub fn stats(
     {
         ordinary_usage.record(message.usage());
     }
-    let covered_message_count = compatible_summary(history, state, enabled, keep_last_messages)
-        .map_or(0, ContextSummary::covered_message_count);
+    let covered_message_count = if config.strategy() == ContextStrategy::Summary {
+        compatible_summary(history, state, true, config.keep_last_messages())
+            .map_or(0, ContextSummary::covered_message_count)
+    } else {
+        0
+    };
+    let raw_message_count = history.messages().len() - covered_message_count;
+    let selected_message_count = match config.strategy() {
+        ContextStrategy::Summary => raw_message_count,
+        ContextStrategy::SlidingWindow | ContextStrategy::StickyFacts => {
+            history.messages().len().min(config.keep_last_messages())
+        }
+        ContextStrategy::Branching => history.messages().len(),
+    };
+    let sticky = config.strategy() == ContextStrategy::StickyFacts;
     ContextStats {
+        strategy: config.strategy(),
         full_message_count: history.messages().len(),
         covered_message_count,
-        raw_message_count: history.messages().len() - covered_message_count,
+        raw_message_count,
+        selected_message_count,
+        facts_count: if sticky { facts.facts().len() } else { 0 },
+        facts_covered_message_count: if sticky {
+            facts.covered_message_count()
+        } else {
+            0
+        },
         ordinary_usage,
         compaction_usage: state.compaction_usage(),
+        facts_usage: facts.update_usage(),
+        dialog_id,
+        branch_group_id,
     }
 }
 

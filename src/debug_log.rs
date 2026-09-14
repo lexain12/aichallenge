@@ -6,7 +6,34 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::chat::{Message, Role};
-use crate::config::DebugConfig;
+use crate::config::{ContextStrategy, DebugConfig};
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RequestMetadata {
+    strategy: ContextStrategy,
+    system_block_names: Vec<String>,
+    selected_message_count: usize,
+    summary_boundary: usize,
+    facts_boundary: usize,
+}
+
+impl RequestMetadata {
+    pub fn new(
+        strategy: ContextStrategy,
+        system_block_names: Vec<String>,
+        selected_message_count: usize,
+        summary_boundary: usize,
+        facts_boundary: usize,
+    ) -> Self {
+        Self {
+            strategy,
+            system_block_names,
+            selected_message_count,
+            summary_boundary,
+            facts_boundary,
+        }
+    }
+}
 
 pub struct DebugLog {
     writer: Option<BufWriter<File>>,
@@ -50,7 +77,7 @@ impl DebugLog {
         &mut self,
         kind: &'static str,
         messages: &[Message],
-        summary_boundary: usize,
+        context: &RequestMetadata,
     ) -> Option<String> {
         let metadata: Vec<_> = messages
             .iter()
@@ -65,7 +92,11 @@ impl DebugLog {
             "event": "request_prepared",
             "timestamp_unix_ms": timestamp_unix_ms(),
             "kind": kind,
-            "summary_boundary": summary_boundary,
+            "strategy": context.strategy,
+            "system_block_names": context.system_block_names,
+            "selected_message_count": context.selected_message_count,
+            "summary_boundary": context.summary_boundary,
+            "facts_boundary": context.facts_boundary,
             "message_count": messages.len(),
             "message_metadata": metadata,
         });

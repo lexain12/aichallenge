@@ -124,11 +124,41 @@ impl TerminalUi {
         self.write_block(
             writer,
             BlockStyle::System,
-            &format!(
+            &format!("Стратегия · {}", stats.strategy.as_str()),
+        )?;
+        let context = match stats.strategy {
+            crate::config::ContextStrategy::Summary => format!(
                 "Контекст · полная история: {} · покрыто summary: {} · дословно: {}",
                 stats.full_message_count, stats.covered_message_count, stats.raw_message_count
             ),
-        )?;
+            crate::config::ContextStrategy::SlidingWindow => format!(
+                "Контекст · полная история: {} · в запросе: {}",
+                stats.full_message_count, stats.selected_message_count
+            ),
+            crate::config::ContextStrategy::StickyFacts => format!(
+                "Контекст · полная история: {} · в запросе: {} · facts: {} · facts до: {}",
+                stats.full_message_count,
+                stats.selected_message_count,
+                stats.facts_count,
+                stats.facts_covered_message_count
+            ),
+            crate::config::ContextStrategy::Branching => match stats.branch_group_id {
+                Some(group) => format!(
+                    "Контекст · полная история: {} · в запросе: {} · диалог: #{} · группа: #{}",
+                    stats.full_message_count,
+                    stats.selected_message_count,
+                    stats.dialog_id.unwrap_or_default(),
+                    group
+                ),
+                None => format!(
+                    "Контекст · полная история: {} · в запросе: {} · диалог: #{} · группа не создана",
+                    stats.full_message_count,
+                    stats.selected_message_count,
+                    stats.dialog_id.unwrap_or_default()
+                ),
+            },
+        };
+        self.write_block(writer, BlockStyle::System, &context)?;
         self.write_block(
             writer,
             BlockStyle::System,
@@ -137,7 +167,12 @@ impl TerminalUi {
         self.write_block(
             writer,
             BlockStyle::System,
-            &format_usage_totals("Сжатие", stats.compaction_usage),
+            &format_usage_totals("Summary", stats.compaction_usage),
+        )?;
+        self.write_block(
+            writer,
+            BlockStyle::System,
+            &format_usage_totals("Facts", stats.facts_usage),
         )?;
         self.write_block(
             writer,
@@ -148,6 +183,7 @@ impl TerminalUi {
                     .ordinary_usage
                     .total_tokens()
                     .saturating_add(stats.compaction_usage.total_tokens())
+                    .saturating_add(stats.facts_usage.total_tokens())
             ),
         )
     }
@@ -516,6 +552,7 @@ mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD};
 
     use crate::client::TokenUsage;
+    use crate::config::ContextStrategy;
     use crate::context::{ContextStats, UsageTotals};
 
     use super::{FullWidthBlock, TerminalUi, fit_line, input_rows};
@@ -696,11 +733,14 @@ mod tests {
             inline_images: false,
         };
         let stats = ContextStats {
+            strategy: ContextStrategy::Summary,
             full_message_count: 24,
             covered_message_count: 14,
             raw_message_count: 10,
+            selected_message_count: 10,
             ordinary_usage: totals(12000, 2000, 14000, false),
             compaction_usage: totals(5000, 600, 5600, false),
+            ..ContextStats::default()
         };
         let mut output = Vec::new();
 
@@ -708,9 +748,11 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "Контекст · полная история: 24 · покрыто summary: 14 · дословно: 10\n\
+            "Стратегия · summary\n\
+             Контекст · полная история: 24 · покрыто summary: 14 · дословно: 10\n\
              Ответы · вход: 12000 · выход: 2000 · всего: 14000\n\
-             Сжатие · вход: 5000 · выход: 600 · всего: 5600\n\
+             Summary · вход: 5000 · выход: 600 · всего: 5600\n\
+             Facts · вход: 0 · выход: 0 · всего: 0\n\
              API всего · 19600\n"
         );
     }
@@ -733,6 +775,35 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.contains("Ответы · вход: 1 · выход: 2 · всего: 3 · без данных API: 1"));
-        assert!(output.contains("Сжатие · вход: 4 · выход: 5 · всего: 9 · без данных API: 1"));
+        assert!(output.contains("Summary · вход: 4 · выход: 5 · всего: 9 · без данных API: 1"));
+    }
+
+    #[test]
+    fn sticky_facts_stats_show_selected_context_and_separate_cost() {
+        let ui = TerminalUi {
+            styled: false,
+            interactive: false,
+            inline_images: false,
+        };
+        let stats = ContextStats {
+            strategy: ContextStrategy::StickyFacts,
+            full_message_count: 8,
+            selected_message_count: 3,
+            facts_count: 2,
+            facts_covered_message_count: 5,
+            facts_usage: totals(10, 2, 12, false),
+            ..ContextStats::default()
+        };
+        let mut output = Vec::new();
+
+        ui.write_context_stats(&mut output, stats).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("Стратегия · sticky_facts"));
+        assert!(
+            output.contains("Контекст · полная история: 8 · в запросе: 3 · facts: 2 · facts до: 5")
+        );
+        assert!(output.contains("Facts · вход: 10 · выход: 2 · всего: 12"));
+        assert!(output.contains("API всего · 12"));
     }
 }

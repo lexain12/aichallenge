@@ -1,5 +1,6 @@
 use deepseek_cli::chat::{Message, Role};
-use deepseek_cli::debug_log::DebugLog;
+use deepseek_cli::config::ContextStrategy;
+use deepseek_cli::debug_log::{DebugLog, RequestMetadata};
 
 #[test]
 fn payload_content_is_opt_in_and_api_key_is_always_redacted() {
@@ -7,16 +8,26 @@ fn payload_content_is_opt_in_and_api_key_is_always_redacted() {
     let safe_path = directory.path().join("safe.jsonl");
     let full_path = directory.path().join("full.jsonl");
     let messages = vec![Message::for_request(Role::User, "private text secret-key")];
+    let metadata = RequestMetadata::new(
+        ContextStrategy::StickyFacts,
+        vec!["base".into(), "facts".into()],
+        1,
+        0,
+        3,
+    );
 
     let mut safe = DebugLog::new(Some(safe_path.clone()), false, "secret-key");
-    assert_eq!(safe.log_request("chat", &messages, 0), None);
+    assert_eq!(safe.log_request("chat", &messages, &metadata), None);
     let safe_text = std::fs::read_to_string(safe_path).unwrap();
     assert!(safe_text.contains("\"content_chars\":23"));
+    assert!(safe_text.contains("\"strategy\":\"sticky_facts\""));
+    assert!(safe_text.contains("\"system_block_names\":[\"base\",\"facts\"]"));
+    assert!(safe_text.contains("\"facts_boundary\":3"));
     assert!(!safe_text.contains("private text"));
     assert!(!safe_text.contains("secret-key"));
 
     let mut full = DebugLog::new(Some(full_path.clone()), true, "secret-key");
-    assert_eq!(full.log_request("chat", &messages, 0), None);
+    assert_eq!(full.log_request("chat", &messages, &metadata), None);
     let full_text = std::fs::read_to_string(full_path).unwrap();
     assert!(full_text.contains("private text [REDACTED]"));
     assert!(!full_text.contains("secret-key"));

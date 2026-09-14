@@ -183,9 +183,11 @@ async fn stats_report_persisted_compression_without_making_an_api_request() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Стратегия · summary"));
     assert!(stdout.contains("Контекст · полная история: 4 · покрыто summary: 2 · дословно: 2"));
     assert!(stdout.contains("Ответы · вход: 6 · выход: 3 · всего: 9"));
-    assert!(stdout.contains("Сжатие · вход: 7 · выход: 2 · всего: 9"));
+    assert!(stdout.contains("Summary · вход: 7 · выход: 2 · всего: 9"));
+    assert!(stdout.contains("Facts · вход: 0 · выход: 0 · всего: 0"));
     assert!(stdout.contains("API всего · 18"));
     assert_eq!(server.received_requests().await.unwrap().len(), 3);
 

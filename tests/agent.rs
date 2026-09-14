@@ -691,6 +691,15 @@ async fn sticky_facts_are_updated_persisted_and_sent_before_the_answer() {
     assert_eq!(stored.facts.facts()["goal"], "prepare specification");
     assert_eq!(stored.facts.covered_message_count(), 1);
     assert_eq!(stored.facts.update_usage().total_tokens(), 7);
+    let stats = agent.context_stats();
+    assert_eq!(
+        stats.strategy,
+        deepseek_cli::config::ContextStrategy::StickyFacts
+    );
+    assert_eq!(stats.selected_message_count, 2);
+    assert_eq!(stats.facts_count, 1);
+    assert_eq!(stats.facts_covered_message_count, 1);
+    assert_eq!(stats.facts_usage.total_tokens(), 7);
 }
 
 #[tokio::test]
@@ -834,4 +843,92 @@ async fn branch_operations_reject_wrong_strategy_or_missing_persistent_dialog() 
         in_memory.switch_branch(1),
         Err(AgentError::NoPersistentDialog)
     ));
+}
+
+#[tokio::test]
+async fn sticky_facts_writes_separate_debug_events_without_payloads() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [sse(r#"{"goal":"ship"}"#, 3, 1, 4), sse("Answer", 5, 1, 6)],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let log_path = directory.path().join("context.jsonl");
+    let mut file = NamedTempFile::new().unwrap();
+    write!(
+        file,
+        "api_key = \"test-key\"\nbase_url = \"{}\"\n[context]\nstrategy = \"sticky_facts\"\n[debug]\nlog_path = \"{}\"\nlog_payloads = false\n",
+        server.uri(),
+        log_path.display(),
+    )
+    .unwrap();
+    let mut agent = Agent::new(&Config::load(file.path(), None).unwrap()).unwrap();
+
+    agent.run_with_prompt("private goal").await.unwrap();
+
+    let events: Vec<Value> = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "request_prepared" && event["kind"] == "facts_update"
+        })
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "facts_update_started")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "facts_update_completed")
+    );
+    let text = serde_json::to_string(&events).unwrap();
+    assert!(!text.contains("private goal"));
+    assert!(!text.contains("ship"));
+    assert!(!text.contains("test-key"));
+}
+
+#[tokio::test]
+async fn branch_creation_and_switch_are_recorded_in_debug_log() {
+    let server = MockServer::start().await;
+    mount(&server, response("Shared answer", true)).await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let log_path = directory.path().join("context.jsonl");
+    let mut file = NamedTempFile::new().unwrap();
+    write!(
+        file,
+        "api_key = \"test-key\"\nbase_url = \"{}\"\n[context]\nstrategy = \"branching\"\n[debug]\nlog_path = \"{}\"\n",
+        server.uri(),
+        log_path.display(),
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(
+        &Config::load(file.path(), None).unwrap(),
+        DialogStore::open(&database).unwrap(),
+    )
+    .unwrap();
+    agent.run_with_prompt("Shared question").await.unwrap();
+
+    let fork = agent.branch_dialog().unwrap();
+    agent.switch_branch(fork.new_dialog_id).unwrap();
+
+    let events: Vec<Value> = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(events.iter().any(|event| {
+        event["event"] == "branch_created"
+            && event["details"]["original_dialog_id"] == fork.original_dialog_id
+            && event["details"]["new_dialog_id"] == fork.new_dialog_id
+    }));
+    assert!(events.iter().any(|event| {
+        event["event"] == "branch_switched" && event["details"]["dialog_id"] == fork.new_dialog_id
+    }));
 }

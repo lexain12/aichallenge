@@ -8,7 +8,7 @@ use crate::config::{Config, ContextConfig, ContextStrategy};
 use crate::context::{
     ContextState, ContextStats, ContextSummary, plan_compaction, prepare_request, stats,
 };
-use crate::debug_log::DebugLog;
+use crate::debug_log::{DebugLog, RequestMetadata};
 use crate::dialog::{BranchInfo, DialogStore, ForkResult, StoreError};
 use crate::facts::{FactsState, parse_facts_json, plan_facts_update};
 
@@ -165,9 +165,21 @@ impl Agent {
         if persistent {
             self.history.push(Role::User, prompt.to_owned());
         }
-        if let Some(error) = self
-            .debug_log
-            .log_request("chat", prepared.messages(), boundary)
+        let facts_boundary = if self.context_config.strategy() == ContextStrategy::StickyFacts {
+            candidate_facts.covered_message_count()
+        } else {
+            0
+        };
+        let request_metadata = RequestMetadata::new(
+            self.context_config.strategy(),
+            prepared.system_block_names().to_vec(),
+            prepared.selected_message_count(),
+            boundary,
+            facts_boundary,
+        );
+        if let Some(error) =
+            self.debug_log
+                .log_request("chat", prepared.messages(), &request_metadata)
         {
             emit_event(&mut on_event, AgentEvent::DebugLogFailed { error })?;
         }
@@ -240,6 +252,15 @@ impl Agent {
                     branch.checkpoint_message_count
                 }),
         });
+        let _ = self.debug_log.log_event(
+            "branch_created",
+            serde_json::json!({
+                "original_dialog_id": fork.original_dialog_id,
+                "new_dialog_id": fork.new_dialog_id,
+                "branch_group_id": fork.branch_group_id,
+                "checkpoint_message_count": fork.checkpoint_message_count,
+            }),
+        );
         Ok(fork)
     }
 
@@ -257,6 +278,16 @@ impl Agent {
         self.branch_info = dialog.branch;
         self.dialog_id = Some(dialog.id);
         self.last_usage = last_usage;
+        let _ = self.debug_log.log_event(
+            "branch_switched",
+            serde_json::json!({
+                "dialog_id": target_id,
+                "branch_group_id": self
+                    .branch_info
+                    .as_ref()
+                    .map(|branch| branch.branch_group_id),
+            }),
+        );
         Ok(())
     }
 
@@ -264,8 +295,12 @@ impl Agent {
         stats(
             &self.history,
             &self.context_state,
-            self.context_config.strategy() == ContextStrategy::Summary,
-            self.context_config.keep_last_messages(),
+            &self.facts_state,
+            &self.context_config,
+            self.dialog_id,
+            self.branch_info
+                .as_ref()
+                .map(|branch| branch.branch_group_id),
         )
     }
 
@@ -300,6 +335,30 @@ impl Agent {
                 target_boundary: plan.covered_message_count(),
             },
         )?;
+        if let Some(error) = self.debug_log.log_event(
+            "facts_update_started",
+            serde_json::json!({
+                "previous_boundary": self.facts_state.covered_message_count(),
+                "target_boundary": plan.covered_message_count(),
+            }),
+        ) {
+            emit_event(on_event, AgentEvent::DebugLogFailed { error })?;
+        }
+        let request_metadata = RequestMetadata::new(
+            ContextStrategy::StickyFacts,
+            vec!["facts_updater".to_owned()],
+            candidate_messages
+                .len()
+                .saturating_sub(self.facts_state.covered_message_count()),
+            0,
+            self.facts_state.covered_message_count(),
+        );
+        if let Some(error) =
+            self.debug_log
+                .log_request("facts_update", plan.request_messages(), &request_metadata)
+        {
+            emit_event(on_event, AgentEvent::DebugLogFailed { error })?;
+        }
         let result = match self
             .client
             .update_facts(
@@ -310,24 +369,28 @@ impl Agent {
         {
             Ok(result) => result,
             Err(error) => {
-                emit_event(
-                    on_event,
-                    AgentEvent::FactsUpdateFailed {
-                        error: error.to_string(),
-                    },
-                )?;
+                let error = error.to_string();
+                if let Some(log_error) = self
+                    .debug_log
+                    .log_event("facts_update_failed", serde_json::json!({"error": error}))
+                {
+                    emit_event(on_event, AgentEvent::DebugLogFailed { error: log_error })?;
+                }
+                emit_event(on_event, AgentEvent::FactsUpdateFailed { error })?;
                 return Ok(self.facts_state.clone());
             }
         };
         let facts = match parse_facts_json(result.answer()) {
             Ok(facts) => facts,
             Err(error) => {
-                emit_event(
-                    on_event,
-                    AgentEvent::FactsUpdateFailed {
-                        error: error.to_string(),
-                    },
-                )?;
+                let error = error.to_string();
+                if let Some(log_error) = self
+                    .debug_log
+                    .log_event("facts_update_failed", serde_json::json!({"error": error}))
+                {
+                    emit_event(on_event, AgentEvent::DebugLogFailed { error: log_error })?;
+                }
+                emit_event(on_event, AgentEvent::FactsUpdateFailed { error })?;
                 return Ok(self.facts_state.clone());
             }
         };
@@ -344,6 +407,15 @@ impl Agent {
         };
         if self.store.is_some() {
             self.facts_state = state.clone();
+        }
+        if let Some(error) = self.debug_log.log_event(
+            "facts_update_completed",
+            serde_json::json!({
+                "covered_message_count": covered_message_count,
+                "usage": result.usage(),
+            }),
+        ) {
+            emit_event(on_event, AgentEvent::DebugLogFailed { error })?;
         }
         emit_event(
             on_event,
@@ -400,9 +472,16 @@ impl Agent {
             emit_event(on_event, AgentEvent::DebugLogFailed { error })?;
         }
         let previous_boundary = self.context_stats().covered_message_count;
+        let request_metadata = RequestMetadata::new(
+            ContextStrategy::Summary,
+            vec!["summary_compactor".to_owned()],
+            plan.request_messages().len(),
+            previous_boundary,
+            0,
+        );
         if let Some(error) =
             self.debug_log
-                .log_request("compaction", plan.request_messages(), previous_boundary)
+                .log_request("compaction", plan.request_messages(), &request_metadata)
         {
             emit_event(on_event, AgentEvent::DebugLogFailed { error })?;
         }
