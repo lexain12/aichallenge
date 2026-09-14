@@ -2,6 +2,8 @@ use std::fmt::Write as _;
 
 use crate::chat::{ChatHistory, Message, Role};
 use crate::client::TokenUsage;
+use crate::config::{ContextConfig, ContextStrategy};
+use crate::system_context::{SystemBlock, SystemContext};
 
 const SUMMARY_CONTEXT_PREFIX: &str = "Summary of earlier conversation:\n";
 const SUMMARY_SYSTEM_PROMPT: &str = "Create a faithful cumulative summary of the conversation context. Preserve facts, names, decisions, constraints, user preferences, unresolved questions, and exact technical identifiers. Distinguish user statements from assistant suggestions. Do not invent missing information. Return only the updated summary.";
@@ -154,6 +156,107 @@ pub struct ContextStats {
     pub raw_message_count: usize,
     pub ordinary_usage: UsageTotals,
     pub compaction_usage: UsageTotals,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistorySelection {
+    Full,
+    Last(usize),
+    After(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedContext {
+    messages: Vec<Message>,
+    selected_message_count: usize,
+    summary_boundary: usize,
+    system_block_names: Vec<String>,
+}
+
+impl PreparedContext {
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    pub fn selected_message_count(&self) -> usize {
+        self.selected_message_count
+    }
+
+    pub fn summary_boundary(&self) -> usize {
+        self.summary_boundary
+    }
+
+    pub fn system_block_names(&self) -> &[String] {
+        &self.system_block_names
+    }
+}
+
+pub fn assemble_request(
+    system: &SystemContext,
+    ordinary_messages: &[Message],
+    selection: HistorySelection,
+) -> Vec<Message> {
+    let start = match selection {
+        HistorySelection::Full => 0,
+        HistorySelection::Last(count) => ordinary_messages.len().saturating_sub(count),
+        HistorySelection::After(boundary) => boundary.min(ordinary_messages.len()),
+    };
+    let mut request = system.to_messages();
+    request.extend(ordinary_messages[start..].iter().cloned());
+    request
+}
+
+pub fn prepare_request(
+    history: &ChatHistory,
+    state: &ContextState,
+    config: &ContextConfig,
+    user_message: &str,
+    additional_system_blocks: &[SystemBlock],
+) -> PreparedContext {
+    let mut system = SystemContext::default();
+    system.push(SystemBlock::new("base", history.system_prompt()));
+
+    let (selection, summary_boundary) = match config.strategy() {
+        ContextStrategy::Summary => {
+            let summary = compatible_summary(history, state, true, config.keep_last_messages());
+            if let Some(summary) = summary {
+                system.push(SystemBlock::new(
+                    "summary",
+                    format!("{SUMMARY_CONTEXT_PREFIX}{}", summary.content()),
+                ));
+            }
+            let boundary = summary.map_or(0, ContextSummary::covered_message_count);
+            (HistorySelection::After(boundary), boundary)
+        }
+        ContextStrategy::SlidingWindow | ContextStrategy::StickyFacts => {
+            (HistorySelection::Last(config.keep_last_messages()), 0)
+        }
+        ContextStrategy::Branching => (HistorySelection::Full, 0),
+    };
+
+    for block in additional_system_blocks {
+        system.push(block.clone());
+    }
+    let system_block_names = system
+        .blocks()
+        .iter()
+        .map(|block| block.name().to_owned())
+        .collect();
+    let mut ordinary_messages = history.messages().to_vec();
+    ordinary_messages.push(Message::new(Role::User, user_message.to_owned()));
+    let selected_message_count = match selection {
+        HistorySelection::Full => ordinary_messages.len(),
+        HistorySelection::Last(count) => ordinary_messages.len().min(count),
+        HistorySelection::After(boundary) => ordinary_messages.len().saturating_sub(boundary),
+    };
+    let messages = assemble_request(&system, &ordinary_messages, selection);
+
+    PreparedContext {
+        messages,
+        selected_message_count,
+        summary_boundary,
+        system_block_names,
+    }
 }
 
 pub fn build_request_messages(

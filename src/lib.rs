@@ -7,4 +7,5 @@ pub mod config;
 pub mod context;
 pub mod debug_log;
 pub mod dialog;
+pub mod system_context;
 pub mod terminal;

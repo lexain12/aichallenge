@@ -1,8 +1,11 @@
 use deepseek_cli::chat::{ChatHistory, Role};
 use deepseek_cli::client::TokenUsage;
+use deepseek_cli::config::{Config, ContextConfig};
 use deepseek_cli::context::{
-    ContextState, ContextSummary, UsageTotals, build_request_messages, plan_compaction,
+    ContextState, ContextSummary, HistorySelection, UsageTotals, assemble_request,
+    build_request_messages, plan_compaction, prepare_request,
 };
+use deepseek_cli::system_context::{SystemBlock, SystemContext};
 
 fn history() -> ChatHistory {
     let mut history = ChatHistory::new("Original system".into());
@@ -10,6 +13,80 @@ fn history() -> ChatHistory {
     history.commit_turn("u2".into(), "a2".into());
     history.commit_turn("u3".into(), "a3".into());
     history
+}
+
+fn context_config(strategy: &str, keep: usize) -> ContextConfig {
+    let source = format!(
+        "api_key = \"key\"\n[context]\nstrategy = \"{strategy}\"\nkeep_last_messages = {keep}"
+    );
+    Config::from_toml(&source, None).unwrap().context().clone()
+}
+
+#[test]
+fn system_blocks_are_ordered_before_windowed_history() {
+    let mut system = SystemContext::default();
+    system.push(SystemBlock::new("base", "Base rules"));
+    system.push(SystemBlock::new("profile", "Future profile"));
+    let ordinary = vec![
+        deepseek_cli::chat::Message::for_request(Role::User, "u1"),
+        deepseek_cli::chat::Message::for_request(Role::Assistant, "a1"),
+        deepseek_cli::chat::Message::for_request(Role::User, "u2"),
+    ];
+
+    let request = assemble_request(&system, &ordinary, HistorySelection::Last(2));
+
+    assert_eq!(
+        request
+            .iter()
+            .map(deepseek_cli::chat::Message::content)
+            .collect::<Vec<_>>(),
+        ["Base rules", "Future profile", "a1", "u2"]
+    );
+    assert_eq!(request[0].role(), Role::System);
+    assert_eq!(request[1].role(), Role::System);
+}
+
+#[test]
+fn pending_user_message_counts_toward_sliding_window() {
+    let config = context_config("sliding_window", 2);
+    let request = prepare_request(&history(), &ContextState::default(), &config, "next", &[]);
+
+    assert_eq!(
+        request
+            .messages()
+            .iter()
+            .map(deepseek_cli::chat::Message::content)
+            .collect::<Vec<_>>(),
+        ["Original system", "a3", "next"]
+    );
+    assert_eq!(request.selected_message_count(), 2);
+}
+
+#[test]
+fn branching_selects_complete_history_and_additional_system_blocks_stay_protected() {
+    let config = context_config("branching", 1);
+    let extra = [SystemBlock::new("runtime", "Runtime rules")];
+    let request = prepare_request(
+        &history(),
+        &ContextState::with_summary(ContextSummary::new("ignored", 2)),
+        &config,
+        "next",
+        &extra,
+    );
+
+    assert_eq!(request.selected_message_count(), 7);
+    assert_eq!(request.summary_boundary(), 0);
+    assert_eq!(request.system_block_names(), ["base", "runtime"]);
+    assert_eq!(request.messages()[0].content(), "Original system");
+    assert_eq!(request.messages()[1].content(), "Runtime rules");
+    assert_eq!(request.messages()[2].content(), "u1");
+    assert_eq!(request.messages().last().unwrap().content(), "next");
+    assert!(
+        !request
+            .messages()
+            .iter()
+            .any(|message| message.content() == "ignored")
+    );
 }
 
 #[test]
