@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use deepseek_cli::chat::ChatHistory;
+use deepseek_cli::chat::{ChatHistory, Message, Role};
 use deepseek_cli::client::DeepSeekClient;
 use deepseek_cli::config::Config;
 use serde_json::json;
@@ -239,4 +239,58 @@ async fn propagates_output_failure() {
         .to_string();
 
     assert!(error.contains("output closed"), "unexpected error: {error}");
+}
+
+#[tokio::test]
+async fn summary_call_uses_deterministic_isolated_options_and_returns_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_json(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "Summarize faithfully."},
+                {"role": "user", "content": "user: one\nassistant: two"}
+            ],
+            "temperature": 0.0,
+            "max_tokens": 64,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "thinking": {"type": "disabled"}
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"summary\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\ndata: [DONE]\n\n",
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut file = NamedTempFile::new().unwrap();
+    write!(
+        file,
+        r#"
+api_key = "test-key"
+base_url = "{}"
+model = "test-model"
+top_p = 0.7
+stop = ["END"]
+thinking = "enabled"
+"#,
+        server.uri()
+    )
+    .unwrap();
+    let config = Config::load(file.path(), None).unwrap();
+    let client = DeepSeekClient::new(&config).unwrap();
+    let messages = vec![
+        Message::for_request(Role::System, "Summarize faithfully."),
+        Message::for_request(Role::User, "user: one\nassistant: two"),
+    ];
+
+    let result = client.summarize(&messages, 64).await.unwrap();
+
+    assert_eq!(result.answer(), "summary");
+    assert_eq!(result.usage().unwrap().total_tokens, 10);
 }

@@ -21,6 +21,10 @@ pub struct Message {
 }
 
 impl Message {
+    pub fn for_request(role: Role, content: impl Into<String>) -> Self {
+        Self::new(role, content.into())
+    }
+
     pub(crate) fn new(role: Role, content: String) -> Self {
         Self {
             role,

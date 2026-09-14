@@ -81,6 +81,66 @@ impl DeepSeekClient {
     pub async fn stream_chat_events<F>(
         &self,
         messages: &[Message],
+        on_event: F,
+    ) -> Result<String, ClientError>
+    where
+        F: FnMut(StreamEvent<'_>) -> io::Result<()>,
+    {
+        self.stream_chat_events_with_options(
+            messages,
+            RequestOptions {
+                temperature: self.temperature,
+                max_tokens: self.max_tokens,
+                thinking: if self.disable_thinking {
+                    Some(Thinking { r#type: "disabled" })
+                } else {
+                    self.thinking
+                        .as_deref()
+                        .map(|value| Thinking { r#type: value })
+                },
+                top_p: self.top_p,
+                stop: &self.stop,
+            },
+            on_event,
+        )
+        .await
+    }
+
+    pub async fn summarize(
+        &self,
+        messages: &[Message],
+        max_tokens: u32,
+    ) -> Result<SummaryResult, ClientError> {
+        let mut usage = None;
+        let empty_stop: &[String] = &[];
+        let answer = self
+            .stream_chat_events_with_options(
+                messages,
+                RequestOptions {
+                    temperature: 0.0,
+                    max_tokens,
+                    thinking: Some(Thinking { r#type: "disabled" }),
+                    top_p: None,
+                    stop: empty_stop,
+                },
+                |event| {
+                    if let StreamEvent::Usage(value) = event {
+                        usage = Some(value);
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+        if answer.trim().is_empty() {
+            return Err(ClientError::EmptyAnswer);
+        }
+        Ok(SummaryResult { answer, usage })
+    }
+
+    async fn stream_chat_events_with_options<F>(
+        &self,
+        messages: &[Message],
+        options: RequestOptions<'_>,
         mut on_event: F,
     ) -> Result<String, ClientError>
     where
@@ -93,21 +153,15 @@ impl DeepSeekClient {
             .json(&ChatRequest {
                 model: &self.model,
                 messages,
-                temperature: self.temperature,
-                max_tokens: self.max_tokens,
+                temperature: options.temperature,
+                max_tokens: options.max_tokens,
                 stream: true,
                 stream_options: self.include_usage.then_some(StreamOptions {
                     include_usage: true,
                 }),
-                thinking: if self.disable_thinking {
-                    Some(Thinking { r#type: "disabled" })
-                } else {
-                    self.thinking
-                        .as_deref()
-                        .map(|value| Thinking { r#type: value })
-                },
-                top_p: self.top_p,
-                stop: &self.stop,
+                thinking: options.thinking,
+                top_p: options.top_p,
+                stop: options.stop,
             })
             .send()
             .await
@@ -154,6 +208,30 @@ impl DeepSeekClient {
             Err(ClientError::IncompleteStream)
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SummaryResult {
+    answer: String,
+    usage: Option<TokenUsage>,
+}
+
+impl SummaryResult {
+    pub fn answer(&self) -> &str {
+        &self.answer
+    }
+
+    pub fn usage(&self) -> Option<TokenUsage> {
+        self.usage
+    }
+}
+
+struct RequestOptions<'a> {
+    temperature: f64,
+    max_tokens: u32,
+    thinking: Option<Thinking<'a>>,
+    top_p: Option<f64>,
+    stop: &'a [String],
 }
 
 async fn read_error_body(
