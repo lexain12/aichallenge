@@ -196,6 +196,38 @@ async fn run() -> Result<(), AppError> {
                             BlockStyle::Error,
                             &format!("context compaction failed: {error}"),
                         ),
+                        AgentEvent::FactsUpdateStarted {
+                            previous_boundary,
+                            target_boundary,
+                        } => {
+                            if stderr_ui.is_interactive() {
+                                stderr_ui.write_status(
+                                    &mut stderr,
+                                    &format!(
+                                        "Контекст · обновляю facts: {previous_boundary} → {target_boundary}"
+                                    ),
+                                )?;
+                            }
+                            Ok(())
+                        }
+                        AgentEvent::FactsUpdateCompleted {
+                            covered_message_count,
+                            ..
+                        } => {
+                            if stderr_ui.is_interactive() {
+                                stderr_ui.write_status(
+                                    &mut stderr,
+                                    &format!(
+                                        "Контекст · facts обновлены до сообщения {covered_message_count}"
+                                    ),
+                                )?;
+                            }
+                            Ok(())
+                        }
+                        AgentEvent::FactsUpdateFailed { error } => {
+                            deferred_warnings.push(format!("facts update failed: {error}"));
+                            Ok(())
+                        }
                         AgentEvent::DebugLogFailed { error } => {
                             if block.is_some() {
                                 deferred_warnings.push(error);

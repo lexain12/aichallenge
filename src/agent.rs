@@ -2,14 +2,15 @@ use std::io;
 
 use thiserror::Error;
 
-use crate::chat::{ChatHistory, Role};
+use crate::chat::{ChatHistory, Message, Role};
 use crate::client::{ClientError, DeepSeekClient, StreamEvent, TokenUsage};
 use crate::config::{Config, ContextConfig, ContextStrategy};
 use crate::context::{
-    ContextState, ContextStats, ContextSummary, build_request_messages, plan_compaction, stats,
+    ContextState, ContextStats, ContextSummary, plan_compaction, prepare_request, stats,
 };
 use crate::debug_log::DebugLog;
 use crate::dialog::{DialogStore, StoreError};
+use crate::facts::{FactsState, parse_facts_json, plan_facts_update};
 
 /// An API client and its independent conversation, optionally backed by SQLite.
 pub struct Agent {
@@ -21,6 +22,7 @@ pub struct Agent {
     last_usage: Option<TokenUsage>,
     context_config: ContextConfig,
     context_state: ContextState,
+    facts_state: FactsState,
     debug_log: DebugLog,
 }
 
@@ -39,6 +41,7 @@ impl Agent {
         let mut agent = Self::with_store(config, store)?;
         agent.last_usage = dialog.messages.last().and_then(|message| message.usage());
         agent.context_state = dialog.context;
+        agent.facts_state = dialog.facts;
         agent.history = ChatHistory::from_messages(dialog.system_prompt, dialog.messages);
         agent.dialog_id = Some(dialog.id);
         Ok(agent)
@@ -63,6 +66,7 @@ impl Agent {
             last_usage: None,
             context_config: config.context().clone(),
             context_state: ContextState::default(),
+            facts_state: FactsState::default(),
             debug_log: DebugLog::from_config(config.debug(), config.api_key()),
         })
     }
@@ -78,6 +82,7 @@ impl Agent {
             last_usage: None,
             context_config: ContextConfig::full_history(),
             context_state: ContextState::default(),
+            facts_state: FactsState::default(),
             debug_log: DebugLog::new(None, false, ""),
         }
     }
@@ -114,17 +119,7 @@ impl Agent {
         if prompt.trim().is_empty() {
             return Err(AgentError::EmptyPrompt);
         }
-        let request = build_request_messages(
-            &self.history,
-            &self.context_state,
-            self.context_config.strategy() == ContextStrategy::Summary,
-            self.context_config.keep_last_messages(),
-            prompt,
-        );
-        let boundary = self.context_stats().covered_message_count;
-        if let Some(error) = self.debug_log.log_request("chat", &request, boundary) {
-            emit_event(&mut on_event, AgentEvent::DebugLogFailed { error })?;
-        }
+        let persistent = self.store.is_some();
         if let Some(store) = &mut self.store {
             match self.dialog_id {
                 Some(id) => {
@@ -134,12 +129,48 @@ impl Agent {
                     self.dialog_id = Some(store.start_dialog(self.history.system_prompt(), prompt)?)
                 }
             }
+        }
+        let mut candidate_messages = self.history.messages().to_vec();
+        candidate_messages.push(Message::new(Role::User, prompt.to_owned()));
+        let facts_result = self
+            .maybe_update_facts(&candidate_messages, &mut on_event)
+            .await;
+        let candidate_facts = match facts_result {
+            Ok(state) => state,
+            Err(error) => {
+                if persistent {
+                    self.history.push(Role::User, prompt.to_owned());
+                }
+                return Err(error);
+            }
+        };
+        let additional_blocks: Vec<_> =
+            if self.context_config.strategy() == ContextStrategy::StickyFacts {
+                candidate_facts.system_block().into_iter().collect()
+            } else {
+                Vec::new()
+            };
+        let prepared = prepare_request(
+            &self.history,
+            &self.context_state,
+            &self.context_config,
+            prompt,
+            &additional_blocks,
+        );
+        let boundary = prepared.summary_boundary();
+        if persistent {
             self.history.push(Role::User, prompt.to_owned());
+        }
+        if let Some(error) = self
+            .debug_log
+            .log_request("chat", prepared.messages(), boundary)
+        {
+            emit_event(&mut on_event, AgentEvent::DebugLogFailed { error })?;
         }
         let mut usage = None;
         let result = self
             .client
-            .stream_chat_events(&request, |event| {
+            .stream_chat_events(prepared.messages(), |event| {
                 if let StreamEvent::Usage(value) = &event {
                     usage = Some(*value);
                 }
@@ -159,6 +190,7 @@ impl Agent {
             store.append_answer(id, self.history.messages().len(), &answer, usage)?;
         } else {
             self.history.push(Role::User, prompt.to_owned());
+            self.facts_state = candidate_facts;
         }
         self.history.push_answer(answer.clone(), usage);
         if let Some(error) = self
@@ -173,6 +205,10 @@ impl Agent {
 
     pub fn history(&self) -> &ChatHistory {
         &self.history
+    }
+
+    pub fn facts_state(&self) -> &FactsState {
+        &self.facts_state
     }
 
     pub fn context_stats(&self) -> ContextStats {
@@ -190,6 +226,83 @@ impl Agent {
         self.dialog_id = None;
         self.last_usage = None;
         self.context_state = ContextState::default();
+        self.facts_state = FactsState::default();
+    }
+
+    async fn maybe_update_facts<F>(
+        &mut self,
+        candidate_messages: &[Message],
+        on_event: &mut F,
+    ) -> Result<FactsState, AgentError>
+    where
+        F: FnMut(AgentEvent<'_>) -> io::Result<()>,
+    {
+        if self.context_config.strategy() != ContextStrategy::StickyFacts {
+            return Ok(self.facts_state.clone());
+        }
+        let Some(plan) = plan_facts_update(candidate_messages, &self.facts_state) else {
+            return Ok(self.facts_state.clone());
+        };
+        emit_event(
+            on_event,
+            AgentEvent::FactsUpdateStarted {
+                previous_boundary: self.facts_state.covered_message_count(),
+                target_boundary: plan.covered_message_count(),
+            },
+        )?;
+        let result = match self
+            .client
+            .update_facts(
+                plan.request_messages(),
+                self.context_config.facts_max_tokens(),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                emit_event(
+                    on_event,
+                    AgentEvent::FactsUpdateFailed {
+                        error: error.to_string(),
+                    },
+                )?;
+                return Ok(self.facts_state.clone());
+            }
+        };
+        let facts = match parse_facts_json(result.answer()) {
+            Ok(facts) => facts,
+            Err(error) => {
+                emit_event(
+                    on_event,
+                    AgentEvent::FactsUpdateFailed {
+                        error: error.to_string(),
+                    },
+                )?;
+                return Ok(self.facts_state.clone());
+            }
+        };
+        let covered_message_count = plan.covered_message_count();
+        let state = if let Some(store) = &mut self.store {
+            let id = self
+                .dialog_id
+                .expect("persistent input created a dialog before facts update");
+            store.replace_facts(id, candidate_messages.len(), facts, result.usage())?
+        } else {
+            self.facts_state
+                .clone()
+                .updated(facts, covered_message_count, result.usage())
+        };
+        if self.store.is_some() {
+            self.facts_state = state.clone();
+        }
+        emit_event(
+            on_event,
+            AgentEvent::FactsUpdateCompleted {
+                covered_message_count,
+                usage: result.usage(),
+            },
+        )?;
+        Ok(state)
     }
 
     async fn maybe_compact<F>(
@@ -317,6 +430,17 @@ pub enum AgentEvent<'a> {
         usage: Option<TokenUsage>,
     },
     CompactionFailed {
+        error: String,
+    },
+    FactsUpdateStarted {
+        previous_boundary: usize,
+        target_boundary: usize,
+    },
+    FactsUpdateCompleted {
+        covered_message_count: usize,
+        usage: Option<TokenUsage>,
+    },
+    FactsUpdateFailed {
         error: String,
     },
     DebugLogFailed {

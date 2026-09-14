@@ -37,6 +37,17 @@ fn compression_config(server: &MockServer, threshold: u64, keep: usize) -> Confi
     Config::load(file.path(), None).unwrap()
 }
 
+fn sticky_config(server: &MockServer, keep: usize) -> Config {
+    let mut file = NamedTempFile::new().unwrap();
+    write!(
+        file,
+        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[context]\nstrategy = \"sticky_facts\"\nkeep_last_messages = {keep}\nfacts_max_tokens = 64\n",
+        server.uri(),
+    )
+    .unwrap();
+    Config::load(file.path(), None).unwrap()
+}
+
 #[derive(Clone)]
 struct SequenceResponder {
     responses: Arc<Mutex<VecDeque<ResponseTemplate>>>,
@@ -97,9 +108,12 @@ fn seen(event: AgentEvent<'_>) -> Seen {
         AgentEvent::CompactionStarted { .. } => Seen::CompactionStarted,
         AgentEvent::CompactionCompleted { .. } => Seen::CompactionCompleted,
         AgentEvent::CompactionFailed { .. } => Seen::CompactionFailed,
-        AgentEvent::Text(_) | AgentEvent::Usage(_) | AgentEvent::DebugLogFailed { .. } => {
-            Seen::Other
-        }
+        AgentEvent::Text(_)
+        | AgentEvent::Usage(_)
+        | AgentEvent::FactsUpdateStarted { .. }
+        | AgentEvent::FactsUpdateCompleted { .. }
+        | AgentEvent::FactsUpdateFailed { .. }
+        | AgentEvent::DebugLogFailed { .. } => Seen::Other,
     }
 }
 
@@ -298,6 +312,9 @@ async fn agents_do_not_share_history_and_forward_stream_events() {
                 AgentEvent::CompactionStarted { .. }
                 | AgentEvent::CompactionCompleted { .. }
                 | AgentEvent::CompactionFailed { .. }
+                | AgentEvent::FactsUpdateStarted { .. }
+                | AgentEvent::FactsUpdateCompleted { .. }
+                | AgentEvent::FactsUpdateFailed { .. }
                 | AgentEvent::DebugLogFailed { .. } => {}
             }
             Ok(())
@@ -610,4 +627,120 @@ async fn failed_compaction_keeps_full_history_and_does_not_fail_user_answer() {
             {"role":"user","content":"second"}
         ])
     );
+}
+
+#[tokio::test]
+async fn sticky_facts_are_updated_persisted_and_sent_before_the_answer() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse(r#"{"goal":"prepare specification"}"#, 5, 2, 7),
+            sse("Understood", 8, 2, 10),
+        ],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dialogs.sqlite3");
+    let mut agent = Agent::with_store(
+        &sticky_config(&server, 3),
+        DialogStore::open(&path).unwrap(),
+    )
+    .unwrap();
+
+    agent
+        .run_with_prompt("We need a specification")
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let facts_body: Value = requests[0].body_json().unwrap();
+    assert_eq!(facts_body["temperature"], 0.0);
+    assert_eq!(facts_body["max_tokens"], 64);
+    assert!(
+        facts_body["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("We need a specification")
+    );
+    let chat_body: Value = requests[1].body_json().unwrap();
+    assert_eq!(
+        chat_body["messages"],
+        json!([
+            {"role": "system", "content": "Be concise."},
+            {"role": "system", "content": "Facts (JSON key-value memory):\n{\"goal\":\"prepare specification\"}"},
+            {"role": "user", "content": "We need a specification"}
+        ])
+    );
+    let stored = DialogStore::open(&path)
+        .unwrap()
+        .load(agent.dialog_id().unwrap())
+        .unwrap();
+    assert_eq!(stored.facts.facts()["goal"], "prepare specification");
+    assert_eq!(stored.facts.covered_message_count(), 1);
+    assert_eq!(stored.facts.update_usage().total_tokens(), 7);
+}
+
+#[tokio::test]
+async fn sticky_facts_failure_recovers_all_uncovered_user_messages() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("not json", 3, 1, 4),
+            sse("First answer", 4, 2, 6),
+            sse(r#"{"deadline":"Monday"}"#, 8, 2, 10),
+            sse("Second answer", 9, 2, 11),
+        ],
+    )
+    .await;
+    let mut agent = Agent::new(&sticky_config(&server, 3)).unwrap();
+
+    agent.run_with_prompt("deadline Friday").await.unwrap();
+    agent
+        .run_with_prompt("cancel Friday; deadline Monday")
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 4);
+    let first_chat: Value = requests[1].body_json().unwrap();
+    assert_eq!(first_chat["messages"].as_array().unwrap().len(), 2);
+    let catch_up: Value = requests[2].body_json().unwrap();
+    let update_input = catch_up["messages"][1]["content"].as_str().unwrap();
+    assert!(update_input.contains("deadline Friday"));
+    assert!(update_input.contains("deadline Monday"));
+    assert!(!update_input.contains("First answer"));
+    let second_chat: Value = requests[3].body_json().unwrap();
+    assert_eq!(
+        second_chat["messages"],
+        json!([
+            {"role": "system", "content": "Be concise."},
+            {"role": "system", "content": "Facts (JSON key-value memory):\n{\"deadline\":\"Monday\"}"},
+            {"role": "user", "content": "deadline Friday"},
+            {"role": "assistant", "content": "First answer"},
+            {"role": "user", "content": "cancel Friday; deadline Monday"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn in_memory_facts_are_not_committed_when_the_answer_fails() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse(r#"{"goal":"ship"}"#, 3, 1, 4),
+            ResponseTemplate::new(500),
+        ],
+    )
+    .await;
+    let mut agent = Agent::new(&sticky_config(&server, 3)).unwrap();
+
+    assert!(agent.run_with_prompt("ship it").await.is_err());
+
+    assert!(agent.history().messages().is_empty());
+    assert!(agent.facts_state().facts().is_empty());
+    assert_eq!(agent.facts_state().covered_message_count(), 0);
 }
