@@ -300,3 +300,59 @@ strategy = "summary"
     assert_eq!(result.answer(), "summary");
     assert_eq!(result.usage().unwrap().total_tokens, 10);
 }
+
+#[tokio::test]
+async fn facts_call_uses_deterministic_isolated_options_and_returns_usage() {
+    let server = MockServer::start().await;
+    let messages = vec![
+        Message::for_request(Role::System, "Return facts JSON."),
+        Message::for_request(Role::User, "New user messages:\n1. ship Monday"),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_json(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "Return facts JSON."},
+                {"role": "user", "content": "New user messages:\n1. ship Monday"}
+            ],
+            "temperature": 0.0,
+            "max_tokens": 512,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "thinking": {"type": "disabled"}
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"deadline\\\":\\\"Monday\\\"}\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3,\"total_tokens\":12}}\n\ndata: [DONE]\n\n",
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut file = NamedTempFile::new().unwrap();
+    write!(
+        file,
+        r#"
+api_key = "test-key"
+base_url = "{}"
+model = "test-model"
+top_p = 0.7
+stop = ["END"]
+thinking = "enabled"
+
+[context]
+strategy = "sticky_facts"
+"#,
+        server.uri()
+    )
+    .unwrap();
+    let client = DeepSeekClient::new(&Config::load(file.path(), None).unwrap()).unwrap();
+
+    let result = client.update_facts(&messages, 512).await.unwrap();
+
+    assert_eq!(result.answer(), r#"{"deadline":"Monday"}"#);
+    assert_eq!(result.usage().unwrap().total_tokens, 12);
+}

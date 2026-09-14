@@ -111,6 +111,22 @@ impl DeepSeekClient {
         messages: &[Message],
         max_tokens: u32,
     ) -> Result<SummaryResult, ClientError> {
+        self.deterministic_service_call(messages, max_tokens).await
+    }
+
+    pub async fn update_facts(
+        &self,
+        messages: &[Message],
+        max_tokens: u32,
+    ) -> Result<SummaryResult, ClientError> {
+        self.deterministic_service_call(messages, max_tokens).await
+    }
+
+    async fn deterministic_service_call(
+        &self,
+        messages: &[Message],
+        max_tokens: u32,
+    ) -> Result<SummaryResult, ClientError> {
         let mut usage = None;
         let empty_stop: &[String] = &[];
         let answer = self
