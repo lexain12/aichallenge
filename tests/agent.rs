@@ -48,6 +48,17 @@ fn sticky_config(server: &MockServer, keep: usize) -> Config {
     Config::load(file.path(), None).unwrap()
 }
 
+fn branching_config(server: &MockServer) -> Config {
+    let mut file = NamedTempFile::new().unwrap();
+    write!(
+        file,
+        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[context]\nstrategy = \"branching\"\n",
+        server.uri(),
+    )
+    .unwrap();
+    Config::load(file.path(), None).unwrap()
+}
+
 #[derive(Clone)]
 struct SequenceResponder {
     responses: Arc<Mutex<VecDeque<ResponseTemplate>>>,
@@ -743,4 +754,84 @@ async fn in_memory_facts_are_not_committed_when_the_answer_fails() {
     assert!(agent.history().messages().is_empty());
     assert!(agent.facts_state().facts().is_empty());
     assert_eq!(agent.facts_state().covered_message_count(), 0);
+}
+
+#[tokio::test]
+async fn branch_and_switch_continue_two_complete_histories_independently() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("Shared answer", 3, 2, 5),
+            sse("Left answer", 7, 2, 9),
+            sse("Right answer", 7, 2, 9),
+        ],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dialogs.sqlite3");
+    let mut agent = Agent::with_store(
+        &branching_config(&server),
+        DialogStore::open(&path).unwrap(),
+    )
+    .unwrap();
+
+    agent.run_with_prompt("Shared question").await.unwrap();
+    let original = agent.dialog_id().unwrap();
+    let fork = agent.branch_dialog().unwrap();
+    assert_eq!(agent.dialog_id(), Some(original));
+    agent.run_with_prompt("Left continuation").await.unwrap();
+    agent.switch_branch(fork.new_dialog_id).unwrap();
+    assert_eq!(agent.dialog_id(), Some(fork.new_dialog_id));
+    agent.run_with_prompt("Right continuation").await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let left: Value = requests[1].body_json().unwrap();
+    assert_eq!(
+        left["messages"],
+        json!([
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Shared question"},
+            {"role": "assistant", "content": "Shared answer"},
+            {"role": "user", "content": "Left continuation"}
+        ])
+    );
+    let right: Value = requests[2].body_json().unwrap();
+    assert_eq!(
+        right["messages"],
+        json!([
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Shared question"},
+            {"role": "assistant", "content": "Shared answer"},
+            {"role": "user", "content": "Right continuation"}
+        ])
+    );
+    let store = DialogStore::open(&path).unwrap();
+    assert_eq!(store.load(original).unwrap().messages.len(), 4);
+    assert_eq!(store.load(fork.new_dialog_id).unwrap().messages.len(), 4);
+}
+
+#[tokio::test]
+async fn branch_operations_reject_wrong_strategy_or_missing_persistent_dialog() {
+    let server = MockServer::start().await;
+    let mut summary = Agent::new(&config(&server)).unwrap();
+    assert!(matches!(
+        summary.branch_dialog(),
+        Err(AgentError::BranchingStrategyRequired)
+    ));
+    assert!(matches!(
+        summary.switch_branch(1),
+        Err(AgentError::BranchingStrategyRequired)
+    ));
+
+    let mut in_memory = Agent::new(&branching_config(&server)).unwrap();
+    assert!(matches!(
+        in_memory.branch_dialog(),
+        Err(AgentError::NoPersistentDialog)
+    ));
+    assert!(matches!(
+        in_memory.switch_branch(1),
+        Err(AgentError::NoPersistentDialog)
+    ));
 }

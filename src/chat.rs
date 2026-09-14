@@ -58,11 +58,33 @@ pub enum InputAction {
     Exit,
     Clear,
     Stats,
+    Branch,
+    Switch(i64),
+    InvalidCommand(String),
     Send(String),
 }
 
 pub fn parse_input(input: &str) -> InputAction {
     let input = input.trim();
+    let mut parts = input.split_whitespace();
+    match parts.next() {
+        Some("/branch") => {
+            return if parts.next().is_none() {
+                InputAction::Branch
+            } else {
+                InputAction::InvalidCommand("usage: /branch".to_owned())
+            };
+        }
+        Some("/switch") => {
+            let id = parts.next().and_then(|value| value.parse::<i64>().ok());
+            return if id.is_some_and(|value| value > 0) && parts.next().is_none() {
+                InputAction::Switch(id.expect("positive ID checked"))
+            } else {
+                InputAction::InvalidCommand("usage: /switch <positive-dialog-id>".to_owned())
+            };
+        }
+        _ => {}
+    }
     match input {
         "" => InputAction::Ignore,
         "/exit" | "/quit" => InputAction::Exit,

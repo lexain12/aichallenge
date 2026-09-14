@@ -49,6 +49,24 @@ summary_max_tokens = 64
     file
 }
 
+fn write_branching_config(base_url: &str) -> NamedTempFile {
+    let mut file = NamedTempFile::new().expect("create temporary config");
+    write!(
+        file,
+        r#"
+api_key = "test-key"
+base_url = "{base_url}"
+model = "test-model"
+timeout_seconds = 5
+
+[context]
+strategy = "branching"
+"#
+    )
+    .expect("write temporary config");
+    file
+}
+
 #[derive(Clone)]
 struct SequenceResponder {
     responses: Arc<Mutex<VecDeque<ResponseTemplate>>>,
@@ -361,4 +379,68 @@ fn end_of_file_exits_successfully_after_prompt() {
         "you> \n"
     );
     assert!(output.stderr.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branches_and_switches_without_extra_api_calls() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse("Answer", 2, 1, 3))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let config = write_branching_config(&server.uri());
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("dialogs.sqlite3");
+
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &[],
+        "Shared question\n/branch\nLeft continuation\n/switch 2\nRight continuation\n/exit\n",
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Checkpoint 2: dialog #1 remains active; created branch #2."));
+    assert!(stdout.contains("Switched to branch #2."));
+    assert!(stdout.contains("you> Shared question\nassistant> Answer"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    let store = DialogStore::open(&database).unwrap();
+    assert_eq!(store.load(1).unwrap().messages.len(), 4);
+    assert_eq!(store.load(2).unwrap().messages.len(), 4);
+    assert_eq!(
+        store.load(1).unwrap().messages[2].content(),
+        "Left continuation"
+    );
+    assert_eq!(
+        store.load(2).unwrap().messages[2].content(),
+        "Right continuation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_or_wrong_strategy_branch_commands_are_local_errors() {
+    let server = MockServer::start().await;
+    let config = write_config(&server.uri());
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("dialogs.sqlite3");
+
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &[],
+        "/switch nope\n/branch\n/exit\n",
+    );
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("usage: /switch <positive-dialog-id>"));
+    assert!(stderr.contains("strategy = branching"));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

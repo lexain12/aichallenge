@@ -9,7 +9,7 @@ use crate::context::{
     ContextState, ContextStats, ContextSummary, plan_compaction, prepare_request, stats,
 };
 use crate::debug_log::DebugLog;
-use crate::dialog::{DialogStore, StoreError};
+use crate::dialog::{BranchInfo, DialogStore, ForkResult, StoreError};
 use crate::facts::{FactsState, parse_facts_json, plan_facts_update};
 
 /// An API client and its independent conversation, optionally backed by SQLite.
@@ -23,6 +23,7 @@ pub struct Agent {
     context_config: ContextConfig,
     context_state: ContextState,
     facts_state: FactsState,
+    branch_info: Option<BranchInfo>,
     debug_log: DebugLog,
 }
 
@@ -42,6 +43,7 @@ impl Agent {
         agent.last_usage = dialog.messages.last().and_then(|message| message.usage());
         agent.context_state = dialog.context;
         agent.facts_state = dialog.facts;
+        agent.branch_info = dialog.branch;
         agent.history = ChatHistory::from_messages(dialog.system_prompt, dialog.messages);
         agent.dialog_id = Some(dialog.id);
         Ok(agent)
@@ -67,6 +69,7 @@ impl Agent {
             context_config: config.context().clone(),
             context_state: ContextState::default(),
             facts_state: FactsState::default(),
+            branch_info: None,
             debug_log: DebugLog::from_config(config.debug(), config.api_key()),
         })
     }
@@ -83,6 +86,7 @@ impl Agent {
             context_config: ContextConfig::full_history(),
             context_state: ContextState::default(),
             facts_state: FactsState::default(),
+            branch_info: None,
             debug_log: DebugLog::new(None, false, ""),
         }
     }
@@ -211,6 +215,51 @@ impl Agent {
         &self.facts_state
     }
 
+    pub fn branch_info(&self) -> Option<&BranchInfo> {
+        self.branch_info.as_ref()
+    }
+
+    pub fn branch_dialog(&mut self) -> Result<ForkResult, AgentError> {
+        if self.context_config.strategy() != ContextStrategy::Branching {
+            return Err(AgentError::BranchingStrategyRequired);
+        }
+        let id = self.dialog_id.ok_or(AgentError::NoPersistentDialog)?;
+        let store = self.store.as_mut().ok_or(AgentError::NoPersistentDialog)?;
+        let fork = store.fork_dialog(id, self.history.messages().len())?;
+        self.branch_info = Some(BranchInfo {
+            dialog_id: id,
+            branch_group_id: fork.branch_group_id,
+            parent_dialog_id: self
+                .branch_info
+                .as_ref()
+                .and_then(|branch| branch.parent_dialog_id),
+            checkpoint_message_count: self
+                .branch_info
+                .as_ref()
+                .map_or(fork.checkpoint_message_count, |branch| {
+                    branch.checkpoint_message_count
+                }),
+        });
+        Ok(fork)
+    }
+
+    pub fn switch_branch(&mut self, target_id: i64) -> Result<(), AgentError> {
+        if self.context_config.strategy() != ContextStrategy::Branching {
+            return Err(AgentError::BranchingStrategyRequired);
+        }
+        let current_id = self.dialog_id.ok_or(AgentError::NoPersistentDialog)?;
+        let store = self.store.as_ref().ok_or(AgentError::NoPersistentDialog)?;
+        let dialog = store.load_branch_member(current_id, target_id)?;
+        let last_usage = dialog.messages.last().and_then(|message| message.usage());
+        self.history = ChatHistory::from_messages(dialog.system_prompt, dialog.messages);
+        self.context_state = dialog.context;
+        self.facts_state = dialog.facts;
+        self.branch_info = dialog.branch;
+        self.dialog_id = Some(dialog.id);
+        self.last_usage = last_usage;
+        Ok(())
+    }
+
     pub fn context_stats(&self) -> ContextStats {
         stats(
             &self.history,
@@ -227,6 +276,7 @@ impl Agent {
         self.last_usage = None;
         self.context_state = ContextState::default();
         self.facts_state = FactsState::default();
+        self.branch_info = None;
     }
 
     async fn maybe_update_facts<F>(
@@ -454,6 +504,10 @@ pub enum AgentError {
     MissingPrompt,
     #[error("prompt must not be empty")]
     EmptyPrompt,
+    #[error("branch commands require context strategy = branching")]
+    BranchingStrategyRequired,
+    #[error("branch commands require a persisted active dialog")]
+    NoPersistentDialog,
     #[error(transparent)]
     Client(#[from] ClientError),
     #[error(transparent)]

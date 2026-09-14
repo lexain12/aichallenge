@@ -7,6 +7,18 @@ fn recognizes_commands_and_ignores_blank_input() {
     assert_eq!(parse_input(" /quit "), InputAction::Exit);
     assert_eq!(parse_input("/clear"), InputAction::Clear);
     assert_eq!(parse_input(" /stats "), InputAction::Stats);
+    assert_eq!(parse_input("/branch"), InputAction::Branch);
+    assert_eq!(parse_input("/switch 42"), InputAction::Switch(42));
+    assert_eq!(parse_input("/switch\t42"), InputAction::Switch(42));
+    for input in [
+        "/branch extra",
+        "/switch",
+        "/switch 0",
+        "/switch nope",
+        "/switch 1 extra",
+    ] {
+        assert!(matches!(parse_input(input), InputAction::InvalidCommand(_)));
+    }
     assert_eq!(
         parse_input(" hello world "),
         InputAction::Send("hello world".into())

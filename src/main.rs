@@ -147,6 +147,48 @@ async fn run() -> Result<(), AppError> {
             InputAction::Stats => {
                 stdout_ui.write_context_stats(&mut stdout, agent.context_stats())?;
             }
+            InputAction::Branch => match agent.branch_dialog() {
+                Ok(fork) => stdout_ui.write_block(
+                    &mut stdout,
+                    BlockStyle::System,
+                    &format!(
+                        "Checkpoint {}: dialog #{} remains active; created branch #{}.",
+                        fork.checkpoint_message_count, fork.original_dialog_id, fork.new_dialog_id
+                    ),
+                )?,
+                Err(error) => stderr_ui.write_block(
+                    &mut stderr,
+                    BlockStyle::Error,
+                    &format!("error: {error}"),
+                )?,
+            },
+            InputAction::Switch(id) => match agent.switch_branch(id) {
+                Ok(()) => {
+                    stdout_ui.write_block(
+                        &mut stdout,
+                        BlockStyle::System,
+                        &format!("Switched to branch #{id}."),
+                    )?;
+                    for message in agent.history().messages() {
+                        let (style, prefix) = match message.role() {
+                            Role::User => (BlockStyle::User, "you> "),
+                            Role::Assistant => (BlockStyle::Assistant, "assistant> "),
+                            Role::System => (BlockStyle::System, "system> "),
+                        };
+                        let mut replay = stdout_ui.start_block(&mut stdout, style, prefix)?;
+                        replay.write_text(message.content())?;
+                        replay.finish()?;
+                    }
+                }
+                Err(error) => stderr_ui.write_block(
+                    &mut stderr,
+                    BlockStyle::Error,
+                    &format!("error: {error}"),
+                )?,
+            },
+            InputAction::InvalidCommand(error) => {
+                stderr_ui.write_block(&mut stderr, BlockStyle::Error, &error)?;
+            }
             InputAction::Send(user_message) => {
                 show_usage = true;
                 let mut block = Some(stdout_ui.start_response(&mut stdout)?);
