@@ -292,3 +292,107 @@ fn stale_failed_or_malformed_facts_never_replace_valid_state() {
         .unwrap();
     assert!(matches!(store.load(1), Err(StoreError::InvalidFacts(_))));
 }
+
+#[test]
+fn fork_copies_checkpoint_state_and_branches_continue_independently() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let mut store = DialogStore::open(&path).unwrap();
+    let original = store.start_dialog("System", "u1").unwrap();
+    let usage = TokenUsage {
+        prompt_tokens: 4,
+        completion_tokens: 2,
+        total_tokens: 6,
+        completion_tokens_details: None,
+    };
+    store.append_answer(original, 1, "a1", Some(usage)).unwrap();
+    store.append_message(original, 2, Role::User, "u2").unwrap();
+    store.append_answer(original, 3, "a2", None).unwrap();
+    store
+        .replace_context(original, 4, ContextSummary::new("summary", 2), Some(usage))
+        .unwrap();
+    store
+        .replace_facts(
+            original,
+            4,
+            Facts::from([("goal".into(), "branch safely".into())]),
+            Some(usage),
+        )
+        .unwrap();
+
+    let fork = store.fork_dialog(original, 4).unwrap();
+
+    assert_eq!(fork.original_dialog_id, original);
+    assert_ne!(fork.new_dialog_id, original);
+    assert_eq!(fork.checkpoint_message_count, 4);
+    let left = store.load(original).unwrap();
+    let right = store.load(fork.new_dialog_id).unwrap();
+    assert_eq!(right.messages, left.messages);
+    assert_eq!(right.messages[1].usage(), Some(usage));
+    assert_eq!(right.context, left.context);
+    assert_eq!(right.facts, left.facts);
+    assert_eq!(left.branch.as_ref().unwrap().branch_group_id, original);
+    assert_eq!(right.branch.as_ref().unwrap().branch_group_id, original);
+    assert_eq!(
+        right.branch.as_ref().unwrap().parent_dialog_id,
+        Some(original)
+    );
+
+    store
+        .append_message(original, 4, Role::User, "left only")
+        .unwrap();
+    store
+        .append_message(fork.new_dialog_id, 4, Role::User, "right only")
+        .unwrap();
+    let left = store.load(original).unwrap();
+    let right = store.load(fork.new_dialog_id).unwrap();
+    assert_eq!(left.messages.last().unwrap().content(), "left only");
+    assert_eq!(right.messages.last().unwrap().content(), "right only");
+
+    let selected = store
+        .load_branch_member(original, fork.new_dialog_id)
+        .unwrap();
+    assert_eq!(selected.id, fork.new_dialog_id);
+}
+
+#[test]
+fn failed_or_stale_fork_rolls_back_and_unrelated_dialog_cannot_be_selected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let mut store = DialogStore::open(&path).unwrap();
+    let original = store.start_dialog("System", "u1").unwrap();
+    let unrelated = store.start_dialog("System", "other").unwrap();
+
+    assert!(matches!(
+        store.fork_dialog(original, 2),
+        Err(StoreError::Conflict(found)) if found == original
+    ));
+    assert_eq!(store.list().unwrap().len(), 2);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER reject_branch_copy BEFORE INSERT ON messages
+             WHEN NEW.dialog_id NOT IN ({original}, {unrelated})
+             BEGIN SELECT RAISE(ABORT, 'copy failed'); END;"
+        ))
+        .unwrap();
+    assert!(store.fork_dialog(original, 1).is_err());
+    assert_eq!(store.list().unwrap().len(), 2);
+    connection
+        .execute_batch("DROP TRIGGER reject_branch_copy;")
+        .unwrap();
+
+    let fork = store.fork_dialog(original, 1).unwrap();
+    assert!(matches!(
+        store.load_branch_member(original, unrelated),
+        Err(StoreError::UnrelatedBranch { current, target })
+            if current == original && target == unrelated
+    ));
+    assert!(matches!(
+        store.load_branch_member(original, 9999),
+        Err(StoreError::NotFound(9999))
+    ));
+    assert_eq!(store.list().unwrap().len(), 3);
+    assert_eq!(store.load(fork.new_dialog_id).unwrap().messages.len(), 1);
+}

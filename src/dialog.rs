@@ -19,6 +19,23 @@ pub struct StoredDialog {
     pub messages: Vec<Message>,
     pub context: ContextState,
     pub facts: FactsState,
+    pub branch: Option<BranchInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchInfo {
+    pub dialog_id: i64,
+    pub branch_group_id: i64,
+    pub parent_dialog_id: Option<i64>,
+    pub checkpoint_message_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForkResult {
+    pub original_dialog_id: i64,
+    pub new_dialog_id: i64,
+    pub branch_group_id: i64,
+    pub checkpoint_message_count: usize,
 }
 
 pub struct DialogSummary {
@@ -75,7 +92,19 @@ impl DialogStore {
                  known_total_tokens INTEGER NOT NULL DEFAULT 0,
                  missing_usage_count INTEGER NOT NULL DEFAULT 0,
                  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+             );
+             CREATE TABLE IF NOT EXISTS dialog_branches (
+                 dialog_id INTEGER PRIMARY KEY REFERENCES dialogs(id),
+                 branch_group_id INTEGER NOT NULL REFERENCES dialogs(id),
+                 parent_dialog_id INTEGER REFERENCES dialogs(id),
+                 checkpoint_message_count INTEGER NOT NULL CHECK (checkpoint_message_count >= 0),
+                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
              );",
+        )?;
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS dialog_branches_by_group
+             ON dialog_branches(branch_group_id, dialog_id)",
+            [],
         )?;
         Ok(Self { connection })
     }
@@ -354,6 +383,156 @@ impl DialogStore {
         Ok(state)
     }
 
+    pub fn fork_dialog(
+        &mut self,
+        id: i64,
+        expected_message_count: usize,
+    ) -> Result<ForkResult, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let source = tx
+            .query_row(
+                "SELECT system_prompt, title FROM dialogs WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound(id))?;
+        let count: i64 = tx.query_row(
+            "SELECT count(*) FROM messages WHERE dialog_id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(count).ok() != Some(expected_message_count) {
+            return Err(StoreError::Conflict(id));
+        }
+        let existing_group = tx
+            .query_row(
+                "SELECT branch_group_id FROM dialog_branches WHERE dialog_id = ?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let branch_group_id = existing_group.unwrap_or(id);
+        if existing_group.is_none() {
+            tx.execute(
+                "INSERT INTO dialog_branches (
+                     dialog_id, branch_group_id, parent_dialog_id, checkpoint_message_count
+                 ) VALUES (?1, ?1, NULL, ?2)",
+                params![id, to_i64(expected_message_count)?],
+            )?;
+        }
+
+        tx.execute(
+            "INSERT INTO dialogs (system_prompt, title) VALUES (?1, ?2)",
+            params![source.0, format!("{} (branch)", source.1)],
+        )?;
+        let new_dialog_id = tx.last_insert_rowid();
+        let source_messages = {
+            let mut statement = tx.prepare(
+                "SELECT m.role, m.content, m.created_at, u.usage_json
+                 FROM messages m
+                 LEFT JOIN message_usage u ON u.message_id = m.id
+                 WHERE m.dialog_id = ?1 ORDER BY m.id",
+            )?;
+            statement
+                .query_map([id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut last_message_id = 0;
+        for (role, content, created_at, usage_json) in source_messages {
+            tx.execute(
+                "INSERT INTO messages (dialog_id, role, content, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![new_dialog_id, role, content, created_at],
+            )?;
+            last_message_id = tx.last_insert_rowid();
+            if let Some(usage_json) = usage_json {
+                tx.execute(
+                    "INSERT INTO message_usage (message_id, usage_json) VALUES (?1, ?2)",
+                    params![last_message_id, usage_json],
+                )?;
+            }
+        }
+        tx.execute(
+            "UPDATE dialogs SET last_message_id = ?1 WHERE id = ?2",
+            params![last_message_id, new_dialog_id],
+        )?;
+        tx.execute(
+            "INSERT INTO dialog_context (
+                 dialog_id, summary, covered_message_count, compaction_count,
+                 known_prompt_tokens, known_completion_tokens,
+                 known_total_tokens, missing_usage_count
+             )
+             SELECT ?1, summary, covered_message_count, compaction_count,
+                    known_prompt_tokens, known_completion_tokens,
+                    known_total_tokens, missing_usage_count
+             FROM dialog_context WHERE dialog_id = ?2",
+            params![new_dialog_id, id],
+        )?;
+        tx.execute(
+            "INSERT INTO dialog_facts (
+                 dialog_id, facts_json, covered_message_count, update_count,
+                 known_prompt_tokens, known_completion_tokens,
+                 known_total_tokens, missing_usage_count
+             )
+             SELECT ?1, facts_json, covered_message_count, update_count,
+                    known_prompt_tokens, known_completion_tokens,
+                    known_total_tokens, missing_usage_count
+             FROM dialog_facts WHERE dialog_id = ?2",
+            params![new_dialog_id, id],
+        )?;
+        tx.execute(
+            "INSERT INTO dialog_branches (
+                 dialog_id, branch_group_id, parent_dialog_id, checkpoint_message_count
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                new_dialog_id,
+                branch_group_id,
+                id,
+                to_i64(expected_message_count)?,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ForkResult {
+            original_dialog_id: id,
+            new_dialog_id,
+            branch_group_id,
+            checkpoint_message_count: expected_message_count,
+        })
+    }
+
+    pub fn load_branch_member(
+        &self,
+        current_id: i64,
+        target_id: i64,
+    ) -> Result<StoredDialog, StoreError> {
+        let current = self.load(current_id)?;
+        let current_branch = current
+            .branch
+            .ok_or(StoreError::NoBranchGroup(current_id))?;
+        let target = self.load(target_id)?;
+        let same_group = target
+            .branch
+            .as_ref()
+            .is_some_and(|branch| branch.branch_group_id == current_branch.branch_group_id);
+        if !same_group {
+            return Err(StoreError::UnrelatedBranch {
+                current: current_id,
+                target: target_id,
+            });
+        }
+        Ok(target)
+    }
+
     pub fn load(&self, id: i64) -> Result<StoredDialog, StoreError> {
         // Read metadata and messages from a single SQLite snapshot.
         let tx = self.connection.unchecked_transaction()?;
@@ -433,6 +612,21 @@ impl DialogStore {
             )
             .optional()?;
         let facts = decode_facts(stored_facts, messages.len())?;
+        let stored_branch = tx
+            .query_row(
+                "SELECT branch_group_id, parent_dialog_id, checkpoint_message_count
+                 FROM dialog_branches WHERE dialog_id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let branch = decode_branch(id, stored_branch, messages.len())?;
         tx.commit()?;
         Ok(StoredDialog {
             id,
@@ -440,6 +634,7 @@ impl DialogStore {
             messages,
             context,
             facts,
+            branch,
         })
     }
 
@@ -530,6 +725,32 @@ fn decode_facts(
     ))
 }
 
+fn decode_branch(
+    dialog_id: i64,
+    row: Option<(i64, Option<i64>, i64)>,
+    message_count: usize,
+) -> Result<Option<BranchInfo>, StoreError> {
+    let Some((branch_group_id, parent_dialog_id, checkpoint)) = row else {
+        return Ok(None);
+    };
+    if branch_group_id <= 0 || parent_dialog_id.is_some_and(|parent| parent <= 0) {
+        return Err(StoreError::InvalidBranch("invalid dialog identifier"));
+    }
+    let checkpoint_message_count = usize::try_from(checkpoint)
+        .map_err(|_| StoreError::InvalidBranch("negative checkpoint boundary"))?;
+    if checkpoint_message_count > message_count {
+        return Err(StoreError::InvalidBranch(
+            "checkpoint boundary exceeds dialog history",
+        ));
+    }
+    Ok(Some(BranchInfo {
+        dialog_id,
+        branch_group_id,
+        parent_dialog_id,
+        checkpoint_message_count,
+    }))
+}
+
 fn to_i64(value: impl TryInto<i64>) -> Result<i64, StoreError> {
     value
         .try_into()
@@ -552,4 +773,10 @@ pub enum StoreError {
     InvalidContext(&'static str),
     #[error("invalid dialog facts: {0}")]
     InvalidFacts(&'static str),
+    #[error("dialog {0} has no branch group; create a branch first")]
+    NoBranchGroup(i64),
+    #[error("dialog {target} is not in the branch group of dialog {current}")]
+    UnrelatedBranch { current: i64, target: i64 },
+    #[error("invalid dialog branch metadata: {0}")]
+    InvalidBranch(&'static str),
 }
