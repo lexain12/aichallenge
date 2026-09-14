@@ -20,6 +20,9 @@ system_prompt = "Be concise."
 temperature = 0.5
 max_tokens = 128
 timeout_seconds = 5
+
+[context]
+strategy = "summary"
 "#,
         server.uri()
     )
@@ -278,6 +281,9 @@ model = "test-model"
 top_p = 0.7
 stop = ["END"]
 thinking = "enabled"
+
+[context]
+strategy = "summary"
 "#,
         server.uri()
     )

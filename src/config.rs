@@ -15,14 +15,25 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_COMPACT_AFTER_PROMPT_TOKENS: u64 = 6000;
 const DEFAULT_KEEP_LAST_MESSAGES: usize = 10;
 const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 1024;
+const DEFAULT_FACTS_MAX_TOKENS: u32 = 512;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextStrategy {
+    Summary,
+    SlidingWindow,
+    StickyFacts,
+    Branching,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawContextConfig {
-    enabled: Option<bool>,
+    strategy: Option<ContextStrategy>,
     compact_after_prompt_tokens: Option<u64>,
     keep_last_messages: Option<usize>,
     summary_max_tokens: Option<u32>,
+    facts_max_tokens: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -54,24 +65,26 @@ struct RawConfig {
 
 #[derive(Clone, Debug)]
 pub struct ContextConfig {
-    enabled: bool,
+    strategy: ContextStrategy,
     compact_after_prompt_tokens: u64,
     keep_last_messages: usize,
     summary_max_tokens: u32,
+    facts_max_tokens: u32,
 }
 
 impl ContextConfig {
-    pub(crate) fn disabled() -> Self {
+    pub(crate) fn full_history() -> Self {
         Self {
-            enabled: false,
+            strategy: ContextStrategy::Branching,
             compact_after_prompt_tokens: DEFAULT_COMPACT_AFTER_PROMPT_TOKENS,
             keep_last_messages: DEFAULT_KEEP_LAST_MESSAGES,
             summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+            facts_max_tokens: DEFAULT_FACTS_MAX_TOKENS,
         }
     }
 
-    pub fn enabled(&self) -> bool {
-        self.enabled
+    pub fn strategy(&self) -> ContextStrategy {
+        self.strategy
     }
 
     pub fn compact_after_prompt_tokens(&self) -> u64 {
@@ -84,6 +97,10 @@ impl ContextConfig {
 
     pub fn summary_max_tokens(&self) -> u32 {
         self.summary_max_tokens
+    }
+
+    pub fn facts_max_tokens(&self) -> u32 {
+        self.facts_max_tokens
     }
 }
 
@@ -215,6 +232,10 @@ impl Config {
                 reason: "must be enabled or disabled, or omitted",
             });
         }
+        let strategy = raw.context.strategy.ok_or(ConfigError::InvalidField {
+            field: "context.strategy",
+            reason: "must be set",
+        })?;
         let compact_after_prompt_tokens = raw
             .context
             .compact_after_prompt_tokens
@@ -245,6 +266,16 @@ impl Config {
                 reason: "must be greater than zero",
             });
         }
+        let facts_max_tokens = raw
+            .context
+            .facts_max_tokens
+            .unwrap_or(DEFAULT_FACTS_MAX_TOKENS);
+        if facts_max_tokens == 0 {
+            return Err(ConfigError::InvalidField {
+                field: "facts_max_tokens",
+                reason: "must be greater than zero",
+            });
+        }
         Ok(Self {
             top_p: raw.top_p,
             stop,
@@ -260,10 +291,11 @@ impl Config {
             max_tokens,
             timeout_seconds,
             context: ContextConfig {
-                enabled: raw.context.enabled.unwrap_or(true),
+                strategy,
                 compact_after_prompt_tokens,
                 keep_last_messages,
                 summary_max_tokens,
+                facts_max_tokens,
             },
             debug: DebugConfig {
                 log_path: raw.debug.log_path,

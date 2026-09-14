@@ -15,7 +15,7 @@ fn config(server: &MockServer) -> Config {
     let mut file = NamedTempFile::new().unwrap();
     write!(
         file,
-        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n",
+        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[context]\nstrategy = \"summary\"\n",
         server.uri()
     )
     .unwrap();
@@ -30,7 +30,7 @@ fn compression_config(server: &MockServer, threshold: u64, keep: usize) -> Confi
     let mut file = NamedTempFile::new().unwrap();
     write!(
         file,
-        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[context]\nenabled = true\ncompact_after_prompt_tokens = {threshold}\nkeep_last_messages = {keep}\nsummary_max_tokens = 64\n",
+        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[context]\nstrategy = \"summary\"\ncompact_after_prompt_tokens = {threshold}\nkeep_last_messages = {keep}\nsummary_max_tokens = 64\n",
         server.uri(),
     )
     .unwrap();
@@ -126,7 +126,7 @@ async fn persists_input_before_answer_and_restores_original_system_and_messages(
     let mut changed = NamedTempFile::new().unwrap();
     write!(
         changed,
-        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Changed system\"\n",
+        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Changed system\"\n[context]\nstrategy = \"summary\"\n",
         server.uri()
     )
     .unwrap();

@@ -19,6 +19,9 @@ api_key = "test-key"
 base_url = "{base_url}"
 model = "test-model"
 timeout_seconds = 5
+
+[context]
+strategy = "summary"
 "#
     )
     .expect("write temporary config");
@@ -36,7 +39,7 @@ model = "test-model"
 timeout_seconds = 5
 
 [context]
-enabled = true
+strategy = "summary"
 compact_after_prompt_tokens = 3
 keep_last_messages = 2
 summary_max_tokens = 64

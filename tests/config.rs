@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use deepseek_cli::config::Config;
+use deepseek_cli::config::{Config, ContextStrategy};
 use tempfile::NamedTempFile;
 
 fn write_config(contents: &str) -> NamedTempFile {
@@ -13,7 +13,7 @@ fn write_config(contents: &str) -> NamedTempFile {
 
 #[test]
 fn applies_defaults_and_reads_file_key() {
-    let file = write_config("api_key = \"file-key\"");
+    let file = write_config("api_key = \"file-key\"\n[context]\nstrategy = \"summary\"");
 
     let config = Config::load(file.path(), None).expect("load valid config");
 
@@ -37,6 +37,9 @@ system_prompt = "Answer briefly."
 temperature = 0.25
 max_tokens = 512
 timeout_seconds = 15
+
+[context]
+strategy = "summary"
 "#,
     );
 
@@ -52,7 +55,7 @@ timeout_seconds = 15
 
 #[test]
 fn environment_key_overrides_file_key() {
-    let file = write_config("api_key = \"file-key\"");
+    let file = write_config("api_key = \"file-key\"\n[context]\nstrategy = \"summary\"");
 
     let config = Config::load(file.path(), Some("env-key".into())).expect("load config");
 
@@ -61,7 +64,7 @@ fn environment_key_overrides_file_key() {
 
 #[test]
 fn environment_key_allows_omitting_file_key() {
-    let file = write_config("");
+    let file = write_config("[context]\nstrategy = \"summary\"");
 
     let config = Config::load(file.path(), Some("env-key".into())).expect("load config");
 
@@ -154,12 +157,14 @@ fn reports_missing_config_path() {
 
 #[test]
 fn applies_context_and_debug_defaults() {
-    let config = Config::from_toml("api_key = \"key\"", None).unwrap();
+    let config =
+        Config::from_toml("api_key = \"key\"\n[context]\nstrategy = \"summary\"", None).unwrap();
 
-    assert!(config.context().enabled());
+    assert_eq!(config.context().strategy(), ContextStrategy::Summary);
     assert_eq!(config.context().compact_after_prompt_tokens(), 6000);
     assert_eq!(config.context().keep_last_messages(), 10);
     assert_eq!(config.context().summary_max_tokens(), 1024);
+    assert_eq!(config.context().facts_max_tokens(), 512);
     assert_eq!(config.debug().log_path(), None);
     assert!(!config.debug().log_payloads());
 }
@@ -171,10 +176,11 @@ fn reads_context_and_debug_overrides() {
 api_key = "key"
 
 [context]
-enabled = false
+strategy = "sticky_facts"
 compact_after_prompt_tokens = 321
 keep_last_messages = 4
 summary_max_tokens = 77
+facts_max_tokens = 55
 
 [debug]
 log_path = "logs/context.jsonl"
@@ -184,10 +190,11 @@ log_payloads = true
     )
     .unwrap();
 
-    assert!(!config.context().enabled());
+    assert_eq!(config.context().strategy(), ContextStrategy::StickyFacts);
     assert_eq!(config.context().compact_after_prompt_tokens(), 321);
     assert_eq!(config.context().keep_last_messages(), 4);
     assert_eq!(config.context().summary_max_tokens(), 77);
+    assert_eq!(config.context().facts_max_tokens(), 55);
     assert_eq!(
         config.debug().log_path(),
         Some(Path::new("logs/context.jsonl"))
@@ -202,13 +209,55 @@ fn rejects_zero_context_limits_and_unknown_nested_fields() {
         "keep_last_messages",
         "summary_max_tokens",
     ] {
-        let text = format!("api_key = \"key\"\n[context]\n{field} = 0");
+        let text = format!("api_key = \"key\"\n[context]\nstrategy = \"summary\"\n{field} = 0");
         let error = Config::from_toml(&text, None).unwrap_err().to_string();
         assert!(error.contains(field), "unexpected error: {error}");
     }
 
-    let error = Config::from_toml("api_key = \"key\"\n[context]\nunknown = 1", None)
-        .unwrap_err()
-        .to_string();
+    let error = Config::from_toml(
+        "api_key = \"key\"\n[context]\nstrategy = \"summary\"\nunknown = 1",
+        None,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("parse"));
+}
+
+#[test]
+fn requires_context_strategy_and_accepts_all_four_values() {
+    let missing = Config::from_toml("api_key = \"key\"", None).unwrap_err();
+    assert!(missing.to_string().contains("strategy"));
+
+    for (text, expected) in [
+        ("summary", ContextStrategy::Summary),
+        ("sliding_window", ContextStrategy::SlidingWindow),
+        ("sticky_facts", ContextStrategy::StickyFacts),
+        ("branching", ContextStrategy::Branching),
+    ] {
+        let source = format!("api_key = \"key\"\n[context]\nstrategy = \"{text}\"");
+        assert_eq!(
+            Config::from_toml(&source, None)
+                .unwrap()
+                .context()
+                .strategy(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn rejects_removed_enabled_and_zero_facts_limit() {
+    assert!(
+        Config::from_toml(
+            "api_key = \"key\"\n[context]\nstrategy = \"summary\"\nenabled = true",
+            None,
+        )
+        .is_err()
+    );
+    let error = Config::from_toml(
+        "api_key = \"key\"\n[context]\nstrategy = \"sticky_facts\"\nfacts_max_tokens = 0",
+        None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("facts_max_tokens"));
 }

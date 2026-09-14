@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::chat::{ChatHistory, Role};
 use crate::client::{ClientError, DeepSeekClient, StreamEvent, TokenUsage};
-use crate::config::{Config, ContextConfig};
+use crate::config::{Config, ContextConfig, ContextStrategy};
 use crate::context::{
     ContextState, ContextStats, ContextSummary, build_request_messages, plan_compaction, stats,
 };
@@ -76,7 +76,7 @@ impl Agent {
             store: None,
             dialog_id: None,
             last_usage: None,
-            context_config: ContextConfig::disabled(),
+            context_config: ContextConfig::full_history(),
             context_state: ContextState::default(),
             debug_log: DebugLog::new(None, false, ""),
         }
@@ -117,7 +117,7 @@ impl Agent {
         let request = build_request_messages(
             &self.history,
             &self.context_state,
-            self.context_config.enabled(),
+            self.context_config.strategy() == ContextStrategy::Summary,
             self.context_config.keep_last_messages(),
             prompt,
         );
@@ -179,7 +179,7 @@ impl Agent {
         stats(
             &self.history,
             &self.context_state,
-            self.context_config.enabled(),
+            self.context_config.strategy() == ContextStrategy::Summary,
             self.context_config.keep_last_messages(),
         )
     }
@@ -203,7 +203,7 @@ impl Agent {
         let Some(usage) = usage else {
             return Ok(());
         };
-        if !self.context_config.enabled()
+        if self.context_config.strategy() != ContextStrategy::Summary
             || usage.prompt_tokens < self.context_config.compact_after_prompt_tokens()
         {
             return Ok(());
