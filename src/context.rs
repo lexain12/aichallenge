@@ -55,6 +55,22 @@ impl UsageTotals {
         }
     }
 
+    pub(crate) fn from_parts(
+        call_count: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+        missing_usage_count: u64,
+    ) -> Self {
+        Self {
+            call_count,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            missing_usage_count,
+        }
+    }
+
     pub fn call_count(&self) -> u64 {
         self.call_count
     }
@@ -88,6 +104,25 @@ impl ContextState {
             summary: Some(summary),
             compaction_usage: UsageTotals::default(),
         }
+    }
+
+    pub(crate) fn restored(
+        summary: Option<ContextSummary>,
+        compaction_usage: UsageTotals,
+    ) -> Self {
+        Self {
+            summary,
+            compaction_usage,
+        }
+    }
+
+    pub(crate) fn replace_summary(
+        &mut self,
+        summary: ContextSummary,
+        usage: Option<TokenUsage>,
+    ) {
+        self.summary = Some(summary);
+        self.compaction_usage.record(usage);
     }
 
     pub fn summary(&self) -> Option<&ContextSummary> {

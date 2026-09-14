@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use deepseek_cli::chat::Role;
 use deepseek_cli::client::TokenUsage;
+use deepseek_cli::context::ContextSummary;
 use deepseek_cli::dialog::{DialogStore, StoreError};
 
 #[test]
@@ -98,4 +101,108 @@ fn upgrades_day7_database_and_writes_answer_usage_atomically() {
     drop(store);
     let store = DialogStore::open(&path).unwrap();
     assert_eq!(store.load(1).unwrap().messages[3].usage(), Some(usage));
+}
+
+fn create_day8_database_with_four_messages(path: &Path) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE dialogs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                system_prompt TEXT NOT NULL,
+                title TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT '',
+                last_message_id INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dialog_id INTEGER NOT NULL REFERENCES dialogs(id),
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE message_usage (
+                message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+                usage_json TEXT NOT NULL
+            );
+            INSERT INTO dialogs (id, system_prompt, title, last_message_id)
+                VALUES (1, 'System', 'u1', 4);
+            INSERT INTO messages (dialog_id, role, content) VALUES
+                (1, 'user', 'u1'),
+                (1, 'assistant', 'a1'),
+                (1, 'user', 'u2'),
+                (1, 'assistant', 'a2');",
+        )
+        .unwrap();
+}
+
+#[test]
+fn upgrades_day8_database_and_replaces_one_summary_while_accumulating_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    create_day8_database_with_four_messages(&path);
+
+    let mut store = DialogStore::open(&path).unwrap();
+    let first = store
+        .replace_context(
+            1,
+            4,
+            ContextSummary::new("first", 2),
+            Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+                completion_tokens_details: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(first.compaction_usage().call_count(), 1);
+
+    let second = store
+        .replace_context(1, 4, ContextSummary::new("second", 3), None)
+        .unwrap();
+    assert_eq!(second.summary().unwrap().content(), "second");
+    assert_eq!(second.summary().unwrap().covered_message_count(), 3);
+    assert_eq!(second.compaction_usage().call_count(), 2);
+    assert_eq!(second.compaction_usage().total_tokens(), 12);
+    assert_eq!(second.compaction_usage().missing_usage_count(), 1);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = connection
+        .query_row("SELECT count(*) FROM dialog_context", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+    assert_eq!(store.load(1).unwrap().context, second);
+    assert_eq!(store.load(1).unwrap().messages.len(), 4);
+}
+
+#[test]
+fn stale_or_failed_context_replacement_keeps_previous_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    create_day8_database_with_four_messages(&path);
+    let mut store = DialogStore::open(&path).unwrap();
+    let first = store
+        .replace_context(1, 4, ContextSummary::new("first", 2), None)
+        .unwrap();
+
+    assert!(matches!(
+        store.replace_context(1, 3, ContextSummary::new("stale", 3), None),
+        Err(StoreError::Conflict(1))
+    ));
+    assert_eq!(store.load(1).unwrap().context, first);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_context BEFORE UPDATE OF summary ON dialog_context
+             BEGIN SELECT RAISE(ABORT, 'context write failed'); END;",
+        )
+        .unwrap();
+    assert!(
+        store
+            .replace_context(1, 4, ContextSummary::new("rejected", 3), None)
+            .is_err()
+    );
+    assert_eq!(store.load(1).unwrap().context, first);
 }

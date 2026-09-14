@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::chat::{Message, Role};
 use crate::client::TokenUsage;
+use crate::context::{ContextState, ContextSummary, UsageTotals};
 
 pub struct DialogStore {
     connection: Connection,
@@ -15,6 +16,7 @@ pub struct StoredDialog {
     pub id: i64,
     pub system_prompt: String,
     pub messages: Vec<Message>,
+    pub context: ContextState,
 }
 
 pub struct DialogSummary {
@@ -49,6 +51,17 @@ impl DialogStore {
              CREATE TABLE IF NOT EXISTS message_usage (
                  message_id INTEGER PRIMARY KEY REFERENCES messages(id),
                  usage_json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS dialog_context (
+                 dialog_id INTEGER PRIMARY KEY REFERENCES dialogs(id),
+                 summary TEXT NOT NULL,
+                 covered_message_count INTEGER NOT NULL CHECK (covered_message_count > 0),
+                 compaction_count INTEGER NOT NULL DEFAULT 0,
+                 known_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                 known_completion_tokens INTEGER NOT NULL DEFAULT 0,
+                 known_total_tokens INTEGER NOT NULL DEFAULT 0,
+                 missing_usage_count INTEGER NOT NULL DEFAULT 0,
+                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
              );",
         )?;
         Ok(Self { connection })
@@ -150,6 +163,96 @@ impl DialogStore {
         Ok(())
     }
 
+    pub fn replace_context(
+        &mut self,
+        id: i64,
+        expected_message_count: usize,
+        summary: ContextSummary,
+        usage: Option<TokenUsage>,
+    ) -> Result<ContextState, StoreError> {
+        if summary.covered_message_count() == 0
+            || summary.covered_message_count() > expected_message_count
+        {
+            return Err(StoreError::InvalidContext(
+                "summary boundary must cover an existing non-empty prefix",
+            ));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let count: i64 = tx.query_row(
+            "SELECT count(*) FROM messages WHERE dialog_id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(count).ok() != Some(expected_message_count) {
+            return Err(StoreError::Conflict(id));
+        }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dialogs WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::NotFound(id));
+        }
+
+        let stored = tx
+            .query_row(
+                "SELECT summary, covered_message_count, compaction_count,
+                        known_prompt_tokens, known_completion_tokens,
+                        known_total_tokens, missing_usage_count
+                 FROM dialog_context WHERE dialog_id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let mut state = decode_context(stored)?;
+        state.replace_summary(summary, usage);
+        let current = state
+            .summary()
+            .expect("replacement always installs a summary");
+        let totals = state.compaction_usage();
+        tx.execute(
+            "INSERT INTO dialog_context (
+                 dialog_id, summary, covered_message_count, compaction_count,
+                 known_prompt_tokens, known_completion_tokens,
+                 known_total_tokens, missing_usage_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(dialog_id) DO UPDATE SET
+                 summary = excluded.summary,
+                 covered_message_count = excluded.covered_message_count,
+                 compaction_count = excluded.compaction_count,
+                 known_prompt_tokens = excluded.known_prompt_tokens,
+                 known_completion_tokens = excluded.known_completion_tokens,
+                 known_total_tokens = excluded.known_total_tokens,
+                 missing_usage_count = excluded.missing_usage_count,
+                 updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
+            params![
+                id,
+                current.content(),
+                to_i64(current.covered_message_count())?,
+                to_i64(totals.call_count())?,
+                to_i64(totals.prompt_tokens())?,
+                to_i64(totals.completion_tokens())?,
+                to_i64(totals.total_tokens())?,
+                to_i64(totals.missing_usage_count())?,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(state)
+    }
+
     pub fn load(&self, id: i64) -> Result<StoredDialog, StoreError> {
         // Read metadata and messages from a single SQLite snapshot.
         let tx = self.connection.unchecked_transaction()?;
@@ -187,11 +290,33 @@ impl DialogStore {
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        let stored_context = tx
+            .query_row(
+                "SELECT summary, covered_message_count, compaction_count,
+                        known_prompt_tokens, known_completion_tokens,
+                        known_total_tokens, missing_usage_count
+                 FROM dialog_context WHERE dialog_id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let context = decode_context(stored_context)?;
         tx.commit()?;
         Ok(StoredDialog {
             id,
             system_prompt,
             messages,
+            context,
         })
     }
 
@@ -224,6 +349,36 @@ impl DialogStore {
     }
 }
 
+type StoredContextRow = (String, i64, i64, i64, i64, i64, i64);
+
+fn decode_context(row: Option<StoredContextRow>) -> Result<ContextState, StoreError> {
+    let Some((summary, covered, calls, prompt, completion, total, missing)) = row else {
+        return Ok(ContextState::default());
+    };
+    let covered = usize::try_from(covered)
+        .map_err(|_| StoreError::InvalidContext("negative summary boundary"))?;
+    let values = [calls, prompt, completion, total, missing];
+    if values.iter().any(|value| *value < 0) {
+        return Err(StoreError::InvalidContext("negative context metric"));
+    }
+    Ok(ContextState::restored(
+        Some(ContextSummary::new(summary, covered)),
+        UsageTotals::from_parts(
+            calls as u64,
+            prompt as u64,
+            completion as u64,
+            total as u64,
+            missing as u64,
+        ),
+    ))
+}
+
+fn to_i64(value: impl TryInto<i64>) -> Result<i64, StoreError> {
+    value
+        .try_into()
+        .map_err(|_| StoreError::InvalidContext("context metric exceeds SQLite INTEGER"))
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("invalid token statistics: {0}")]
@@ -236,4 +391,6 @@ pub enum StoreError {
     Conflict(i64),
     #[error("system instructions belong to the dialog, not its message list")]
     InvalidRole,
+    #[error("invalid dialog context: {0}")]
+    InvalidContext(&'static str),
 }
