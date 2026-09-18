@@ -1,4 +1,5 @@
 use crate::client::TokenUsage;
+use crate::memory::DurableMemoryScope;
 use serde::Serialize;
 
 /// A role accepted by the DeepSeek Chat Completions API.
@@ -60,6 +61,16 @@ pub enum InputAction {
     Stats,
     Branch,
     Switch(i64),
+    Remember {
+        scope: DurableMemoryScope,
+        key: String,
+        value: String,
+    },
+    Forget {
+        scope: DurableMemoryScope,
+        key: String,
+    },
+    Memory(Option<DurableMemoryScope>),
     InvalidCommand(String),
     Send(String),
 }
@@ -68,6 +79,41 @@ pub fn parse_input(input: &str) -> InputAction {
     let input = input.trim();
     let mut parts = input.split_whitespace();
     match parts.next() {
+        Some("/remember") => {
+            let scope = parse_memory_scope(parts.next());
+            let key = parts.next();
+            let value = parts.collect::<Vec<_>>().join(" ");
+            return match (scope, key) {
+                (Some(scope), Some(key)) if !value.is_empty() => InputAction::Remember {
+                    scope,
+                    key: key.to_owned(),
+                    value,
+                },
+                _ => InputAction::InvalidCommand(
+                    "usage: /remember <user|task> <key> <value>".to_owned(),
+                ),
+            };
+        }
+        Some("/forget") => {
+            let scope = parse_memory_scope(parts.next());
+            let key = parts.next();
+            return match (scope, key, parts.next()) {
+                (Some(scope), Some(key), None) => InputAction::Forget {
+                    scope,
+                    key: key.to_owned(),
+                },
+                _ => InputAction::InvalidCommand("usage: /forget <user|task> <key>".to_owned()),
+            };
+        }
+        Some("/memory") => {
+            let argument = parts.next();
+            let scope = parse_memory_scope(argument);
+            return if (argument.is_none() || scope.is_some()) && parts.next().is_none() {
+                InputAction::Memory(scope)
+            } else {
+                InputAction::InvalidCommand("usage: /memory [user|task]".to_owned())
+            };
+        }
         Some("/branch") => {
             return if parts.next().is_none() {
                 InputAction::Branch
@@ -91,6 +137,14 @@ pub fn parse_input(input: &str) -> InputAction {
         "/clear" => InputAction::Clear,
         "/stats" => InputAction::Stats,
         message => InputAction::Send(message.to_owned()),
+    }
+}
+
+fn parse_memory_scope(value: Option<&str>) -> Option<DurableMemoryScope> {
+    match value {
+        Some("user") => Some(DurableMemoryScope::User),
+        Some("task") => Some(DurableMemoryScope::Task),
+        _ => None,
     }
 }
 

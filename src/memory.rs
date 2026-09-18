@@ -16,6 +16,15 @@ pub enum DurableMemoryScope {
     Task,
 }
 
+impl DurableMemoryScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::User => "Long-term",
+            Self::Task => "Working",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestScope {
     user_id: String,

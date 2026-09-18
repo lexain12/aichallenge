@@ -1,4 +1,73 @@
 use deepseek_cli::chat::{ChatHistory, InputAction, Role, parse_input};
+use deepseek_cli::memory::DurableMemoryScope;
+
+#[test]
+fn parses_explicit_memory_commands_and_normalizes_values() {
+    for (name, scope) in [
+        ("user", DurableMemoryScope::User),
+        ("task", DurableMemoryScope::Task),
+    ] {
+        assert_eq!(
+            parse_input(&format!(
+                " /remember\t{name} database  SQLite   local file "
+            )),
+            InputAction::Remember {
+                scope,
+                key: "database".into(),
+                value: "SQLite local file".into()
+            }
+        );
+        assert_eq!(
+            parse_input(&format!("/forget {name} database")),
+            InputAction::Forget {
+                scope,
+                key: "database".into()
+            }
+        );
+        assert_eq!(
+            parse_input(&format!("/memory {name}")),
+            InputAction::Memory(Some(scope))
+        );
+    }
+    assert_eq!(parse_input("/memory"), InputAction::Memory(None));
+}
+
+#[test]
+fn malformed_memory_commands_are_local_usage_errors() {
+    for (inputs, usage) in [
+        (
+            vec![
+                "/remember",
+                "/remember short key value",
+                "/remember user",
+                "/remember user key",
+                "/remember task key   ",
+            ],
+            "usage: /remember <user|task> <key> <value>",
+        ),
+        (
+            vec![
+                "/forget",
+                "/forget task",
+                "/forget conversation key",
+                "/forget user key extra",
+            ],
+            "usage: /forget <user|task> <key>",
+        ),
+        (
+            vec!["/memory conversation", "/memory user extra"],
+            "usage: /memory [user|task]",
+        ),
+    ] {
+        for input in inputs {
+            assert_eq!(
+                parse_input(input),
+                InputAction::InvalidCommand(usage.into()),
+                "{input}"
+            );
+        }
+    }
+}
 
 #[test]
 fn recognizes_commands_and_ignores_blank_input() {

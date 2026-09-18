@@ -8,6 +8,7 @@ use deepseek_cli::chat::{InputAction, Role, parse_input};
 use deepseek_cli::client::ClientError;
 use deepseek_cli::config::{Config, ConfigError};
 use deepseek_cli::dialog::{DialogStore, StoreError};
+use deepseek_cli::memory::{DEFAULT_TASK_ID, DEFAULT_USER_ID, DurableMemoryScope, RequestScope};
 use deepseek_cli::terminal::{BlockStyle, TerminalUi};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -30,6 +31,21 @@ struct Args {
     /// List saved dialogs without calling the API or loading its configuration.
     #[arg(long)]
     list_dialogs: bool,
+    /// Long-term memory owner for a new dialog; must match a resumed dialog.
+    #[arg(long, value_parser = parse_non_blank_id)]
+    user: Option<String>,
+    /// Working-memory task for a new dialog; must match a resumed dialog.
+    #[arg(long, value_parser = parse_non_blank_id)]
+    task: Option<String>,
+}
+
+fn parse_non_blank_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err("identifier must not be blank".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
 }
 
 #[tokio::main]
@@ -63,7 +79,7 @@ async fn run() -> Result<(), AppError> {
             stdout_ui.write_block(
                 &mut stdout,
                 BlockStyle::System,
-                "ID | Updated (UTC) | Messages | First message",
+                "ID | User | Task | Updated (UTC) | Messages | First message",
             )?;
             for dialog in dialogs {
                 let title = dialog
@@ -75,8 +91,13 @@ async fn run() -> Result<(), AppError> {
                     &mut stdout,
                     BlockStyle::System,
                     &format!(
-                        "{} | {} | {} | {}",
-                        dialog.id, dialog.updated_at, dialog.message_count, title
+                        "{} | {} | {} | {} | {} | {}",
+                        dialog.id,
+                        dialog.scope.user_id(),
+                        dialog.scope.task_id(),
+                        dialog.updated_at,
+                        dialog.message_count,
+                        title
                     ),
                 )?;
             }
@@ -91,9 +112,45 @@ async fn run() -> Result<(), AppError> {
     let env_api_key = std::env::var("DEEPSEEK_API_KEY").ok();
     let config = Config::load(&args.config, env_api_key)?;
     let mut agent = match resume {
-        Some(id) => Agent::from_dialog(&config, store, id)?,
-        None => Agent::with_store(&config, store)?,
+        Some(id) => {
+            let agent = Agent::from_dialog(&config, store, id)?;
+            if let Some(user) = args.user.as_deref()
+                && user != agent.scope().user_id()
+            {
+                return Err(AppError::UserScopeMismatch {
+                    stored: agent.scope().user_id().to_owned(),
+                    requested: user.to_owned(),
+                });
+            }
+            if let Some(task) = args.task.as_deref()
+                && task != agent.scope().task_id()
+            {
+                return Err(AppError::TaskScopeMismatch {
+                    stored: agent.scope().task_id().to_owned(),
+                    requested: task.to_owned(),
+                });
+            }
+            agent
+        }
+        None => Agent::with_store_for_scope(
+            &config,
+            store,
+            RequestScope::new(
+                args.user.as_deref().unwrap_or(DEFAULT_USER_ID),
+                args.task.as_deref().unwrap_or(DEFAULT_TASK_ID),
+            )
+            .expect("CLI identifiers and default scope are nonblank"),
+        )?,
     };
+    stdout_ui.write_block(
+        &mut stdout,
+        BlockStyle::System,
+        &format!(
+            "Scope · user: {} · task: {}",
+            agent.scope().user_id(),
+            agent.scope().task_id()
+        ),
+    )?;
     if let Some(id) = resume {
         stdout_ui.write_block(
             &mut stdout,
@@ -146,6 +203,38 @@ async fn run() -> Result<(), AppError> {
             }
             InputAction::Stats => {
                 stdout_ui.write_context_stats(&mut stdout, agent.context_stats())?;
+            }
+            InputAction::Remember { scope, key, value } => {
+                agent.remember(scope, &key, &value)?;
+                let address = memory_address_label(agent.scope(), scope);
+                stdout_ui.write_block(
+                    &mut stdout,
+                    BlockStyle::System,
+                    &format!(
+                        "Saved {} memory · {key} = {value} · {address}",
+                        scope.label()
+                    ),
+                )?;
+            }
+            InputAction::Forget { scope, key } => {
+                let removed = agent.forget(scope, &key)?;
+                let address = memory_address_label(agent.scope(), scope);
+                let message = if removed {
+                    format!("Forgot {} memory · {key} · {address}", scope.label())
+                } else {
+                    format!("No {} memory entry named {key} · {address}", scope.label())
+                };
+                stdout_ui.write_block(&mut stdout, BlockStyle::System, &message)?;
+            }
+            InputAction::Memory(filter) => {
+                let snapshot = agent.memory_snapshot()?;
+                stdout_ui.write_memory(
+                    &mut stdout,
+                    agent.scope(),
+                    agent.context_stats(),
+                    &snapshot,
+                    filter,
+                )?;
             }
             InputAction::Branch => match agent.branch_dialog() {
                 Ok(fork) => stdout_ui.write_block(
@@ -314,6 +403,10 @@ async fn run() -> Result<(), AppError> {
 
 #[derive(Debug, Error)]
 enum AppError {
+    #[error("dialog belongs to user '{stored}', not requested user '{requested}'")]
+    UserScopeMismatch { stored: String, requested: String },
+    #[error("dialog belongs to task '{stored}', not requested task '{requested}'")]
+    TaskScopeMismatch { stored: String, requested: String },
     #[error("no saved dialogs; start a new chat without --resume-last")]
     NoDialogs,
     #[error(transparent)]
@@ -328,6 +421,15 @@ enum AppError {
     Io(#[from] io::Error),
 }
 
+fn memory_address_label(scope: &RequestScope, layer: DurableMemoryScope) -> String {
+    match layer {
+        DurableMemoryScope::User => format!("user: {}", scope.user_id()),
+        DurableMemoryScope::Task => {
+            format!("user: {} · task: {}", scope.user_id(), scope.task_id())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -335,6 +437,27 @@ mod tests {
     use clap::Parser;
 
     use super::Args;
+
+    #[test]
+    fn accepts_and_trims_memory_scope_identifiers() {
+        let args =
+            Args::try_parse_from(["deepseek-cli", "--user", " alice ", "--task", " bot "]).unwrap();
+        assert_eq!(args.user.as_deref(), Some("alice"));
+        assert_eq!(args.task.as_deref(), Some("bot"));
+        let defaults = Args::try_parse_from(["deepseek-cli"]).unwrap();
+        assert!(defaults.user.is_none());
+        assert!(defaults.task.is_none());
+    }
+
+    #[test]
+    fn rejects_blank_memory_scope_identifiers() {
+        for flag in ["--user", "--task"] {
+            for value in ["", " \t "] {
+                let error = Args::try_parse_from(["deepseek-cli", flag, value]).unwrap_err();
+                assert!(error.to_string().contains("identifier must not be blank"));
+            }
+        }
+    }
 
     #[test]
     fn uses_deepseek_toml_by_default() {

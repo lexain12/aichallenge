@@ -5,6 +5,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
 use deepseek_cli::dialog::DialogStore;
+use deepseek_cli::memory::{MemoryRepository, RequestScope};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
@@ -361,7 +362,7 @@ async fn clear_and_api_error_leave_cli_ready_for_more_input() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout is UTF-8"),
-        "you> Conversation cleared.\nyou> assistant> \nyou> Токены · нет данных API\n"
+        "Scope · user: default · task: default\nyou> Conversation cleared.\nyou> assistant> \nyou> Токены · нет данных API\n"
     );
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(stderr.contains("HTTP 500 Internal Server Error"));
@@ -378,7 +379,7 @@ fn end_of_file_exits_successfully_after_prompt() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout is UTF-8"),
-        "you> \n"
+        "Scope · user: default · task: default\nyou> \n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -445,4 +446,199 @@ async fn malformed_or_wrong_strategy_branch_commands_are_local_errors() {
     assert!(stderr.contains("usage: /switch <positive-dialog-id>"));
     assert!(stderr.contains("strategy = branching"));
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_commands_are_local_and_persist_across_dialogs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse("Answer", 2, 1, 3))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut config = write_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let log_path = directory.path().join("debug.jsonl");
+    writeln!(
+        config,
+        "\n[debug]\nlog_path = {:?}\nlog_payloads = false",
+        log_path.to_str().unwrap()
+    )
+    .unwrap();
+    let scope_args = ["--user", "alice", "--task", "bot"];
+    let first = run_cli_args(
+        config.path(),
+        &database,
+        &scope_args,
+        "/remember user language Russian\n/remember task stack Rust\n/remember task database SQLite\n/memory\n/forget task missing\nQuestion\n/memory\n/exit\n",
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let stdout = String::from_utf8(first.stdout).unwrap();
+    assert_eq!(stdout.matches("Scope · user: alice · task: bot").count(), 1);
+    assert!(stdout.contains("Saved Long-term memory · language = Russian · user: alice"));
+    assert!(stdout.contains("Saved Working memory · stack = Rust · user: alice · task: bot"));
+    assert!(stdout.contains("Conversation · dialog: new · strategy: summary · messages: 0 · summary boundary: 0 · sticky facts: 0"));
+    assert!(stdout.contains("Conversation · dialog: #1 · strategy: summary · messages: 2 · summary boundary: 0 · sticky facts: 0"));
+    assert!(stdout.contains(
+        "Working · database = SQLite\nWorking · stack = Rust\nLong-term · language = Russian"
+    ));
+    assert!(stdout.contains("No Working memory entry named missing"));
+    let second = run_cli_args(
+        config.path(),
+        &database,
+        &scope_args,
+        "/memory\nFollow up\n/exit\n",
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let body: Value = requests[1].body_json().unwrap();
+    let messages = serde_json::to_string(&body["messages"]).unwrap();
+    assert!(messages.contains("Russian"));
+    assert!(messages.contains("Rust"));
+    assert!(!messages.contains("Question"));
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("user_memory"));
+    assert!(log.contains("task_memory"));
+    for secret in ["Russian", "Rust", "SQLite", "/remember"] {
+        assert!(!log.contains(secret), "safe debug log leaked {secret}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_memory_edits_filters_and_invalid_commands_never_call_api() {
+    let server = MockServer::start().await;
+    let config = write_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &[],
+        "/remember user language English\n/remember user language Russian\n/remember task stack Rust\n/forget task stack\n/forget user language extra\n/remember task bad\n/memory conversation\n/memory user\n/memory task\n/exit\n",
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Forgot Working memory · stack"));
+    assert!(stdout.contains("Long-term · language = Russian"));
+    assert!(stdout.contains("Working · empty"));
+    assert!(!stdout.contains("Conversation ·"));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("usage: /forget <user|task> <key>"));
+    assert!(stderr.contains("usage: /remember <user|task> <key> <value>"));
+    assert!(stderr.contains("usage: /memory [user|task]"));
+    let store = DialogStore::open(&database).unwrap();
+    assert!(store.list().unwrap().is_empty());
+    let snapshot = store.load_memory(&RequestScope::default()).unwrap();
+    assert_eq!(snapshot.user_entries()["language"], "Russian");
+    assert!(snapshot.task_entries().is_empty());
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &[],
+        "/forget user language\n/memory user\n/exit\n",
+    );
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Long-term · empty")
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_uses_persisted_scope_and_rejects_explicit_conflicts_before_api() {
+    let server = MockServer::start().await;
+    let config = write_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let mut store = DialogStore::open(&database).unwrap();
+    let id = store
+        .start_dialog_in_scope(
+            &RequestScope::new("alice", "bot").unwrap(),
+            "System",
+            "Question",
+        )
+        .unwrap()
+        .to_string();
+    for resume in [vec!["--resume", id.as_str()], vec!["--resume-last"]] {
+        for (flag, value, expected) in [
+            (
+                "--user",
+                "bob",
+                "dialog belongs to user 'alice', not requested user 'bob'",
+            ),
+            (
+                "--task",
+                "other",
+                "dialog belongs to task 'bot', not requested task 'other'",
+            ),
+        ] {
+            let mut args = resume.clone();
+            args.extend([flag, value]);
+            let output = run_cli_args(config.path(), &database, &args, "Must not send\n/exit\n");
+            assert!(!output.status.success());
+            assert!(String::from_utf8(output.stderr).unwrap().contains(expected));
+            assert!(output.stdout.is_empty());
+        }
+        for explicit in [
+            vec![],
+            vec!["--user", "alice"],
+            vec!["--task", "bot"],
+            vec!["--user", "alice", "--task", "bot"],
+        ] {
+            let mut args = resume.clone();
+            args.extend(explicit);
+            let output = run_cli_args(config.path(), &database, &args, "/memory\n/exit\n");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(stdout.matches("Scope · user: alice · task: bot").count(), 1);
+            assert!(stdout.contains("Conversation · dialog: #1"));
+        }
+    }
+    assert_eq!(store.load(1).unwrap().messages.len(), 1);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn dialog_listing_includes_each_persisted_scope_without_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let mut store = DialogStore::open(&database).unwrap();
+    store
+        .start_dialog_in_scope(
+            &RequestScope::new("alice", "bot").unwrap(),
+            "",
+            "Same title",
+        )
+        .unwrap();
+    store
+        .start_dialog_in_scope(&RequestScope::new("bob", "bot").unwrap(), "", "Same title")
+        .unwrap();
+    let output = run_cli_args(
+        &directory.path().join("missing.toml"),
+        &database,
+        &["--list-dialogs"],
+        "",
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("ID | User | Task | Updated (UTC) | Messages | First message\n"));
+    assert!(stdout.contains("1 | alice | bot |"));
+    assert!(stdout.contains("2 | bob | bot |"));
 }

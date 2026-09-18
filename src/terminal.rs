@@ -2,6 +2,7 @@ use std::io::{self, IsTerminal, Write};
 
 use crate::client::TokenUsage;
 use crate::context::{ContextStats, UsageTotals};
+use crate::memory::{DurableMemoryScope, MemorySnapshot, RequestScope};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use terminal_size::{Height, Width, terminal_size};
 use unicode_segmentation::UnicodeSegmentation;
@@ -42,6 +43,49 @@ pub struct TerminalUi {
 }
 
 impl TerminalUi {
+    pub fn write_memory<W: Write>(
+        &self,
+        writer: &mut W,
+        scope: &RequestScope,
+        stats: ContextStats,
+        snapshot: &MemorySnapshot,
+        filter: Option<DurableMemoryScope>,
+    ) -> io::Result<()> {
+        if filter.is_none() {
+            let dialog = scope
+                .dialog_id()
+                .map_or_else(|| "new".to_owned(), |id| format!("#{id}"));
+            self.write_block(writer, BlockStyle::System, &format!(
+                "Conversation · dialog: {dialog} · strategy: {} · messages: {} · summary boundary: {} · sticky facts: {}",
+                stats.strategy.as_str(), stats.full_message_count, stats.covered_message_count, stats.facts_count,
+            ))?;
+        }
+        for (layer, entries) in [
+            (DurableMemoryScope::Task, snapshot.task_entries()),
+            (DurableMemoryScope::User, snapshot.user_entries()),
+        ] {
+            if filter.is_some_and(|selected| selected != layer) {
+                continue;
+            }
+            if entries.is_empty() {
+                self.write_block(
+                    writer,
+                    BlockStyle::System,
+                    &format!("{} · empty", layer.label()),
+                )?;
+            } else {
+                for (key, value) in entries {
+                    self.write_block(
+                        writer,
+                        BlockStyle::System,
+                        &format!("{} · {key} = {value}", layer.label()),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Compact, dim metadata line; pipes and NO_COLOR receive plain text.
     pub fn write_status<W: Write>(&self, writer: &mut W, text: &str) -> io::Result<()> {
         let mut block = FullWidthBlock::new(writer, self.styled, current_width(), "\x1b[2m", "")?;
@@ -554,8 +598,65 @@ mod tests {
     use crate::client::TokenUsage;
     use crate::config::ContextStrategy;
     use crate::context::{ContextStats, UsageTotals};
+    use crate::memory::{DurableMemoryScope, MemorySnapshot, RequestScope};
 
     use super::{FullWidthBlock, TerminalUi, fit_line, input_rows};
+
+    #[test]
+    fn memory_report_separates_layers_and_filters_without_conversation_content() {
+        let ui = TerminalUi {
+            styled: false,
+            interactive: false,
+            inline_images: false,
+        };
+        let scope = RequestScope::new("alice", "bot")
+            .unwrap()
+            .with_dialog_id(Some(42));
+        let snapshot = MemorySnapshot::new(
+            scope.clone(),
+            [("language".into(), "Russian".into())].into(),
+            [
+                ("stack".into(), "Rust".into()),
+                ("database".into(), "SQLite".into()),
+            ]
+            .into(),
+        );
+        let stats = ContextStats {
+            strategy: ContextStrategy::StickyFacts,
+            full_message_count: 8,
+            covered_message_count: 2,
+            facts_count: 3,
+            ..ContextStats::default()
+        };
+        for (filter, expected) in [
+            (
+                None,
+                "Conversation · dialog: #42 · strategy: sticky_facts · messages: 8 · summary boundary: 2 · sticky facts: 3\nWorking · database = SQLite\nWorking · stack = Rust\nLong-term · language = Russian\n",
+            ),
+            (
+                Some(DurableMemoryScope::User),
+                "Long-term · language = Russian\n",
+            ),
+            (
+                Some(DurableMemoryScope::Task),
+                "Working · database = SQLite\nWorking · stack = Rust\n",
+            ),
+        ] {
+            let mut output = Vec::new();
+            ui.write_memory(&mut output, &scope, stats, &snapshot, filter)
+                .unwrap();
+            assert_eq!(String::from_utf8(output).unwrap(), expected);
+        }
+        let mut output = Vec::new();
+        let scope = RequestScope::default();
+        let empty = MemorySnapshot::new(scope.clone(), Default::default(), Default::default());
+        ui.write_memory(&mut output, &scope, ContextStats::default(), &empty, None)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Conversation · dialog: new · strategy: summary · messages: 0 · summary boundary: 0 · sticky facts: 0\nWorking · empty\nLong-term · empty\n"
+        );
+    }
 
     fn totals(prompt: u64, completion: u64, total: u64, missing: bool) -> UsageTotals {
         let mut result = UsageTotals::default();
