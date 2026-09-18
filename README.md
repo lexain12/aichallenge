@@ -1,10 +1,70 @@
-> Ветка **Day-10** — задание дня 10, на основе Day-9. [Все дни и команды запуска](docs/DAYS.md).
+> Ветка **Day-11** — задание дня 11, на основе Day-10. [Все дни и команды запуска](docs/DAYS.md).
 
 # DeepSeek CLI
 
 Один интерактивный чат с агентом на Rust. Ответ печатается по мере генерации,
 а сообщения сохраняются в SQLite и переживают перезапуск программы.
 Реплики пользователя и DeepSeek выделяются разными фоновыми полосами.
+
+## День 11: явные слои памяти
+
+Day 11 разделяет контекст по адресу и сроку жизни:
+
+```text
+conversation = dialog ID; task = user ID + task ID; user = user ID
+```
+
+- **Conversation** — сообщения, cumulative summary и sticky facts одного
+  диалога. Слой заполняется автоматически; старый raw-контекст можно заменить
+  summary в запросе модели, но полная исходная история остаётся в SQLite.
+- **Working** (`task`) — явные key-value записи пользователя для одной задачи.
+  Они переживают новые диалоги и перезапуск процесса, но доступны только для
+  той же пары `user ID + task ID`.
+- **Long-term** (`user`) — явные key-value записи пользователя, общие для всех
+  его задач и диалогов. Другой пользователь их не видит.
+
+Новый scoped-диалог и операции с памятью:
+
+```text
+cargo run -- --user alice --task telegram-bot
+/remember user response_language Russian
+/remember task stack Rust
+/memory
+/forget task stack
+```
+
+`/remember user|task` и `/forget user|task` всегда явно называют изменяемый
+слой. `/memory` показывает Conversation, Working и Long-term;
+`/memory user` или `/memory task` оставляет только выбранный durable-слой.
+Команды выполняются локально, не вызывают модель и записывают durable-память в
+ту же SQLite-базу. Повторный `/remember` с тем же ключом заменяет значение.
+
+Без `--user` и `--task` используются точные идентификаторы `default` и
+`default`. При `--resume ID` или `--resume-last` всегда восстанавливается
+сохранённый scope диалога. Явный конфликтующий `--user` или `--task` завершает
+запуск локальной ошибкой до API-запроса. `--list-dialogs` показывает оба
+идентификатора рядом с ID диалога.
+
+В обычном запросе непустые durable-слои автоматически становятся отдельными
+system-блоками `user_memory`, затем `task_memory`. Текущий явный запрос имеет
+приоритет над working memory, а working memory конкретной задачи — над общей
+long-term memory. Оба блока имеют `CompactionPolicy::Exclude`: они не попадают
+в запрос summary-компактера и не копируются в conversation summary. Предыдущий
+conversation summary, напротив, имеет `Include`, чтобы следующий summary был
+накопительным.
+
+При `debug.log_payloads = false` JSONL-лог показывает безопасные метаданные
+блоков — `name`, `scope`, `compaction` — и размеры сообщений, но не их текст и
+не значения памяти. Включение `log_payloads = true` добавляет содержимое
+запросов и может раскрыть чувствительные данные.
+
+Общий интерфейс context provider + policy-bearing `SystemBlock` оставляет швы
+для будущих provider-ов: user profile (Day 12), task state (Day 13), invariants
+(Day 14) и transition policy (Day 15). В Day 11 этих структур, автоматических
+правил и переходов **ещё нет**: доступны только явные key-value записи.
+
+Пошаговый сценарий записи и SQLite/debug-проверки находятся в
+[`docs/day11-results.md`](docs/day11-results.md).
 
 ## День 10: стратегии управления контекстом
 
@@ -25,16 +85,17 @@ SQLite во всех режимах сохраняет полную исходн
 
 ### Общий SystemContext
 
-Base prompt, summary, facts и будущие служебные данные представлены отдельными
+Base prompt, summary, facts и служебные данные представлены отдельными
 именованными `SystemBlock` внутри общего `SystemContext`:
 
 ```text
 SystemContext blocks → выбранные user/assistant messages
 ```
 
-Эти блоки не записываются как обычные реплики, не попадают под sliding window и
-не поглощаются summary-компактером. Новый блок — например, профиль пользователя
-или правила проекта — можно добавить без изменения алгоритмов выбора истории.
+Эти блоки не записываются как обычные реплики и не попадают под sliding window.
+Начиная с Day 11, каждый блок явно задаёт scope и compaction policy: предыдущий
+summary включается в следующий compaction, а base, facts и durable memory из
+него исключаются.
 
 ### Sticky facts
 
@@ -183,8 +244,9 @@ JSONL debug-log содержит активную стратегию, имена
 
 ```bash
 cargo run                         # Новый диалог
+cargo run -- --user alice --task telegram-bot # Новый scoped-диалог
 cargo run -- --resume-last         # Продолжить последний активный диалог
-cargo run -- --list-dialogs        # Список: ID, время UTC, число сообщений, первый вопрос
+cargo run -- --list-dialogs        # Список: ID, user, task, время UTC, сообщения, первый вопрос
 cargo run -- --resume 3            # Продолжить диалог с ID 3
 cargo run -- --db /path/chats.sqlite3 --resume-last
 ```
@@ -348,6 +410,11 @@ you> /exit
 
 - `/clear` — начать новый диалог, сохранив прежний в базе;
 - `/stats` — показать контекст и накопленные токены без вызова API;
+- `/remember user KEY VALUE` — явно сохранить long-term запись;
+- `/remember task KEY VALUE` — явно сохранить working запись;
+- `/forget user KEY` / `/forget task KEY` — удалить запись выбранного слоя;
+- `/memory` — показать Conversation, Working и Long-term без вызова API;
+- `/memory user` / `/memory task` — показать один durable-слой;
 - `/branch` — создать checkpoint-копию активного диалога (только `branching`);
 - `/switch ID` — перейти на ветку из той же группы (только `branching`);
 - `/exit` или `/quit` — выйти;

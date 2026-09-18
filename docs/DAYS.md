@@ -15,10 +15,11 @@
 | `Day-8` | Токены входа, выхода и всего запроса из API, сохранение статистики | `cargo run` |
 | `Day-9` | Summary старой истории, raw-tail, метрики и диагностика компактинга | `cargo run` |
 | `Day-10` | Переключаемые стратегии context: summary, sliding window, sticky facts и branching | `cargo run` |
+| `Day-11` | Явные conversation/task/user memory layers и защита от compaction | `cargo run -- --user alice --task telegram-bot` |
 
 ```bash
-git switch Day-10
-cargo run
+git switch Day-11
+cargo run -- --user alice --task telegram-bot
 ```
 
 На новой копии репозитория сначала создай `deepseek.toml` из
@@ -29,8 +30,8 @@ cargo run
 `main` — навигация по заданиям. Day 2 и Day 3 развиваются от Day 1;
 Day 4 продолжает Day 3, Day 5 продолжает Day 4, Day 6 продолжает Day 5,
 Day 7 продолжает Day 6, Day 8 продолжает Day 7, Day 9 продолжает Day 8,
-Day 10 продолжает Day 9. Поздние дни могут сохранять режимы предыдущих дней,
-но соответствующая ветка фиксирует свой этап.
+Day 10 продолжает Day 9, Day 11 продолжает Day 10. Поздние дни могут сохранять
+режимы предыдущих дней, но соответствующая ветка фиксирует свой этап.
 
 Локальные `deepseek.toml`, `windows.toml`, `panels/`, `panels-day5/` и новые
 `reports/*.md`, а также базы `*.sqlite3` не коммитятся и остаются на диске при переключении веток.
