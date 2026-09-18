@@ -3,6 +3,7 @@ use std::io::{self, IsTerminal, Write};
 use crate::client::TokenUsage;
 use crate::context::{ContextStats, UsageTotals};
 use crate::memory::{DurableMemoryScope, MemorySnapshot, RequestScope};
+use crate::profile::UserProfile;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use terminal_size::{Height, Width, terminal_size};
 use unicode_segmentation::UnicodeSegmentation;
@@ -43,6 +44,19 @@ pub struct TerminalUi {
 }
 
 impl TerminalUi {
+    pub fn write_profile<W: Write>(
+        &self,
+        writer: &mut W,
+        user_id: &str,
+        profile: Option<&UserProfile>,
+    ) -> io::Result<()> {
+        let message = profile.map_or_else(
+            || format!("Profile · user: {user_id} · empty"),
+            |profile| format!("Profile · user: {user_id}\n{}", profile.content_markdown()),
+        );
+        self.write_block(writer, BlockStyle::System, &message)
+    }
+
     pub fn write_memory<W: Write>(
         &self,
         writer: &mut W,
@@ -599,6 +613,7 @@ mod tests {
     use crate::config::ContextStrategy;
     use crate::context::{ContextStats, UsageTotals};
     use crate::memory::{DurableMemoryScope, MemorySnapshot, RequestScope};
+    use crate::profile::UserProfile;
 
     use super::{FullWidthBlock, TerminalUi, fit_line, input_rows};
 
@@ -655,6 +670,31 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Conversation · dialog: new · strategy: summary · messages: 0 · summary boundary: 0 · sticky facts: 0\nWorking · empty\nLong-term · empty\n"
+        );
+    }
+
+    #[test]
+    fn profile_report_prints_complete_markdown_or_explicit_empty_state() {
+        let ui = TerminalUi {
+            styled: false,
+            interactive: false,
+            inline_images: false,
+        };
+        let profile = UserProfile::restored(
+            "alice",
+            "# Preferences\n\n- Be concise.\n- Prefer Android.",
+            "now",
+        )
+        .unwrap();
+        let mut output = Vec::new();
+
+        ui.write_profile(&mut output, "alice", Some(&profile))
+            .unwrap();
+        ui.write_profile(&mut output, "bob", None).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Profile · user: alice\n# Preferences\n\n- Be concise.\n- Prefer Android.\nProfile · user: bob · empty\n"
         );
     }
 

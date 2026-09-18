@@ -1,4 +1,4 @@
-use deepseek_cli::chat::{ChatHistory, InputAction, Role, parse_input};
+use deepseek_cli::chat::{ChatHistory, InputAction, ProfileAction, Role, parse_input};
 use deepseek_cli::memory::DurableMemoryScope;
 
 #[test]
@@ -66,6 +66,47 @@ fn malformed_memory_commands_are_local_usage_errors() {
                 "{input}"
             );
         }
+    }
+}
+
+#[test]
+fn parses_explicit_profile_commands_without_losing_free_form_text() {
+    assert_eq!(
+        parse_input("/profile"),
+        InputAction::Profile(ProfileAction::Show)
+    );
+    assert_eq!(
+        parse_input(" /profile set  Communicate briefly and directly. "),
+        InputAction::Profile(ProfileAction::Set(
+            "Communicate briefly and directly.".into()
+        ))
+    );
+    assert_eq!(
+        parse_input("/profile import ./profiles/Alice Profile.md"),
+        InputAction::Profile(ProfileAction::Import("./profiles/Alice Profile.md".into()))
+    );
+    assert_eq!(
+        parse_input("/profile clear"),
+        InputAction::Profile(ProfileAction::Clear)
+    );
+}
+
+#[test]
+fn malformed_profile_commands_are_local_usage_errors() {
+    for input in [
+        "/profile set",
+        "/profile import",
+        "/profile clear extra",
+        "/profile show",
+        "/profile unknown",
+    ] {
+        assert_eq!(
+            parse_input(input),
+            InputAction::InvalidCommand(
+                "usage: /profile [set <markdown>|import <path>|clear]".into()
+            ),
+            "{input}"
+        );
     }
 }
 

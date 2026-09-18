@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use deepseek_cli::dialog::DialogStore;
 use deepseek_cli::memory::{MemoryRepository, RequestScope};
+use deepseek_cli::profile::ProfileRepository;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
@@ -555,6 +556,143 @@ async fn local_memory_edits_filters_and_invalid_commands_never_call_api() {
             .contains("Long-term · empty")
     );
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_import_show_and_failures_are_local_and_atomic() {
+    let server = MockServer::start().await;
+    let config = write_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let valid = directory.path().join("Alice Profile.md");
+    let blank = directory.path().join("blank.md");
+    let binary = directory.path().join("binary.md");
+    let missing = directory.path().join("missing.md");
+    std::fs::write(
+        &valid,
+        "# Alice preferences\n\n- Communicate briefly.\n- Prefer Android.\n",
+    )
+    .unwrap();
+    std::fs::write(&blank, " \n ").unwrap();
+    std::fs::write(&binary, [0xff, 0xfe]).unwrap();
+    let input = format!(
+        "/profile set Original preference\n/profile import {}\n/profile\n/profile import {}\n/profile import {}\n/profile import {}\n/profile\n/exit\n",
+        valid.display(),
+        missing.display(),
+        blank.display(),
+        binary.display(),
+    );
+
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &["--user", "alice", "--task", "first"],
+        &input,
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Saved profile · user: alice"));
+    assert!(stdout.contains("Imported profile · user: alice"));
+    assert_eq!(stdout.matches("# Alice preferences").count(), 2);
+    assert!(stdout.contains("- Communicate briefly.\n- Prefer Android."));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.matches("failed to import profile").count(), 3);
+    let store = DialogStore::open(&database).unwrap();
+    assert!(store.list().unwrap().is_empty());
+    assert_eq!(
+        store
+            .load_profile("alice")
+            .unwrap()
+            .unwrap()
+            .content_markdown(),
+        "# Alice preferences\n\n- Communicate briefly.\n- Prefer Android.",
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    let cleared = run_cli_args(
+        config.path(),
+        &database,
+        &["--user", "alice", "--task", "other"],
+        "/profile clear\n/profile clear\n/profile\n/exit\n",
+    );
+    assert!(cleared.status.success());
+    let stdout = String::from_utf8(cleared.stdout).unwrap();
+    assert!(stdout.contains("Cleared profile · user: alice"));
+    assert!(stdout.contains("No profile for user: alice"));
+    assert!(stdout.contains("Profile · user: alice · empty"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profiles_persist_across_tasks_and_personalize_the_same_prompt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse("Answer", 2, 1, 3))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut config = write_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let log_path = directory.path().join("profiles.jsonl");
+    writeln!(
+        config,
+        "\n[debug]\nlog_path = {:?}\nlog_payloads = false",
+        log_path.to_str().unwrap()
+    )
+    .unwrap();
+
+    let alice_setup = run_cli_args(
+        config.path(),
+        &database,
+        &["--user", "alice", "--task", "setup"],
+        "/profile set ALICE_ANDROID_PROFILE\n/exit\n",
+    );
+    assert!(alice_setup.status.success());
+    let bob_setup = run_cli_args(
+        config.path(),
+        &database,
+        &["--user", "bob", "--task", "setup"],
+        "/profile set BOB_FLUTTER_PROFILE\n/exit\n",
+    );
+    assert!(bob_setup.status.success());
+    let alice = run_cli_args(
+        config.path(),
+        &database,
+        &["--user", "alice", "--task", "new-task"],
+        "/profile\nDesign a mobile app\n/exit\n",
+    );
+    assert!(alice.status.success());
+    assert!(
+        String::from_utf8(alice.stdout)
+            .unwrap()
+            .contains("ALICE_ANDROID_PROFILE")
+    );
+    let bob = run_cli_args(
+        config.path(),
+        &database,
+        &["--user", "bob", "--task", "new-task"],
+        "Design a mobile app\n/exit\n",
+    );
+    assert!(bob.status.success());
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let alice_request = serde_json::to_string(&requests[0].body_json::<Value>().unwrap()).unwrap();
+    let bob_request = serde_json::to_string(&requests[1].body_json::<Value>().unwrap()).unwrap();
+    assert!(alice_request.contains("ALICE_ANDROID_PROFILE"));
+    assert!(!alice_request.contains("BOB_FLUTTER_PROFILE"));
+    assert!(bob_request.contains("BOB_FLUTTER_PROFILE"));
+    assert!(!bob_request.contains("ALICE_ANDROID_PROFILE"));
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("user_profile"));
+    assert!(!log.contains("ALICE_ANDROID_PROFILE"));
+    assert!(!log.contains("BOB_FLUTTER_PROFILE"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

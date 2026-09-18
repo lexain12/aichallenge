@@ -1,10 +1,11 @@
+use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
 use deepseek_cli::agent::{Agent, AgentError, AgentEvent};
-use deepseek_cli::chat::{InputAction, Role, parse_input};
+use deepseek_cli::chat::{InputAction, ProfileAction, Role, parse_input};
 use deepseek_cli::client::ClientError;
 use deepseek_cli::config::{Config, ConfigError};
 use deepseek_cli::dialog::{DialogStore, StoreError};
@@ -236,6 +237,55 @@ async fn run() -> Result<(), AppError> {
                     filter,
                 )?;
             }
+            InputAction::Profile(action) => match action {
+                ProfileAction::Show => {
+                    let profile = agent.profile()?;
+                    stdout_ui.write_profile(
+                        &mut stdout,
+                        agent.scope().user_id(),
+                        profile.as_ref(),
+                    )?;
+                }
+                ProfileAction::Set(markdown) => {
+                    agent.replace_profile(&markdown)?;
+                    stdout_ui.write_block(
+                        &mut stdout,
+                        BlockStyle::System,
+                        &format!("Saved profile · user: {}", agent.scope().user_id()),
+                    )?;
+                }
+                ProfileAction::Import(path) => match fs::read_to_string(&path) {
+                    Ok(markdown) => match agent.replace_profile(&markdown) {
+                        Ok(()) => stdout_ui.write_block(
+                            &mut stdout,
+                            BlockStyle::System,
+                            &format!(
+                                "Imported profile · user: {} · path: {path}",
+                                agent.scope().user_id()
+                            ),
+                        )?,
+                        Err(error) => stderr_ui.write_block(
+                            &mut stderr,
+                            BlockStyle::Error,
+                            &format!("failed to import profile from '{path}': {error}"),
+                        )?,
+                    },
+                    Err(error) => stderr_ui.write_block(
+                        &mut stderr,
+                        BlockStyle::Error,
+                        &format!("failed to import profile from '{path}': {error}"),
+                    )?,
+                },
+                ProfileAction::Clear => {
+                    let user_id = agent.scope().user_id().to_owned();
+                    let message = if agent.clear_profile()? {
+                        format!("Cleared profile · user: {user_id}")
+                    } else {
+                        format!("No profile for user: {user_id}")
+                    };
+                    stdout_ui.write_block(&mut stdout, BlockStyle::System, &message)?;
+                }
+            },
             InputAction::Branch => match agent.branch_dialog() {
                 Ok(fork) => stdout_ui.write_block(
                     &mut stdout,

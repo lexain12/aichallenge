@@ -71,14 +71,48 @@ pub enum InputAction {
         key: String,
     },
     Memory(Option<DurableMemoryScope>),
+    Profile(ProfileAction),
     InvalidCommand(String),
     Send(String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum ProfileAction {
+    Show,
+    Set(String),
+    Import(String),
+    Clear,
 }
 
 pub fn parse_input(input: &str) -> InputAction {
     let input = input.trim();
     let mut parts = input.split_whitespace();
     match parts.next() {
+        Some("/profile") => {
+            let arguments = input
+                .strip_prefix("/profile")
+                .expect("matched profile command")
+                .trim();
+            let action = if arguments.is_empty() {
+                Some(ProfileAction::Show)
+            } else if let Some(markdown) = profile_argument(arguments, "set") {
+                Some(ProfileAction::Set(markdown.to_owned()))
+            } else if let Some(path) = profile_argument(arguments, "import") {
+                Some(ProfileAction::Import(path.to_owned()))
+            } else if arguments == "clear" {
+                Some(ProfileAction::Clear)
+            } else {
+                None
+            };
+            return action.map_or_else(
+                || {
+                    InputAction::InvalidCommand(
+                        "usage: /profile [set <markdown>|import <path>|clear]".to_owned(),
+                    )
+                },
+                InputAction::Profile,
+            );
+        }
         Some("/remember") => {
             let scope = parse_memory_scope(parts.next());
             let key = parts.next();
@@ -138,6 +172,15 @@ pub fn parse_input(input: &str) -> InputAction {
         "/stats" => InputAction::Stats,
         message => InputAction::Send(message.to_owned()),
     }
+}
+
+fn profile_argument<'a>(arguments: &'a str, action: &str) -> Option<&'a str> {
+    let value = arguments.strip_prefix(action)?;
+    if value.is_empty() || !value.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 fn parse_memory_scope(value: Option<&str>) -> Option<DurableMemoryScope> {
