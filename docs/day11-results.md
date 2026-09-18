@@ -112,8 +112,17 @@ Long-term · response_language = Russian
 После завершения ответа в другом терминале выполните:
 
 ```bash
-jq -c 'select(.event == "request_prepared" and .kind == "ordinary") | {kind, system_block_names, system_blocks, message_count, message_metadata, payload_logged: has("messages")}' "$DEBUG" | tail -n 1
+jq -s -e '
+  ((map(select(.event == "request_prepared" and .kind == "chat")) | last)
+   // error("no chat request_prepared record"))
+  | {kind, system_block_names, system_blocks, message_count, message_metadata,
+     payload_logged: has("messages")}
+' "$DEBUG"
 ```
+
+Обычный ответ имеет точное значение `kind = "chat"`. Команда завершается с
+ошибкой, если такой `request_prepared` отсутствует, поэтому пустой лог нельзя
+ошибочно принять за успешную проверку.
 
 В `system_block_names` блок `user_memory` должен идти раньше `task_memory`.
 Структурные метаданные для них должны иметь точные значения:
@@ -207,7 +216,7 @@ ordinary-запись debug-log должна содержать `user_memory`, �
 
 ```bash
 jq -s -e '
-  map(select(.event == "request_prepared" and .kind == "ordinary"))
+  map(select(.event == "request_prepared" and .kind == "chat"))
   | last
   | .system_block_names as $names
   | (($names | index("user_memory")) != null
@@ -233,7 +242,7 @@ Long-term · empty
 
 ```bash
 jq -s -e '
-  map(select(.event == "request_prepared" and .kind == "ordinary"))
+  map(select(.event == "request_prepared" and .kind == "chat"))
   | last
   | .system_block_names as $names
   | (($names | index("user_memory")) == null
