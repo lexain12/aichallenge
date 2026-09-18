@@ -224,6 +224,8 @@ pub enum MemoryError {
 pub enum ContextError {
     #[error("memory snapshot does not match the active request scope")]
     ScopeMismatch,
+    #[error("user profile does not match the active request user")]
+    ProfileScopeMismatch,
     #[error("failed to serialize memory context: {0}")]
     Serialization(String),
 }
