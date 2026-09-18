@@ -11,6 +11,10 @@ use crate::context::{
 use crate::debug_log::{DebugLog, RequestMetadata};
 use crate::dialog::{BranchInfo, DialogStore, ForkResult, StoreError};
 use crate::facts::{FactsState, parse_facts_json, plan_facts_update};
+use crate::memory::{
+    ContextError, ContextProvider, DurableMemoryScope, MemoryRepository, MemorySnapshot,
+    RequestScope,
+};
 use crate::system_context::{CompactionPolicy, ContextScope, SystemBlockMetadata, SystemContext};
 
 /// An API client and its independent conversation, optionally backed by SQLite.
@@ -20,6 +24,7 @@ pub struct Agent {
     prompt: Option<String>,
     store: Option<DialogStore>,
     dialog_id: Option<i64>,
+    scope: RequestScope,
     last_usage: Option<TokenUsage>,
     context_config: ContextConfig,
     context_state: ContextState,
@@ -31,8 +36,18 @@ pub struct Agent {
 impl Agent {
     /// Start a persistent dialog lazily, when the first prompt is sent.
     pub fn with_store(config: &Config, store: DialogStore) -> Result<Self, ClientError> {
+        Self::with_store_for_scope(config, store, RequestScope::default())
+    }
+
+    /// Start a fresh persistent dialog within the addressed user and task.
+    pub fn with_store_for_scope(
+        config: &Config,
+        store: DialogStore,
+        scope: RequestScope,
+    ) -> Result<Self, ClientError> {
         let mut agent = Self::new(config)?;
         agent.store = Some(store);
+        agent.scope = scope.with_dialog_id(None);
         Ok(agent)
     }
 
@@ -47,11 +62,45 @@ impl Agent {
         agent.branch_info = dialog.branch;
         agent.history = ChatHistory::from_messages(dialog.system_prompt, dialog.messages);
         agent.dialog_id = Some(dialog.id);
+        agent.scope = dialog.scope.with_dialog_id(Some(dialog.id));
         Ok(agent)
     }
 
     pub fn dialog_id(&self) -> Option<i64> {
         self.dialog_id
+    }
+
+    pub fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+
+    pub fn remember(
+        &mut self,
+        layer: DurableMemoryScope,
+        key: &str,
+        value: &str,
+    ) -> Result<(), AgentError> {
+        self.store
+            .as_mut()
+            .ok_or(AgentError::MemoryRequiresStore)?
+            .upsert_memory(&self.scope.address(layer), key, value)?;
+        Ok(())
+    }
+
+    pub fn forget(&mut self, layer: DurableMemoryScope, key: &str) -> Result<bool, AgentError> {
+        Ok(self
+            .store
+            .as_mut()
+            .ok_or(AgentError::MemoryRequiresStore)?
+            .delete_memory(&self.scope.address(layer), key)?)
+    }
+
+    pub fn memory_snapshot(&self) -> Result<MemorySnapshot, AgentError> {
+        Ok(self
+            .store
+            .as_ref()
+            .ok_or(AgentError::MemoryRequiresStore)?
+            .load_memory(&self.scope)?)
     }
 
     /// Statistics for the latest request, not a sum over the conversation.
@@ -66,6 +115,7 @@ impl Agent {
             prompt: None,
             store: None,
             dialog_id: None,
+            scope: RequestScope::default(),
             last_usage: None,
             context_config: config.context().clone(),
             context_state: ContextState::default(),
@@ -83,6 +133,7 @@ impl Agent {
             prompt: None,
             store: None,
             dialog_id: None,
+            scope: RequestScope::default(),
             last_usage: None,
             context_config: ContextConfig::full_history(),
             context_state: ContextState::default(),
@@ -131,10 +182,30 @@ impl Agent {
                     store.append_message(id, self.history.messages().len(), Role::User, prompt)?
                 }
                 None => {
-                    self.dialog_id = Some(store.start_dialog(self.history.system_prompt(), prompt)?)
+                    let id = store.start_dialog_in_scope(
+                        &self.scope,
+                        self.history.system_prompt(),
+                        prompt,
+                    )?;
+                    self.dialog_id = Some(id);
+                    self.scope = self.scope.with_dialog_id(Some(id));
                 }
             }
         }
+        let memory_blocks = if persistent {
+            match self
+                .memory_snapshot()
+                .and_then(|snapshot| snapshot.blocks(&self.scope).map_err(AgentError::Context))
+            {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    self.history.push(Role::User, prompt.to_owned());
+                    return Err(error);
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let mut candidate_messages = self.history.messages().to_vec();
         candidate_messages.push(Message::new(Role::User, prompt.to_owned()));
         let facts_result = self
@@ -149,12 +220,10 @@ impl Agent {
                 return Err(error);
             }
         };
-        let additional_blocks: Vec<_> =
-            if self.context_config.strategy() == ContextStrategy::StickyFacts {
-                candidate_facts.system_block().into_iter().collect()
-            } else {
-                Vec::new()
-            };
+        let mut additional_blocks = memory_blocks;
+        if self.context_config.strategy() == ContextStrategy::StickyFacts {
+            additional_blocks.extend(candidate_facts.system_block());
+        }
         let prepared = prepare_request(
             &self.history,
             &self.context_state,
@@ -279,6 +348,7 @@ impl Agent {
         self.facts_state = dialog.facts;
         self.branch_info = dialog.branch;
         self.dialog_id = Some(dialog.id);
+        self.scope = dialog.scope.with_dialog_id(Some(dialog.id));
         self.last_usage = last_usage;
         let _ = self.debug_log.log_event(
             "branch_switched",
@@ -310,6 +380,7 @@ impl Agent {
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.dialog_id = None;
+        self.scope = self.scope.with_dialog_id(None);
         self.last_usage = None;
         self.context_state = ContextState::default();
         self.facts_state = FactsState::default();
@@ -606,6 +677,10 @@ pub enum AgentError {
     BranchingStrategyRequired,
     #[error("branch commands require a persisted active dialog")]
     NoPersistentDialog,
+    #[error("durable memory requires a persistent store")]
+    MemoryRequiresStore,
+    #[error(transparent)]
+    Context(#[from] ContextError),
     #[error(transparent)]
     Client(#[from] ClientError),
     #[error(transparent)]

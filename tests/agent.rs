@@ -6,6 +6,7 @@ use deepseek_cli::agent::{Agent, AgentError, AgentEvent};
 use deepseek_cli::client::ClientError;
 use deepseek_cli::config::Config;
 use deepseek_cli::dialog::DialogStore;
+use deepseek_cli::memory::{DurableMemoryScope, RequestScope};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
@@ -126,6 +127,387 @@ fn seen(event: AgentEvent<'_>) -> Seen {
         | AgentEvent::FactsUpdateFailed { .. }
         | AgentEvent::DebugLogFailed { .. } => Seen::Other,
     }
+}
+
+#[tokio::test]
+async fn ordinary_request_includes_user_then_task_memory() {
+    let server = MockServer::start().await;
+    mount(&server, response("Answer", true)).await;
+    let directory = tempfile::tempdir().unwrap();
+    let scope = RequestScope::new("alice", "bot").unwrap();
+    let mut agent = Agent::with_store_for_scope(
+        &config(&server),
+        DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap(),
+        scope,
+    )
+    .unwrap();
+    agent
+        .remember(DurableMemoryScope::User, "language", "Russian")
+        .unwrap();
+    agent
+        .remember(DurableMemoryScope::Task, "stack", "Rust")
+        .unwrap();
+
+    agent
+        .run_with_prompt("What context do you have?")
+        .await
+        .unwrap();
+
+    let request = &server.received_requests().await.unwrap()[0];
+    let body: Value = request.body_json().unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    assert!(messages[1]["content"].as_str().unwrap().contains("Russian"));
+    assert!(messages[2]["content"].as_str().unwrap().contains("Rust"));
+    assert_eq!(
+        messages.last().unwrap()["content"],
+        "What context do you have?"
+    );
+}
+
+#[tokio::test]
+async fn restored_and_new_dialogs_observe_only_their_addressed_memory() {
+    let server = MockServer::start().await;
+    mount(&server, response("Answer", true)).await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let scope = RequestScope::new("alice", "bot").unwrap();
+    let mut first = Agent::with_store_for_scope(
+        &config(&server),
+        DialogStore::open(&path).unwrap(),
+        scope.clone(),
+    )
+    .unwrap();
+    first
+        .remember(DurableMemoryScope::User, "language", "Russian")
+        .unwrap();
+    first
+        .remember(DurableMemoryScope::Task, "stack", "Rust")
+        .unwrap();
+    first.run_with_prompt("First dialog").await.unwrap();
+    let id = first.dialog_id().unwrap();
+    assert_eq!(first.scope(), &scope.with_dialog_id(Some(id)));
+    drop(first);
+
+    let restored =
+        Agent::from_dialog(&config(&server), DialogStore::open(&path).unwrap(), id).unwrap();
+    assert_eq!(restored.scope(), &scope.with_dialog_id(Some(id)));
+    assert_eq!(
+        restored.memory_snapshot().unwrap().task_entries()["stack"],
+        "Rust"
+    );
+
+    let other = Agent::with_store_for_scope(
+        &config(&server),
+        DialogStore::open(&path).unwrap(),
+        RequestScope::new("alice", "other").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        other.memory_snapshot().unwrap().user_entries()["language"],
+        "Russian"
+    );
+    assert!(other.memory_snapshot().unwrap().task_entries().is_empty());
+    let other_user = Agent::with_store_for_scope(
+        &config(&server),
+        DialogStore::open(&path).unwrap(),
+        RequestScope::new("bob", "bot").unwrap(),
+    )
+    .unwrap();
+    assert!(
+        other_user
+            .memory_snapshot()
+            .unwrap()
+            .user_entries()
+            .is_empty()
+    );
+    assert!(
+        other_user
+            .memory_snapshot()
+            .unwrap()
+            .task_entries()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn compaction_excludes_durable_memory() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("answer one", 2, 1, 3),
+            sse("answer two", 4, 2, 6),
+            sse("summary", 7, 2, 9),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut agent = Agent::with_store_for_scope(
+        &compression_config(&server, 3, 2),
+        DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap(),
+        RequestScope::new("alice", "bot").unwrap(),
+    )
+    .unwrap();
+    agent
+        .remember(DurableMemoryScope::User, "private", "user secret")
+        .unwrap();
+    agent
+        .remember(DurableMemoryScope::Task, "decision", "task decision")
+        .unwrap();
+    agent.run_with_prompt("First").await.unwrap();
+    agent.run_with_prompt("Second").await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let compaction: Value = requests[2].body_json().unwrap();
+    let serialized = serde_json::to_string(&compaction["messages"]).unwrap();
+    assert!(!serialized.contains("user secret"));
+    assert!(!serialized.contains("task decision"));
+}
+
+#[tokio::test]
+async fn durable_memory_metadata_appears_only_in_ordinary_requests() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("answer one", 2, 1, 3),
+            sse("answer two", 4, 2, 6),
+            sse("summary", 7, 2, 9),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let log_path = directory.path().join("context.jsonl");
+    let mut file = NamedTempFile::new().unwrap();
+    write!(file,
+        "api_key = \"test-key\"\nbase_url = \"{}\"\n[context]\nstrategy = \"summary\"\ncompact_after_prompt_tokens = 3\nkeep_last_messages = 2\n[debug]\nlog_path = \"{}\"\nlog_payloads = false\n",
+        server.uri(), log_path.display(),
+    ).unwrap();
+    let mut agent = Agent::with_store(
+        &Config::load(file.path(), None).unwrap(),
+        DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap(),
+    )
+    .unwrap();
+    agent
+        .remember(DurableMemoryScope::User, "private", "user secret")
+        .unwrap();
+    agent
+        .remember(DurableMemoryScope::Task, "decision", "task decision")
+        .unwrap();
+    agent.run_with_prompt("First").await.unwrap();
+    agent.run_with_prompt("Second").await.unwrap();
+    let log = std::fs::read_to_string(log_path).unwrap();
+    let events: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let requests: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "request_prepared")
+        .collect();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0]["system_blocks"],
+        json!([
+            {"name":"base", "scope":"application", "compaction":"exclude"},
+            {"name":"user_memory", "scope":"user", "compaction":"exclude"},
+            {"name":"task_memory", "scope":"task", "compaction":"exclude"},
+        ])
+    );
+    assert_eq!(requests[2]["kind"], "compaction");
+    assert_eq!(
+        requests[2]["system_blocks"],
+        json!([
+            {"name":"summary_compactor", "scope":"application", "compaction":"exclude"},
+        ])
+    );
+    assert!(!log.contains("user secret"));
+    assert!(!log.contains("task decision"));
+}
+
+#[tokio::test]
+async fn sticky_facts_follow_durable_memory_in_the_ordinary_request() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [sse(r#"{"goal":"ship"}"#, 3, 1, 4), sse("Answer", 5, 1, 6)],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut agent = Agent::with_store(
+        &sticky_config(&server, 3),
+        DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap(),
+    )
+    .unwrap();
+    agent
+        .remember(DurableMemoryScope::User, "language", "Russian")
+        .unwrap();
+    agent
+        .remember(DurableMemoryScope::Task, "stack", "Rust")
+        .unwrap();
+    agent.run_with_prompt("Ship it").await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let body: Value = requests[1].body_json().unwrap();
+    assert!(
+        body["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Russian")
+    );
+    assert!(
+        body["messages"][2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Rust")
+    );
+    assert!(
+        body["messages"][3]["content"]
+            .as_str()
+            .unwrap()
+            .contains(r#"{"goal":"ship"}"#)
+    );
+    assert_eq!(body["messages"][4]["content"], "Ship it");
+}
+
+#[tokio::test]
+async fn memory_is_reloaded_and_forgetting_updates_the_next_request() {
+    let server = MockServer::start().await;
+    mount(&server, response("Answer", true)).await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let mut agent = Agent::with_store(&config(&server), DialogStore::open(&path).unwrap()).unwrap();
+    let mut writer =
+        Agent::with_store(&config(&server), DialogStore::open(&path).unwrap()).unwrap();
+    writer
+        .remember(DurableMemoryScope::Task, "stack", "Rust")
+        .unwrap();
+    agent.run_with_prompt("First").await.unwrap();
+    writer
+        .remember(DurableMemoryScope::Task, "stack", "Go")
+        .unwrap();
+    agent.run_with_prompt("Second").await.unwrap();
+    assert!(agent.forget(DurableMemoryScope::Task, "stack").unwrap());
+    assert!(!agent.forget(DurableMemoryScope::Task, "stack").unwrap());
+    agent.run_with_prompt("Third").await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let first: Value = requests[0].body_json().unwrap();
+    let second: Value = requests[1].body_json().unwrap();
+    let third: Value = requests[2].body_json().unwrap();
+    assert!(
+        first["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Rust")
+    );
+    assert!(
+        second["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Go")
+    );
+    assert_eq!(third["messages"][1]["role"], "user");
+}
+
+#[tokio::test]
+async fn in_memory_agents_reject_durable_memory_operations() {
+    let server = MockServer::start().await;
+    let mut agent = agent(&server);
+    assert!(matches!(
+        agent.remember(DurableMemoryScope::User, "key", "value"),
+        Err(AgentError::MemoryRequiresStore)
+    ));
+    assert!(matches!(
+        agent.forget(DurableMemoryScope::Task, "key"),
+        Err(AgentError::MemoryRequiresStore)
+    ));
+    assert!(matches!(
+        agent.memory_snapshot(),
+        Err(AgentError::MemoryRequiresStore)
+    ));
+}
+
+#[tokio::test]
+async fn clear_and_branch_switch_preserve_the_persisted_memory_scope() {
+    let server = MockServer::start().await;
+    mount(&server, response("Answer", true)).await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let scope = RequestScope::new("alice", "bot").unwrap();
+    let mut agent = Agent::with_store_for_scope(
+        &branching_config(&server),
+        DialogStore::open(&path).unwrap(),
+        scope.clone(),
+    )
+    .unwrap();
+    agent
+        .remember(DurableMemoryScope::Task, "stack", "Rust")
+        .unwrap();
+    agent.run_with_prompt("First").await.unwrap();
+    let fork = agent.branch_dialog().unwrap();
+    agent.switch_branch(fork.new_dialog_id).unwrap();
+    assert_eq!(
+        agent.scope(),
+        &scope.with_dialog_id(Some(fork.new_dialog_id))
+    );
+    assert_eq!(
+        agent.memory_snapshot().unwrap().task_entries()["stack"],
+        "Rust"
+    );
+    agent.clear_history();
+    assert_eq!(agent.scope(), &scope);
+    assert_eq!(agent.dialog_id(), None);
+    agent.run_with_prompt("Fresh dialog").await.unwrap();
+    let saved = DialogStore::open(&path)
+        .unwrap()
+        .load(agent.dialog_id().unwrap())
+        .unwrap();
+    assert_eq!(saved.scope.user_id(), "alice");
+    assert_eq!(saved.scope.task_id(), "bot");
+    assert_eq!(
+        agent.memory_snapshot().unwrap().task_entries()["stack"],
+        "Rust"
+    );
+}
+
+#[tokio::test]
+async fn memory_read_failure_preserves_input_and_prevents_sticky_facts_http() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let mut agent = Agent::with_store(
+        &sticky_config(&server, 3),
+        DialogStore::open(&path).unwrap(),
+    )
+    .unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "ALTER TABLE memory_entries RENAME TO unavailable_memory",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        agent.run_with_prompt("Pending").await,
+        Err(AgentError::Store(_))
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(agent.history().messages().len(), 1);
+    assert_eq!(agent.history().messages()[0].content(), "Pending");
+    connection
+        .execute(
+            "ALTER TABLE unavailable_memory RENAME TO memory_entries",
+            [],
+        )
+        .unwrap();
+    let saved = DialogStore::open(&path)
+        .unwrap()
+        .load(agent.dialog_id().unwrap())
+        .unwrap();
+    assert_eq!(saved.messages, agent.history().messages());
+    mount_sequence(&server, [sse("{}", 3, 1, 4), sse("Recovered", 3, 1, 4)]).await;
+    agent.run_with_prompt("Retry").await.unwrap();
+    assert_eq!(agent.history().messages().len(), 3);
 }
 
 #[tokio::test]
