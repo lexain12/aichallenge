@@ -11,6 +11,7 @@ use crate::context::{
 use crate::debug_log::{DebugLog, RequestMetadata};
 use crate::dialog::{BranchInfo, DialogStore, ForkResult, StoreError};
 use crate::facts::{FactsState, parse_facts_json, plan_facts_update};
+use crate::system_context::{CompactionPolicy, ContextScope, SystemBlockMetadata, SystemContext};
 
 /// An API client and its independent conversation, optionally backed by SQLite.
 pub struct Agent {
@@ -172,7 +173,7 @@ impl Agent {
         };
         let request_metadata = RequestMetadata::new(
             self.context_config.strategy(),
-            prepared.system_block_names().to_vec(),
+            prepared.system_block_metadata(),
             prepared.selected_message_count(),
             boundary,
             facts_boundary,
@@ -215,7 +216,8 @@ impl Agent {
         {
             emit_event(&mut on_event, AgentEvent::DebugLogFailed { error })?;
         }
-        self.maybe_compact(usage, &mut on_event).await?;
+        self.maybe_compact(prepared.system_context(), usage, &mut on_event)
+            .await?;
         Ok(answer)
     }
 
@@ -346,7 +348,11 @@ impl Agent {
         }
         let request_metadata = RequestMetadata::new(
             ContextStrategy::StickyFacts,
-            vec!["facts_updater".to_owned()],
+            vec![SystemBlockMetadata {
+                name: "facts_updater".to_owned(),
+                scope: ContextScope::Application,
+                compaction: CompactionPolicy::Exclude,
+            }],
             candidate_messages
                 .len()
                 .saturating_sub(self.facts_state.covered_message_count()),
@@ -429,6 +435,7 @@ impl Agent {
 
     async fn maybe_compact<F>(
         &mut self,
+        system_context: &SystemContext,
         usage: Option<TokenUsage>,
         on_event: &mut F,
     ) -> Result<(), AgentError>
@@ -447,6 +454,7 @@ impl Agent {
             &self.history,
             &self.context_state,
             self.context_config.keep_last_messages(),
+            system_context,
         ) else {
             return Ok(());
         };
@@ -472,9 +480,20 @@ impl Agent {
             emit_event(on_event, AgentEvent::DebugLogFailed { error })?;
         }
         let previous_boundary = self.context_stats().covered_message_count;
+        let mut system_blocks = vec![SystemBlockMetadata {
+            name: "summary_compactor".to_owned(),
+            scope: ContextScope::Application,
+            compaction: CompactionPolicy::Exclude,
+        }];
+        system_blocks.extend(
+            system_context
+                .compaction_blocks()
+                .into_iter()
+                .map(|block| block.metadata()),
+        );
         let request_metadata = RequestMetadata::new(
             ContextStrategy::Summary,
-            vec!["summary_compactor".to_owned()],
+            system_blocks,
             plan.request_messages().len(),
             previous_boundary,
             0,

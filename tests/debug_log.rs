@@ -1,6 +1,7 @@
 use deepseek_cli::chat::{Message, Role};
 use deepseek_cli::config::ContextStrategy;
 use deepseek_cli::debug_log::{DebugLog, RequestMetadata};
+use deepseek_cli::system_context::{CompactionPolicy, ContextScope, SystemBlockMetadata};
 
 #[test]
 fn payload_content_is_opt_in_and_api_key_is_always_redacted() {
@@ -10,7 +11,18 @@ fn payload_content_is_opt_in_and_api_key_is_always_redacted() {
     let messages = vec![Message::for_request(Role::User, "private text secret-key")];
     let metadata = RequestMetadata::new(
         ContextStrategy::StickyFacts,
-        vec!["base".into(), "facts".into()],
+        vec![
+            SystemBlockMetadata {
+                name: "base".into(),
+                scope: ContextScope::Application,
+                compaction: CompactionPolicy::Exclude,
+            },
+            SystemBlockMetadata {
+                name: "facts".into(),
+                scope: ContextScope::Conversation,
+                compaction: CompactionPolicy::Exclude,
+            },
+        ],
         1,
         0,
         3,
@@ -22,6 +34,7 @@ fn payload_content_is_opt_in_and_api_key_is_always_redacted() {
     assert!(safe_text.contains("\"content_chars\":23"));
     assert!(safe_text.contains("\"strategy\":\"sticky_facts\""));
     assert!(safe_text.contains("\"system_block_names\":[\"base\",\"facts\"]"));
+    assert!(safe_text.contains(r#""name":"facts","scope":"conversation","compaction":"exclude""#));
     assert!(safe_text.contains("\"facts_boundary\":3"));
     assert!(!safe_text.contains("private text"));
     assert!(!safe_text.contains("secret-key"));

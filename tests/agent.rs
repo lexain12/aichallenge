@@ -591,7 +591,9 @@ async fn repeated_compaction_sends_previous_summary_with_only_new_prefix() {
     assert_eq!(requests.len(), 5);
     let second_summary: Value = requests[4].body_json().unwrap();
     let input = second_summary["messages"][1]["content"].as_str().unwrap();
-    assert!(input.contains("Previous summary:\nsummary one"));
+    assert!(
+        input.contains("Context block summary:\nSummary of earlier conversation:\nsummary one")
+    );
     assert!(input.contains("New messages:\nuser: u2\nassistant: a2"));
     assert!(!input.contains("user: u1"));
     assert!(!input.contains("user: u3"));

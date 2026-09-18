@@ -7,11 +7,12 @@ use serde_json::{Value, json};
 
 use crate::chat::{Message, Role};
 use crate::config::{ContextStrategy, DebugConfig};
+use crate::system_context::SystemBlockMetadata;
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct RequestMetadata {
     strategy: ContextStrategy,
-    system_block_names: Vec<String>,
+    system_blocks: Vec<SystemBlockMetadata>,
     selected_message_count: usize,
     summary_boundary: usize,
     facts_boundary: usize,
@@ -20,14 +21,14 @@ pub struct RequestMetadata {
 impl RequestMetadata {
     pub fn new(
         strategy: ContextStrategy,
-        system_block_names: Vec<String>,
+        system_blocks: Vec<SystemBlockMetadata>,
         selected_message_count: usize,
         summary_boundary: usize,
         facts_boundary: usize,
     ) -> Self {
         Self {
             strategy,
-            system_block_names,
+            system_blocks,
             selected_message_count,
             summary_boundary,
             facts_boundary,
@@ -88,12 +89,18 @@ impl DebugLog {
                 })
             })
             .collect();
+        let names: Vec<_> = context
+            .system_blocks
+            .iter()
+            .map(|block| block.name.as_str())
+            .collect();
         let mut value = json!({
             "event": "request_prepared",
             "timestamp_unix_ms": timestamp_unix_ms(),
             "kind": kind,
             "strategy": context.strategy,
-            "system_block_names": context.system_block_names,
+            "system_block_names": names,
+            "system_blocks": context.system_blocks,
             "selected_message_count": context.selected_message_count,
             "summary_boundary": context.summary_boundary,
             "facts_boundary": context.facts_boundary,

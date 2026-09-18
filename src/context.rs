@@ -4,7 +4,9 @@ use crate::chat::{ChatHistory, Message, Role};
 use crate::client::TokenUsage;
 use crate::config::{ContextConfig, ContextStrategy};
 use crate::facts::FactsState;
-use crate::system_context::{SystemBlock, SystemContext};
+use crate::system_context::{
+    CompactionPolicy, ContextScope, SystemBlock, SystemBlockMetadata, SystemContext,
+};
 
 const SUMMARY_CONTEXT_PREFIX: &str = "Summary of earlier conversation:\n";
 const SUMMARY_SYSTEM_PROMPT: &str = "Create a faithful cumulative summary of the conversation context. Preserve facts, names, decisions, constraints, user preferences, unresolved questions, and exact technical identifiers. Distinguish user statements from assistant suggestions. Do not invent missing information. Return only the updated summary.";
@@ -179,6 +181,7 @@ pub struct PreparedContext {
     selected_message_count: usize,
     summary_boundary: usize,
     system_block_names: Vec<String>,
+    system_context: SystemContext,
 }
 
 impl PreparedContext {
@@ -196,6 +199,14 @@ impl PreparedContext {
 
     pub fn system_block_names(&self) -> &[String] {
         &self.system_block_names
+    }
+
+    pub fn system_context(&self) -> &SystemContext {
+        &self.system_context
+    }
+
+    pub fn system_block_metadata(&self) -> Vec<SystemBlockMetadata> {
+        self.system_context.metadata()
     }
 }
 
@@ -222,7 +233,12 @@ pub fn prepare_request(
     additional_system_blocks: &[SystemBlock],
 ) -> PreparedContext {
     let mut system = SystemContext::default();
-    system.push(SystemBlock::new("base", history.system_prompt()));
+    system.push(SystemBlock::new(
+        "base",
+        history.system_prompt(),
+        ContextScope::Application,
+        CompactionPolicy::Exclude,
+    ));
 
     let (selection, summary_boundary) = match config.strategy() {
         ContextStrategy::Summary => {
@@ -231,6 +247,8 @@ pub fn prepare_request(
                 system.push(SystemBlock::new(
                     "summary",
                     format!("{SUMMARY_CONTEXT_PREFIX}{}", summary.content()),
+                    ContextScope::Conversation,
+                    CompactionPolicy::Include,
                 ));
             }
             let boundary = summary.map_or(0, ContextSummary::covered_message_count);
@@ -246,9 +264,9 @@ pub fn prepare_request(
         system.push(block.clone());
     }
     let system_block_names = system
-        .blocks()
-        .iter()
-        .map(|block| block.name().to_owned())
+        .metadata()
+        .into_iter()
+        .map(|block| block.name)
         .collect();
     let mut ordinary_messages = history.messages().to_vec();
     ordinary_messages.push(Message::new(Role::User, user_message.to_owned()));
@@ -264,6 +282,7 @@ pub fn prepare_request(
         selected_message_count,
         summary_boundary,
         system_block_names,
+        system_context: system,
     }
 }
 
@@ -298,6 +317,7 @@ pub fn plan_compaction(
     history: &ChatHistory,
     state: &ContextState,
     keep_last_messages: usize,
+    system: &SystemContext,
 ) -> Option<CompactionPlan> {
     let target = history.messages().len().checked_sub(keep_last_messages)?;
     if target == 0 {
@@ -311,8 +331,14 @@ pub fn plan_compaction(
     }
 
     let mut input = String::new();
-    if let Some(summary) = previous {
-        writeln!(input, "Previous summary:\n{}\n", summary.content()).ok()?;
+    for block in system.compaction_blocks() {
+        writeln!(
+            input,
+            "Context block {}:\n{}\n",
+            block.name(),
+            block.content()
+        )
+        .ok()?;
     }
     input.push_str("New messages:\n");
     for message in &history.messages()[previous_boundary..target] {

@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::chat::{Message, Role};
 use crate::client::TokenUsage;
 use crate::context::UsageTotals;
-use crate::system_context::SystemBlock;
+use crate::system_context::{CompactionPolicy, ContextScope, SystemBlock};
 
 pub type Facts = BTreeMap<String, String>;
 
@@ -49,6 +49,8 @@ impl FactsState {
         Some(SystemBlock::new(
             "facts",
             format!("{FACTS_BLOCK_PREFIX}{json}"),
+            ContextScope::Conversation,
+            CompactionPolicy::Exclude,
         ))
     }
 
