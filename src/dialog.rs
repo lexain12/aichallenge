@@ -13,6 +13,9 @@ use crate::memory::{
     MemoryAddress, MemoryError, MemoryRepository, MemorySnapshot, RequestScope, memory_key,
     memory_value,
 };
+use crate::profile::{
+    ProfileError, ProfileRepository, UserProfile, profile_markdown, profile_user_id,
+};
 
 pub struct DialogStore {
     connection: Connection,
@@ -126,6 +129,11 @@ impl DialogStore {
                      (scope_type = 'task' AND task_id <> '')
                  ),
                  PRIMARY KEY (scope_type, user_id, task_id, key)
+             );
+             CREATE TABLE IF NOT EXISTS user_profiles (
+                 user_id TEXT PRIMARY KEY,
+                 content_markdown TEXT NOT NULL,
+                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
              );",
         )?;
         connection.execute(
@@ -822,6 +830,58 @@ impl MemoryRepository for DialogStore {
     }
 }
 
+impl ProfileRepository for DialogStore {
+    type Error = StoreError;
+
+    fn load_profile(&self, user_id: &str) -> Result<Option<UserProfile>, Self::Error> {
+        let user_id = profile_user_id(user_id)?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT content_markdown, updated_at
+                 FROM user_profiles
+                 WHERE user_id = ?1",
+                params![user_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        row.map(|(markdown, updated_at)| UserProfile::restored(user_id, markdown, updated_at))
+            .transpose()
+            .map_err(StoreError::from)
+    }
+
+    fn replace_profile(&mut self, user_id: &str, markdown: &str) -> Result<(), Self::Error> {
+        let user_id = profile_user_id(user_id)?;
+        let markdown = profile_markdown(markdown)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO user_profiles (user_id, content_markdown)
+             VALUES (?1, ?2)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 content_markdown = excluded.content_markdown,
+                 updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
+            params![user_id, markdown],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn delete_profile(&mut self, user_id: &str) -> Result<bool, Self::Error> {
+        let user_id = profile_user_id(user_id)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
+            "DELETE FROM user_profiles WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+}
+
 fn address_parts(address: &MemoryAddress) -> Result<(&'static str, &str, &str), MemoryError> {
     let user_id = address.user_id().trim();
     if user_id.is_empty() {
@@ -937,6 +997,8 @@ pub enum StoreError {
     Database(#[from] rusqlite::Error),
     #[error("invalid durable memory: {0}")]
     InvalidMemory(#[from] MemoryError),
+    #[error("invalid user profile: {0}")]
+    InvalidProfile(#[from] ProfileError),
     #[error("dialog {0} was not found")]
     NotFound(i64),
     #[error("dialog {0} changed in another session; restart with --resume {0}")]

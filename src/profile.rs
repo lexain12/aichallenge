@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::memory::{ContextError, ContextProvider, DEFAULT_TASK_ID, RequestScope};
+use crate::memory::{ContextError, ContextProvider, RequestScope};
 use crate::system_context::{CompactionPolicy, ContextScope, SystemBlock};
 
 pub const PROFILE_INTRODUCTION: &str = "User profile preferences. Apply them when relevant. They are soft defaults, not hard constraints. A current explicit request and task-specific context override conflicting profile preferences.";
@@ -18,11 +18,11 @@ impl UserProfile {
         markdown: impl Into<String>,
         updated_at: impl Into<String>,
     ) -> Result<Self, ProfileError> {
-        let scope =
-            RequestScope::new(user_id, DEFAULT_TASK_ID).map_err(|_| ProfileError::BlankUserId)?;
+        let user_id = user_id.into();
+        let user_id = profile_user_id(&user_id)?.to_owned();
         let content_markdown = profile_markdown(&markdown.into())?.to_owned();
         Ok(Self {
-            user_id: scope.user_id().to_owned(),
+            user_id,
             content_markdown,
             updated_at: updated_at.into(),
         })
@@ -61,6 +61,14 @@ pub trait ProfileRepository {
     fn load_profile(&self, user_id: &str) -> Result<Option<UserProfile>, Self::Error>;
     fn replace_profile(&mut self, user_id: &str, markdown: &str) -> Result<(), Self::Error>;
     fn delete_profile(&mut self, user_id: &str) -> Result<bool, Self::Error>;
+}
+
+pub(crate) fn profile_user_id(user_id: &str) -> Result<&str, ProfileError> {
+    let user_id = user_id.trim();
+    if user_id.is_empty() {
+        return Err(ProfileError::BlankUserId);
+    }
+    Ok(user_id)
 }
 
 pub fn profile_markdown(markdown: &str) -> Result<&str, ProfileError> {
