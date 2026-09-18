@@ -6,7 +6,8 @@ use deepseek_cli::context::ContextSummary;
 use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::facts::Facts;
 use deepseek_cli::memory::{
-    DEFAULT_TASK_ID, DEFAULT_USER_ID, DurableMemoryScope, MemoryRepository, RequestScope,
+    DEFAULT_TASK_ID, DEFAULT_USER_ID, DurableMemoryScope, MemoryAddress, MemoryError,
+    MemoryRepository, RequestScope,
 };
 
 #[test]
@@ -504,4 +505,171 @@ fn upsert_replaces_and_delete_reports_whether_a_key_existed() {
     );
     assert!(store.delete_memory(&address, "language").unwrap());
     assert!(!store.delete_memory(&address, "language").unwrap());
+}
+
+fn blank_memory_addresses() -> Vec<(MemoryAddress, MemoryError)> {
+    vec![
+        (
+            MemoryAddress::User { user_id: "".into() },
+            MemoryError::BlankUserId,
+        ),
+        (
+            MemoryAddress::User {
+                user_id: " \t ".into(),
+            },
+            MemoryError::BlankUserId,
+        ),
+        (
+            MemoryAddress::Task {
+                user_id: "".into(),
+                task_id: "bot".into(),
+            },
+            MemoryError::BlankUserId,
+        ),
+        (
+            MemoryAddress::Task {
+                user_id: " \t ".into(),
+                task_id: "bot".into(),
+            },
+            MemoryError::BlankUserId,
+        ),
+        (
+            MemoryAddress::Task {
+                user_id: "alice".into(),
+                task_id: "".into(),
+            },
+            MemoryError::BlankTaskId,
+        ),
+        (
+            MemoryAddress::Task {
+                user_id: "alice".into(),
+                task_id: " \t ".into(),
+            },
+            MemoryError::BlankTaskId,
+        ),
+    ]
+}
+
+#[test]
+fn memory_address_upsert_rejects_blank_identifiers_before_sql() {
+    // Catch accepting public enum variants that no valid RequestScope can reach.
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let mut store = DialogStore::open(&database).unwrap();
+    for (address, expected) in blank_memory_addresses() {
+        let result = store.upsert_memory(&address, "key", "value");
+        assert!(
+            matches!(&result, Err(StoreError::InvalidMemory(error)) if *error == expected),
+            "{address:?}: {result:?}"
+        );
+    }
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let rows: i64 = connection
+        .query_row("SELECT count(*) FROM memory_entries", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn memory_address_delete_rejects_blank_identifiers_before_sql() {
+    // Catch treating an invalid address as a successful missing-key lookup.
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();
+    for (address, expected) in blank_memory_addresses() {
+        let result = store.delete_memory(&address, "key");
+        assert!(
+            matches!(&result, Err(StoreError::InvalidMemory(error)) if *error == expected),
+            "{address:?}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn memory_address_upsert_normalizes_padding_to_the_existing_entry() {
+    // Catch unreachable duplicate rows when callers construct padded enum variants.
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();
+    let scope = RequestScope::new("alice", "bot").unwrap();
+    store
+        .upsert_memory(
+            &scope.address(DurableMemoryScope::User),
+            "language",
+            "English",
+        )
+        .unwrap();
+    store
+        .upsert_memory(&scope.address(DurableMemoryScope::Task), "stack", "Go")
+        .unwrap();
+    store
+        .upsert_memory(
+            &MemoryAddress::User {
+                user_id: " alice ".into(),
+            },
+            "language",
+            "Russian",
+        )
+        .unwrap();
+    store
+        .upsert_memory(
+            &MemoryAddress::Task {
+                user_id: " alice ".into(),
+                task_id: " bot ".into(),
+            },
+            "stack",
+            "Rust",
+        )
+        .unwrap();
+
+    let snapshot = store.load_memory(&scope).unwrap();
+    assert_eq!(
+        snapshot.user_entries(),
+        &[("language".into(), "Russian".into())].into()
+    );
+    assert_eq!(
+        snapshot.task_entries(),
+        &[("stack".into(), "Rust".into())].into()
+    );
+}
+
+#[test]
+fn memory_address_delete_normalizes_padding_to_the_existing_entry() {
+    // Catch padded delete addresses silently leaving canonical entries intact.
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();
+    let scope = RequestScope::new("alice", "bot").unwrap();
+    store
+        .upsert_memory(
+            &scope.address(DurableMemoryScope::User),
+            "language",
+            "Russian",
+        )
+        .unwrap();
+    store
+        .upsert_memory(&scope.address(DurableMemoryScope::Task), "stack", "Rust")
+        .unwrap();
+    assert!(
+        store
+            .delete_memory(
+                &MemoryAddress::User {
+                    user_id: " alice ".into()
+                },
+                "language"
+            )
+            .unwrap()
+    );
+    assert!(
+        store
+            .delete_memory(
+                &MemoryAddress::Task {
+                    user_id: " alice ".into(),
+                    task_id: " bot ".into()
+                },
+                "stack"
+            )
+            .unwrap()
+    );
+
+    let snapshot = store.load_memory(&scope).unwrap();
+    assert!(snapshot.user_entries().is_empty());
+    assert!(snapshot.task_entries().is_empty());
 }

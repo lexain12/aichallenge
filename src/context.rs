@@ -136,6 +136,7 @@ pub struct CompactionPlan {
     request_messages: Vec<Message>,
     covered_message_count: usize,
     new_message_count: usize,
+    system_block_metadata: Vec<SystemBlockMetadata>,
 }
 
 impl CompactionPlan {
@@ -149,6 +150,14 @@ impl CompactionPlan {
 
     pub fn new_message_count(&self) -> usize {
         self.new_message_count
+    }
+
+    pub fn previous_boundary(&self) -> usize {
+        self.covered_message_count - self.new_message_count
+    }
+
+    pub fn system_block_metadata(&self) -> &[SystemBlockMetadata] {
+        &self.system_block_metadata
     }
 }
 
@@ -244,12 +253,7 @@ pub fn prepare_request(
         ContextStrategy::Summary => {
             let summary = compatible_summary(history, state, true, config.keep_last_messages());
             if let Some(summary) = summary {
-                system.push(SystemBlock::new(
-                    "summary",
-                    format!("{SUMMARY_CONTEXT_PREFIX}{}", summary.content()),
-                    ContextScope::Conversation,
-                    CompactionPolicy::Include,
-                ));
+                system.push(summary_block(summary));
             }
             let boundary = summary.map_or(0, ContextSummary::covered_message_count);
             (HistorySelection::After(boundary), boundary)
@@ -317,7 +321,7 @@ pub fn plan_compaction(
     history: &ChatHistory,
     state: &ContextState,
     keep_last_messages: usize,
-    system: &SystemContext,
+    additional_system_blocks: &[SystemBlock],
 ) -> Option<CompactionPlan> {
     let target = history.messages().len().checked_sub(keep_last_messages)?;
     if target == 0 {
@@ -330,8 +334,17 @@ pub fn plan_compaction(
         return None;
     }
 
+    // Select the summary block and boundary from the same post-turn snapshot.
+    let mut system = SystemContext::default();
+    if let Some(summary) = previous {
+        system.push(summary_block(summary));
+    }
+    for block in additional_system_blocks {
+        system.push(block.clone());
+    }
+    let admitted_blocks = system.compaction_blocks();
     let mut input = String::new();
-    for block in system.compaction_blocks() {
+    for block in &admitted_blocks {
         writeln!(
             input,
             "Context block {}:\n{}\n",
@@ -357,7 +370,20 @@ pub fn plan_compaction(
         ],
         covered_message_count: target,
         new_message_count: target - previous_boundary,
+        system_block_metadata: admitted_blocks
+            .iter()
+            .map(|block| block.metadata())
+            .collect(),
     })
+}
+
+fn summary_block(summary: &ContextSummary) -> SystemBlock {
+    SystemBlock::new(
+        "summary",
+        format!("{SUMMARY_CONTEXT_PREFIX}{}", summary.content()),
+        ContextScope::Conversation,
+        CompactionPolicy::Include,
+    )
 }
 
 pub fn stats(

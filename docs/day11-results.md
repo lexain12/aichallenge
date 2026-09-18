@@ -136,7 +136,11 @@ jq -s -e '
 `Russian`, `Rust` и `SQLite` в JSONL не записываются. Проверка этого свойства:
 
 ```bash
-jq -s -e '[.[] | select(.event == "request_prepared") | has("messages")] | all(. == false)' "$DEBUG"
+jq -s -e '
+  map(select(.event == "request_prepared"))
+  | if length == 0 then error("request_prepared record missing")
+    else all(has("messages") | not) end
+' "$DEBUG"
 ```
 
 ## 4. Показываем исключение durable memory из compaction
@@ -152,7 +156,12 @@ eligible prefix для summary:
 реальный compaction request:
 
 ```bash
-jq -c 'select(.event == "request_prepared" and .kind == "compaction") | {kind, system_block_names, system_blocks, message_count, message_metadata, payload_logged: has("messages")}' "$DEBUG" | tail -n 1
+jq -s -e '
+  map(select(.event == "request_prepared" and .kind == "compaction"))
+  | (last // error("compaction request_prepared record missing"))
+  | {kind, system_block_names, system_blocks, message_count, message_metadata,
+     payload_logged: has("messages")}
+' "$DEBUG"
 ```
 
 Первый такой запрос содержит служебный `summary_compactor`; последующие могут
@@ -163,15 +172,17 @@ compaction-записи:
 ```bash
 jq -s -e '
   map(select(.event == "request_prepared" and .kind == "compaction"))
-  | last
+  | (last // error("compaction request_prepared record missing"))
   | .system_block_names as $names
   | (($names | index("user_memory")) == null
      and ($names | index("task_memory")) == null)
 ' "$DEBUG"
 ```
 
-Команда должна завершиться с кодом 0. Это проверяет executable policy, а не
-поиск чувствительных значений в payload: payload намеренно отключён.
+Команда должна завершиться с кодом 0. Пустой лог или отсутствие compaction-записи
+дают ошибку. Это проверяет executable policy, а не поиск чувствительных значений
+в payload: payload намеренно отключён. Факты из durable memory, повторённые в
+обычных репликах, могут попасть в summary; исключаются сами system-блоки.
 
 ## 5. Новый диалог той же задачи сохраняет оба durable-слоя
 
@@ -217,7 +228,7 @@ ordinary-запись debug-log должна содержать `user_memory`, �
 ```bash
 jq -s -e '
   map(select(.event == "request_prepared" and .kind == "chat"))
-  | last
+  | (last // error("chat request_prepared record missing"))
   | .system_block_names as $names
   | (($names | index("user_memory")) != null
      and ($names | index("task_memory")) == null)
@@ -243,7 +254,7 @@ Long-term · empty
 ```bash
 jq -s -e '
   map(select(.event == "request_prepared" and .kind == "chat"))
-  | last
+  | (last // error("chat request_prepared record missing"))
   | .system_block_names as $names
   | (($names | index("user_memory")) == null
      and ($names | index("task_memory")) == null)

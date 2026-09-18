@@ -1317,6 +1317,14 @@ Run: `git status --short`
 
 Expected: no output.
 
-Run: `git log -7 --oneline --decorate`
+Run: `git log --oneline --decorate 5726ba8988cf3d8db4368cf8ce4eeac24cb70a29..HEAD`
 
-Expected: the Day 11 design commit followed by the six implementation/documentation commits from this plan, with `HEAD -> Day-11` on the final documentation commit.
+Expected: every Day 11 commit since the recorded merge base, including the design, plan, implementation, documentation, and review-fix commits, with `HEAD -> Day-11` on the latest commit. Do not assume a fixed commit count.
+
+### Final-review ruling
+
+The initial implementation steps above describe the original task sequence. Final review found that reusing the pre-turn `PreparedContext` during post-turn compaction could omit a prior summary while still skipping its covered messages when retention changed on resume. The corrected planner builds the summary block and boundary together from the post-turn history and context state, accepts additional provider blocks, applies compaction policy filtering, and exposes the admitted metadata for logging.
+
+Repository mutations also normalize and validate directly constructed `MemoryAddress` identifiers with the same trimming/blank rules as `RequestScope`. Demo assertions must fail when their selected request record is missing. Compaction exclusion applies to direct system blocks; facts echoed in conversation may still enter summaries, and `/forget` does not erase historical conversation or summaries.
+
+The merge-base range command supersedes both the original `-7` instruction and the earlier `-8` pre-flight ruling. Historical command transcripts remain unchanged in the SDD reports.

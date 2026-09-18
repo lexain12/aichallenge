@@ -984,6 +984,94 @@ async fn repeated_compaction_sends_previous_summary_with_only_new_prefix() {
 }
 
 #[tokio::test]
+async fn resumed_retention_increase_keeps_the_previous_summary_in_compaction() {
+    // Catch skipping the summarized prefix when the pre-turn request omitted its summary.
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("a1", 2, 1, 3),
+            sse("a2", 4, 1, 5),
+            sse("summary one", 5, 2, 7),
+            sse("a3", 4, 1, 5),
+            sse("summary two", 6, 2, 8),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let mut agent = Agent::with_store(
+        &compression_config(&server, 3, 2),
+        DialogStore::open(&database).unwrap(),
+    )
+    .unwrap();
+    agent
+        .remember(DurableMemoryScope::User, "private", "user secret")
+        .unwrap();
+    agent
+        .remember(DurableMemoryScope::Task, "decision", "task decision")
+        .unwrap();
+    agent.run_with_prompt("u1").await.unwrap();
+    agent.run_with_prompt("u2").await.unwrap();
+    let id = agent.dialog_id().unwrap();
+    assert_eq!(agent.history().messages().len(), 4);
+    assert_eq!(agent.context_stats().covered_message_count, 2);
+    drop(agent);
+
+    let log_path = directory.path().join("resumed.jsonl");
+    let resumed_config = Config::from_toml(
+        &format!(
+            "api_key = \"test-key\"\nbase_url = {:?}\n[context]\nstrategy = \"summary\"\ncompact_after_prompt_tokens = 3\nkeep_last_messages = 3\n[debug]\nlog_path = {:?}\n",
+            server.uri(), log_path.to_str().unwrap(),
+        ),
+        None,
+    ).unwrap();
+    let mut resumed =
+        Agent::from_dialog(&resumed_config, DialogStore::open(&database).unwrap(), id).unwrap();
+    resumed.run_with_prompt("u3").await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 5);
+    let ordinary: Value = requests[3].body_json().unwrap();
+    assert_eq!(
+        &ordinary["messages"].as_array().unwrap()[3..],
+        &json!([
+            {"role":"user","content":"u1"},
+            {"role":"assistant","content":"a1"},
+            {"role":"user","content":"u2"},
+            {"role":"assistant","content":"a2"},
+            {"role":"user","content":"u3"},
+        ])
+        .as_array()
+        .unwrap()[..],
+    );
+    let compaction: Value = requests[4].body_json().unwrap();
+    assert_eq!(
+        compaction["messages"][1]["content"],
+        "Context block summary:\nSummary of earlier conversation:\nsummary one\n\nNew messages:\nuser: u2\n",
+    );
+    let events: Vec<Value> = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let compaction_log = events
+        .iter()
+        .find(|event| event["kind"] == "compaction")
+        .unwrap();
+    assert_eq!(
+        compaction_log["system_block_names"],
+        json!(["summary_compactor", "summary"])
+    );
+    assert_eq!(compaction_log["summary_boundary"], 2);
+    let stored = DialogStore::open(&database).unwrap().load(id).unwrap();
+    let summary = stored.context.summary().unwrap();
+    assert_eq!(summary.content(), "summary two");
+    assert_eq!(summary.covered_message_count(), 3);
+    assert_eq!(stored.messages.len(), 6);
+}
+
+#[tokio::test]
 async fn failed_compaction_keeps_full_history_and_does_not_fail_user_answer() {
     let server = MockServer::start().await;
     mount_sequence(

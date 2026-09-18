@@ -15,7 +15,7 @@ use crate::memory::{
     ContextError, ContextProvider, DurableMemoryScope, MemoryRepository, MemorySnapshot,
     RequestScope,
 };
-use crate::system_context::{CompactionPolicy, ContextScope, SystemBlockMetadata, SystemContext};
+use crate::system_context::{CompactionPolicy, ContextScope, SystemBlock, SystemBlockMetadata};
 
 /// An API client and its independent conversation, optionally backed by SQLite.
 pub struct Agent {
@@ -285,7 +285,7 @@ impl Agent {
         {
             emit_event(&mut on_event, AgentEvent::DebugLogFailed { error })?;
         }
-        self.maybe_compact(prepared.system_context(), usage, &mut on_event)
+        self.maybe_compact(&additional_blocks, usage, &mut on_event)
             .await?;
         Ok(answer)
     }
@@ -506,7 +506,7 @@ impl Agent {
 
     async fn maybe_compact<F>(
         &mut self,
-        system_context: &SystemContext,
+        additional_system_blocks: &[SystemBlock],
         usage: Option<TokenUsage>,
         on_event: &mut F,
     ) -> Result<(), AgentError>
@@ -525,7 +525,7 @@ impl Agent {
             &self.history,
             &self.context_state,
             self.context_config.keep_last_messages(),
-            system_context,
+            additional_system_blocks,
         ) else {
             return Ok(());
         };
@@ -550,23 +550,17 @@ impl Agent {
         ) {
             emit_event(on_event, AgentEvent::DebugLogFailed { error })?;
         }
-        let previous_boundary = self.context_stats().covered_message_count;
         let mut system_blocks = vec![SystemBlockMetadata {
             name: "summary_compactor".to_owned(),
             scope: ContextScope::Application,
             compaction: CompactionPolicy::Exclude,
         }];
-        system_blocks.extend(
-            system_context
-                .compaction_blocks()
-                .into_iter()
-                .map(|block| block.metadata()),
-        );
+        system_blocks.extend_from_slice(plan.system_block_metadata());
         let request_metadata = RequestMetadata::new(
             ContextStrategy::Summary,
             system_blocks,
             plan.request_messages().len(),
-            previous_boundary,
+            plan.previous_boundary(),
             0,
         );
         if let Some(error) =

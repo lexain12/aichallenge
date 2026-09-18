@@ -790,7 +790,7 @@ impl MemoryRepository for DialogStore {
     ) -> Result<(), Self::Error> {
         let key = memory_key(key)?;
         let value = memory_value(value)?;
-        let (scope_type, task_id) = address_parts(address);
+        let (scope_type, user_id, task_id) = address_parts(address)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -800,7 +800,7 @@ impl MemoryRepository for DialogStore {
              ON CONFLICT(scope_type, user_id, task_id, key) DO UPDATE SET
                  value = excluded.value,
                  updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
-            params![scope_type, address.user_id(), task_id, key, value],
+            params![scope_type, user_id, task_id, key, value],
         )?;
         tx.commit()?;
         Ok(())
@@ -808,24 +808,34 @@ impl MemoryRepository for DialogStore {
 
     fn delete_memory(&mut self, address: &MemoryAddress, key: &str) -> Result<bool, Self::Error> {
         let key = memory_key(key)?;
-        let (scope_type, task_id) = address_parts(address);
+        let (scope_type, user_id, task_id) = address_parts(address)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let deleted = tx.execute(
             "DELETE FROM memory_entries
              WHERE scope_type = ?1 AND user_id = ?2 AND task_id = ?3 AND key = ?4",
-            params![scope_type, address.user_id(), task_id, key],
+            params![scope_type, user_id, task_id, key],
         )?;
         tx.commit()?;
         Ok(deleted > 0)
     }
 }
 
-fn address_parts(address: &MemoryAddress) -> (&'static str, &str) {
+fn address_parts(address: &MemoryAddress) -> Result<(&'static str, &str, &str), MemoryError> {
+    let user_id = address.user_id().trim();
+    if user_id.is_empty() {
+        return Err(MemoryError::BlankUserId);
+    }
     match address {
-        MemoryAddress::User { .. } => ("user", ""),
-        MemoryAddress::Task { task_id, .. } => ("task", task_id),
+        MemoryAddress::User { .. } => Ok(("user", user_id, "")),
+        MemoryAddress::Task { task_id, .. } => {
+            let task_id = task_id.trim();
+            if task_id.is_empty() {
+                return Err(MemoryError::BlankTaskId);
+            }
+            Ok(("task", user_id, task_id))
+        }
     }
 }
 

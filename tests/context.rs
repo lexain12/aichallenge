@@ -191,9 +191,7 @@ fn disabled_or_incompatible_summary_sends_full_history() {
 #[test]
 fn later_compaction_uses_previous_summary_and_only_newly_eligible_messages() {
     let state = ContextState::with_summary(ContextSummary::new("old facts", 2));
-    let config = context_config("summary", 2);
-    let prepared = prepare_request(&history(), &state, &config, "next", &[]);
-    let plan = plan_compaction(&history(), &state, 2, prepared.system_context()).unwrap();
+    let plan = plan_compaction(&history(), &state, 2, &[]).unwrap();
 
     assert_eq!(plan.covered_message_count(), 4);
     assert_eq!(plan.new_message_count(), 2);
@@ -211,7 +209,6 @@ fn later_compaction_uses_previous_summary_and_only_newly_eligible_messages() {
 #[test]
 fn compaction_input_never_contains_excluded_blocks() {
     let state = ContextState::with_summary(ContextSummary::new("old facts", 2));
-    let config = context_config("summary", 2);
     let extra = [
         SystemBlock::new(
             "user_memory",
@@ -226,8 +223,7 @@ fn compaction_input_never_contains_excluded_blocks() {
             CompactionPolicy::Exclude,
         ),
     ];
-    let prepared = prepare_request(&history(), &state, &config, "next", &extra);
-    let plan = plan_compaction(&history(), &state, 2, prepared.system_context()).unwrap();
+    let plan = plan_compaction(&history(), &state, 2, &extra).unwrap();
     let text = plan.request_messages()[1].content();
 
     assert!(text.contains("old facts"));
@@ -238,13 +234,10 @@ fn compaction_input_never_contains_excluded_blocks() {
 #[test]
 fn compaction_requires_messages_beyond_the_raw_tail_and_summary_boundary() {
     let short = ChatHistory::new("System".into());
-    let short_system = SystemContext::default();
-    assert!(plan_compaction(&short, &ContextState::default(), 2, &short_system).is_none());
+    assert!(plan_compaction(&short, &ContextState::default(), 2, &[]).is_none());
 
     let state = ContextState::with_summary(ContextSummary::new("all old", 4));
-    let config = context_config("summary", 2);
-    let prepared = prepare_request(&history(), &state, &config, "next", &[]);
-    assert!(plan_compaction(&history(), &state, 2, prepared.system_context()).is_none());
+    assert!(plan_compaction(&history(), &state, 2, &[]).is_none());
 }
 
 #[test]

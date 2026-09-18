@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Day 11 adds an explicit memory model to the existing DeepSeek CLI. The design must distinguish conversation, task, and user lifetimes; make every durable write intentional; and keep durable memory outside conversation compaction. It must also provide stable extension points for the user profile, task state, invariants, and controlled transitions introduced on Days 12–15.
+Day 11 adds an explicit memory model to the existing DeepSeek CLI. The design must distinguish conversation, task, and user lifetimes; make every durable write intentional; and exclude durable system blocks from direct conversation-compaction input. It must also provide stable extension points for the user profile, task state, invariants, and controlled transitions introduced on Days 12–15.
 
 The implementation extends the existing SQLite persistence and `SystemContext` pipeline. It does not add a second file-based memory system or replace the context strategies implemented on Days 9–10.
 
@@ -16,7 +16,7 @@ The implementation extends the existing SQLite persistence and `SystemContext` p
 - Persist working and long-term memory independently from dialog history.
 - Inject relevant memory into every ordinary model request as named context blocks.
 - Make compaction eligibility explicit metadata and enforce it in the compaction path.
-- Ensure user and task memory never enter a compaction request.
+- Ensure user and task system blocks never enter a compaction request directly.
 - Preserve all existing Day 10 context strategies and dialog restoration behavior.
 - Make new context sources easy to add without extending one large request-building function.
 
@@ -29,6 +29,7 @@ The implementation extends the existing SQLite persistence and `SystemContext` p
 - Add semantic search, embeddings, relevance ranking, or vector storage.
 - Add a graphical interface.
 - Treat provider configuration such as API keys, model, temperature, or token limits as memory.
+- Erase historical conversation or summaries when a durable entry is forgotten.
 
 ## Existing Architecture
 
@@ -142,7 +143,7 @@ The initial policy table is:
 
 Raw conversation messages are not `SystemBlock` values. The compaction planner continues to select an eligible old prefix of raw messages independently.
 
-The previous summary is marked `Include` because it is an input to the next cumulative summary. User memory, task memory, base instructions, and sticky facts are excluded from the compactor. This prevents durable facts from being copied into a dialog summary and later surviving after the durable entry is changed or deleted.
+The previous summary is marked `Include` because it is an input to the next cumulative summary. User memory, task memory, base instructions, and sticky-facts system blocks are excluded from the compactor's direct inputs. This is a structural block-selection guarantee: facts echoed in user or assistant messages may still be compacted and survive in conversation history or a summary after a durable entry is changed or deleted. `/forget` removes the addressed durable entry only; it does not erase historical messages or summaries.
 
 ## Context Providers
 
@@ -227,6 +228,8 @@ pub enum MemoryAddress {
 }
 ```
 
+Because callers may construct the public variants directly, repository `upsert` and `delete` boundaries trim address identifiers and reject identifiers that are empty after trimming, matching `RequestScope`. For example, task address `" alice " / " bot "` writes to and deletes from canonical `alice/bot`; it cannot create a separate unreachable row.
+
 The existing SQLite store implements this trait. Prompt code depends on the repository contract and memory snapshot, not SQL.
 
 ## CLI Scope Selection
@@ -292,9 +295,9 @@ Empty memory layers do not produce empty system messages.
 
 For compaction:
 
-1. Select the old raw-message prefix according to the existing summary strategy.
-2. Ask `SystemContext` for blocks allowed in compaction.
-3. Include the previous conversation summary when present.
+1. After the completed answer is committed, select the old raw-message prefix according to the existing summary strategy.
+2. Build the compatible previous-summary block and its coverage boundary from that same history snapshot; do not reuse the pre-turn ordinary request's summary selection.
+3. Ask `SystemContext` for blocks allowed in compaction and include the compatible previous conversation summary when present.
 4. Exclude base, user memory, task memory, and sticky facts.
 5. Replace the stored conversation summary using the existing durable transaction.
 
@@ -352,6 +355,7 @@ This is not an invariant system. Day 14 will introduce rules that can override a
 
 - An ordinary request contains user and task blocks.
 - A compaction request contains neither block, even when both are populated.
+- Resuming with retention increased from two to three messages preserves the previous cumulative summary when it becomes compatible after the completed turn.
 - A second dialog in the same task receives both durable layers but no first-dialog raw messages.
 - A second task receives only the user layer.
 - A second user receives neither layer from the first user.

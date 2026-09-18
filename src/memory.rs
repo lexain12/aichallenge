@@ -177,6 +177,8 @@ impl ContextProvider for MemorySnapshot {
     }
 }
 
+/// Repository mutations trim address identifiers and reject blank identifiers,
+/// matching `RequestScope::new` even for directly constructed `MemoryAddress` variants.
 pub trait MemoryRepository {
     type Error;
 

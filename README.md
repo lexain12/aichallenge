@@ -49,9 +49,11 @@ cargo run -- --user alice --task telegram-bot
 system-блоками `user_memory`, затем `task_memory`. Текущий явный запрос имеет
 приоритет над working memory, а working memory конкретной задачи — над общей
 long-term memory. Оба блока имеют `CompactionPolicy::Exclude`: они не попадают
-в запрос summary-компактера и не копируются в conversation summary. Предыдущий
-conversation summary, напротив, имеет `Include`, чтобы следующий summary был
-накопительным.
+напрямую в запрос summary-компактера. Это структурная гарантия для system-блоков:
+факты, которые пользователь или ассистент повторил в обычных репликах, могут
+попасть в conversation summary. `/forget` удаляет только durable-запись и не
+стирает уже сохранённые реплики или summary. Предыдущий conversation summary
+имеет `Include`, чтобы следующий summary был накопительным.
 
 При `debug.log_payloads = false` JSONL-лог показывает безопасные метаданные
 блоков — `name`, `scope`, `compaction` — и размеры сообщений, но не их текст и
