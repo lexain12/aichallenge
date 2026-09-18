@@ -165,6 +165,169 @@ async fn ordinary_request_includes_user_then_task_memory() {
 }
 
 #[tokio::test]
+async fn different_users_automatically_receive_only_their_profiles() {
+    let server = MockServer::start().await;
+    mount(&server, response("Answer", true)).await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let mut alice = Agent::with_store_for_scope(
+        &config(&server),
+        DialogStore::open(&path).unwrap(),
+        RequestScope::new("alice", "mobile").unwrap(),
+    )
+    .unwrap();
+    alice
+        .replace_profile("ALICE_PROFILE prefers Android")
+        .unwrap();
+    alice
+        .remember(DurableMemoryScope::User, "language", "Kotlin")
+        .unwrap();
+    alice
+        .remember(DurableMemoryScope::Task, "ui", "Compose")
+        .unwrap();
+    let mut bob = Agent::with_store_for_scope(
+        &config(&server),
+        DialogStore::open(&path).unwrap(),
+        RequestScope::new("bob", "mobile").unwrap(),
+    )
+    .unwrap();
+    bob.replace_profile("BOB_PROFILE prefers Flutter").unwrap();
+
+    alice.run_with_prompt("Design an app").await.unwrap();
+    bob.run_with_prompt("Design an app").await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let alice_request: Value = requests[0].body_json().unwrap();
+    let alice_messages = alice_request["messages"].as_array().unwrap();
+    assert!(
+        alice_messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("ALICE_PROFILE")
+    );
+    assert!(
+        alice_messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Kotlin")
+    );
+    assert!(
+        alice_messages[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Compose")
+    );
+    assert!(
+        !serde_json::to_string(alice_messages)
+            .unwrap()
+            .contains("BOB_PROFILE")
+    );
+    let bob_request: Value = requests[1].body_json().unwrap();
+    let bob_serialized = serde_json::to_string(&bob_request["messages"]).unwrap();
+    assert!(bob_serialized.contains("BOB_PROFILE"));
+    assert!(!bob_serialized.contains("ALICE_PROFILE"));
+}
+
+#[tokio::test]
+async fn profile_is_reloaded_each_request_and_excluded_from_compaction() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("answer one", 2, 1, 3),
+            sse("answer two", 4, 2, 6),
+            sse("summary", 7, 2, 9),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let mut agent = Agent::with_store(
+        &compression_config(&server, 3, 2),
+        DialogStore::open(&path).unwrap(),
+    )
+    .unwrap();
+    agent.replace_profile("PROFILE_ONE").unwrap();
+    agent.run_with_prompt("First").await.unwrap();
+    let mut writer = Agent::with_store(
+        &compression_config(&server, 3, 2),
+        DialogStore::open(&path).unwrap(),
+    )
+    .unwrap();
+    writer.replace_profile("PROFILE_TWO").unwrap();
+    agent.run_with_prompt("Second").await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let first = serde_json::to_string(&requests[0].body_json::<Value>().unwrap()).unwrap();
+    let second = serde_json::to_string(&requests[1].body_json::<Value>().unwrap()).unwrap();
+    let compaction = serde_json::to_string(&requests[2].body_json::<Value>().unwrap()).unwrap();
+    assert!(first.contains("PROFILE_ONE"));
+    assert!(!first.contains("PROFILE_TWO"));
+    assert!(second.contains("PROFILE_TWO"));
+    assert!(!second.contains("PROFILE_ONE"));
+    assert!(!compaction.contains("PROFILE_ONE"));
+    assert!(!compaction.contains("PROFILE_TWO"));
+}
+
+#[tokio::test]
+async fn in_memory_agents_reject_profile_operations() {
+    let server = MockServer::start().await;
+    let mut agent = agent(&server);
+
+    assert!(matches!(
+        agent.profile(),
+        Err(AgentError::ProfileRequiresStore)
+    ));
+    assert!(matches!(
+        agent.replace_profile("Be concise."),
+        Err(AgentError::ProfileRequiresStore)
+    ));
+    assert!(matches!(
+        agent.clear_profile(),
+        Err(AgentError::ProfileRequiresStore)
+    ));
+}
+
+#[tokio::test]
+async fn profile_read_failure_preserves_input_and_prevents_sticky_facts_http() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let mut agent = Agent::with_store(
+        &sticky_config(&server, 3),
+        DialogStore::open(&path).unwrap(),
+    )
+    .unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "ALTER TABLE user_profiles RENAME TO unavailable_profiles",
+            [],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        agent.run_with_prompt("Pending").await,
+        Err(AgentError::Store(_))
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(agent.history().messages().len(), 1);
+    assert_eq!(agent.history().messages()[0].content(), "Pending");
+
+    connection
+        .execute(
+            "ALTER TABLE unavailable_profiles RENAME TO user_profiles",
+            [],
+        )
+        .unwrap();
+    mount_sequence(&server, [sse("{}", 3, 1, 4), sse("Recovered", 3, 1, 4)]).await;
+    agent.run_with_prompt("Retry").await.unwrap();
+    assert_eq!(agent.history().messages().len(), 3);
+}
+
+#[tokio::test]
 async fn restored_and_new_dialogs_observe_only_their_addressed_memory() {
     let server = MockServer::start().await;
     mount(&server, response("Answer", true)).await;

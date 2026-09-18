@@ -15,6 +15,7 @@ use crate::memory::{
     ContextError, ContextProvider, DurableMemoryScope, MemoryRepository, MemorySnapshot,
     RequestScope,
 };
+use crate::profile::{ProfileRepository, UserProfile};
 use crate::system_context::{CompactionPolicy, ContextScope, SystemBlock, SystemBlockMetadata};
 
 /// An API client and its independent conversation, optionally backed by SQLite.
@@ -101,6 +102,30 @@ impl Agent {
             .as_ref()
             .ok_or(AgentError::MemoryRequiresStore)?
             .load_memory(&self.scope)?)
+    }
+
+    pub fn profile(&self) -> Result<Option<UserProfile>, AgentError> {
+        Ok(self
+            .store
+            .as_ref()
+            .ok_or(AgentError::ProfileRequiresStore)?
+            .load_profile(self.scope.user_id())?)
+    }
+
+    pub fn replace_profile(&mut self, markdown: &str) -> Result<(), AgentError> {
+        self.store
+            .as_mut()
+            .ok_or(AgentError::ProfileRequiresStore)?
+            .replace_profile(self.scope.user_id(), markdown)?;
+        Ok(())
+    }
+
+    pub fn clear_profile(&mut self) -> Result<bool, AgentError> {
+        Ok(self
+            .store
+            .as_mut()
+            .ok_or(AgentError::ProfileRequiresStore)?
+            .delete_profile(self.scope.user_id())?)
     }
 
     /// Statistics for the latest request, not a sum over the conversation.
@@ -192,11 +217,16 @@ impl Agent {
                 }
             }
         }
-        let memory_blocks = if persistent {
-            match self
-                .memory_snapshot()
-                .and_then(|snapshot| snapshot.blocks(&self.scope).map_err(AgentError::Context))
-            {
+        let mut additional_blocks = if persistent {
+            let context = (|| {
+                let mut blocks = Vec::new();
+                if let Some(profile) = self.profile()? {
+                    blocks.extend(profile.blocks(&self.scope)?);
+                }
+                blocks.extend(self.memory_snapshot()?.blocks(&self.scope)?);
+                Ok::<_, AgentError>(blocks)
+            })();
+            match context {
                 Ok(blocks) => blocks,
                 Err(error) => {
                     self.history.push(Role::User, prompt.to_owned());
@@ -220,7 +250,6 @@ impl Agent {
                 return Err(error);
             }
         };
-        let mut additional_blocks = memory_blocks;
         if self.context_config.strategy() == ContextStrategy::StickyFacts {
             additional_blocks.extend(candidate_facts.system_block());
         }
@@ -673,6 +702,8 @@ pub enum AgentError {
     NoPersistentDialog,
     #[error("durable memory requires a persistent store")]
     MemoryRequiresStore,
+    #[error("user profiles require a persistent store")]
+    ProfileRequiresStore,
     #[error(transparent)]
     Context(#[from] ContextError),
     #[error(transparent)]
