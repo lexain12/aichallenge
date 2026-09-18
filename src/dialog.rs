@@ -20,6 +20,7 @@ pub struct DialogStore {
 
 pub struct StoredDialog {
     pub id: i64,
+    pub scope: RequestScope,
     pub system_prompt: String,
     pub messages: Vec<Message>,
     pub context: ContextState,
@@ -45,6 +46,7 @@ pub struct ForkResult {
 
 pub struct DialogSummary {
     pub id: i64,
+    pub scope: RequestScope,
     pub title: String,
     pub updated_at: String,
     pub message_count: i64,
@@ -64,6 +66,13 @@ impl DialogStore {
                  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
                  last_message_id INTEGER NOT NULL DEFAULT 0
              );
+             CREATE TABLE IF NOT EXISTS dialog_scopes (
+                 dialog_id INTEGER PRIMARY KEY REFERENCES dialogs(id),
+                 user_id TEXT NOT NULL,
+                 task_id TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO dialog_scopes (dialog_id, user_id, task_id)
+             SELECT id, 'default', 'default' FROM dialogs;
              CREATE TABLE IF NOT EXISTS messages (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  dialog_id INTEGER NOT NULL REFERENCES dialogs(id),
@@ -128,7 +137,12 @@ impl DialogStore {
     }
 
     /// Create a dialog and its first user message in one durable transaction.
-    pub fn start_dialog(&mut self, system_prompt: &str, prompt: &str) -> Result<i64, StoreError> {
+    pub fn start_dialog_in_scope(
+        &mut self,
+        scope: &RequestScope,
+        system_prompt: &str,
+        prompt: &str,
+    ) -> Result<i64, StoreError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -139,6 +153,10 @@ impl DialogStore {
         )?;
         let id = tx.last_insert_rowid();
         tx.execute(
+            "INSERT INTO dialog_scopes (dialog_id, user_id, task_id) VALUES (?1, ?2, ?3)",
+            params![id, scope.user_id(), scope.task_id()],
+        )?;
+        tx.execute(
             "INSERT INTO messages (dialog_id, role, content) VALUES (?1, 'user', ?2)",
             params![id, prompt],
         )?;
@@ -148,6 +166,10 @@ impl DialogStore {
         )?;
         tx.commit()?;
         Ok(id)
+    }
+
+    pub fn start_dialog(&mut self, system_prompt: &str, prompt: &str) -> Result<i64, StoreError> {
+        self.start_dialog_in_scope(&RequestScope::default(), system_prompt, prompt)
     }
 
     /// Reject stale sessions instead of silently mixing independently generated replies.
@@ -447,6 +469,18 @@ impl DialogStore {
             params![source.0, format!("{} (branch)", source.1)],
         )?;
         let new_dialog_id = tx.last_insert_rowid();
+        let copied_scope = tx.execute(
+            "INSERT INTO dialog_scopes (dialog_id, user_id, task_id)
+             SELECT ?1, user_id, task_id
+             FROM dialog_scopes
+             WHERE dialog_id = ?2",
+            params![new_dialog_id, id],
+        )?;
+        if copied_scope != 1 {
+            return Err(StoreError::InvalidDialogScope(
+                "source dialog scope is missing",
+            ));
+        }
         let source_messages = {
             let mut statement = tx.prepare(
                 "SELECT m.role, m.content, m.created_at, u.usage_json
@@ -562,6 +596,15 @@ impl DialogStore {
             )
             .optional()?
             .ok_or(StoreError::NotFound(id))?;
+        let stored_scope = tx
+            .query_row(
+                "SELECT user_id, task_id FROM dialog_scopes WHERE dialog_id = ?1",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::InvalidDialogScope("dialog scope is missing"))?;
+        let scope = RequestScope::new(stored_scope.0, stored_scope.1)?;
         let messages = {
             let mut statement =
                 tx.prepare("SELECT m.role, m.content, u.usage_json FROM messages m LEFT JOIN message_usage u ON u.message_id = m.id WHERE m.dialog_id = ?1 ORDER BY m.id")?;
@@ -648,6 +691,7 @@ impl DialogStore {
         tx.commit()?;
         Ok(StoredDialog {
             id,
+            scope,
             system_prompt,
             messages,
             context,
@@ -669,19 +713,34 @@ impl DialogStore {
 
     pub fn list(&self) -> Result<Vec<DialogSummary>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT d.id, d.title, d.updated_at, (SELECT count(*) FROM messages m WHERE m.dialog_id = d.id)
-             FROM dialogs d ORDER BY d.last_message_id DESC, d.id DESC",
+            "SELECT d.id, s.user_id, s.task_id, d.title, d.updated_at,
+                    (SELECT count(*) FROM messages m WHERE m.dialog_id = d.id)
+             FROM dialogs d
+             JOIN dialog_scopes s ON s.dialog_id = d.id
+             ORDER BY d.last_message_id DESC, d.id DESC",
         )?;
-        Ok(statement
-            .query_map([], |row| {
-                Ok(DialogSummary {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    updated_at: row.get(2)?,
-                    message_count: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?)
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut dialogs = Vec::new();
+        for row in rows {
+            let (id, user_id, task_id, title, updated_at, message_count) = row?;
+            dialogs.push(DialogSummary {
+                id,
+                scope: RequestScope::new(user_id, task_id)?,
+                title,
+                updated_at,
+                message_count,
+            });
+        }
+        Ok(dialogs)
     }
 }
 
@@ -884,4 +943,6 @@ pub enum StoreError {
     UnrelatedBranch { current: i64, target: i64 },
     #[error("invalid dialog branch metadata: {0}")]
     InvalidBranch(&'static str),
+    #[error("invalid dialog scope: {0}")]
+    InvalidDialogScope(&'static str),
 }

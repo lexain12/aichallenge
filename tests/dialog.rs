@@ -5,7 +5,9 @@ use deepseek_cli::client::TokenUsage;
 use deepseek_cli::context::ContextSummary;
 use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::facts::Facts;
-use deepseek_cli::memory::{DurableMemoryScope, MemoryRepository, RequestScope};
+use deepseek_cli::memory::{
+    DEFAULT_TASK_ID, DEFAULT_USER_ID, DurableMemoryScope, MemoryRepository, RequestScope,
+};
 
 #[test]
 fn reopens_messages_in_order_and_lists_latest_activity() {
@@ -396,6 +398,38 @@ fn failed_or_stale_fork_rolls_back_and_unrelated_dialog_cannot_be_selected() {
     ));
     assert_eq!(store.list().unwrap().len(), 3);
     assert_eq!(store.load(fork.new_dialog_id).unwrap().messages.len(), 1);
+}
+
+#[test]
+fn dialog_scope_is_persisted_listed_and_copied_to_branches() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();
+    let scope = RequestScope::new("alice", "bot").unwrap();
+    let id = store
+        .start_dialog_in_scope(&scope, "System", "Question")
+        .unwrap();
+    let fork = store.fork_dialog(id, 1).unwrap();
+
+    assert_eq!(store.load(id).unwrap().scope.user_id(), "alice");
+    assert_eq!(store.load(id).unwrap().scope.task_id(), "bot");
+    assert_eq!(
+        store.load(fork.new_dialog_id).unwrap().scope,
+        store.load(id).unwrap().scope
+    );
+    assert_eq!(store.list().unwrap()[0].scope.user_id(), "alice");
+}
+
+#[test]
+fn legacy_dialogs_are_migrated_to_default_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    create_day8_database_with_four_messages(&path);
+
+    let store = DialogStore::open(&path).unwrap();
+    let scope = store.load(1).unwrap().scope;
+
+    assert_eq!(scope.user_id(), DEFAULT_USER_ID);
+    assert_eq!(scope.task_id(), DEFAULT_TASK_ID);
 }
 
 #[test]
