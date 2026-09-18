@@ -5,6 +5,7 @@ use deepseek_cli::client::TokenUsage;
 use deepseek_cli::context::ContextSummary;
 use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::facts::Facts;
+use deepseek_cli::memory::{DurableMemoryScope, MemoryRepository, RequestScope};
 
 #[test]
 fn reopens_messages_in_order_and_lists_latest_activity() {
@@ -395,4 +396,78 @@ fn failed_or_stale_fork_rolls_back_and_unrelated_dialog_cannot_be_selected() {
     ));
     assert_eq!(store.list().unwrap().len(), 3);
     assert_eq!(store.load(fork.new_dialog_id).unwrap().messages.len(), 1);
+}
+
+#[test]
+fn durable_memory_is_isolated_by_user_and_task() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();
+    let alice_bot = RequestScope::new("alice", "bot").unwrap();
+    let alice_other = RequestScope::new("alice", "other").unwrap();
+    let bob_bot = RequestScope::new("bob", "bot").unwrap();
+
+    store
+        .upsert_memory(
+            &alice_bot.address(DurableMemoryScope::User),
+            "language",
+            "Russian",
+        )
+        .unwrap();
+    store
+        .upsert_memory(
+            &alice_bot.address(DurableMemoryScope::Task),
+            "stack",
+            "Rust",
+        )
+        .unwrap();
+
+    let first = store.load_memory(&alice_bot).unwrap();
+    assert_eq!(first.user_entries()["language"], "Russian");
+    assert_eq!(first.task_entries()["stack"], "Rust");
+    assert_eq!(
+        store.load_memory(&alice_other).unwrap().user_entries()["language"],
+        "Russian"
+    );
+    assert!(
+        store
+            .load_memory(&alice_other)
+            .unwrap()
+            .task_entries()
+            .is_empty()
+    );
+    assert!(
+        store
+            .load_memory(&bob_bot)
+            .unwrap()
+            .user_entries()
+            .is_empty()
+    );
+    assert!(
+        store
+            .load_memory(&bob_bot)
+            .unwrap()
+            .task_entries()
+            .is_empty()
+    );
+}
+
+#[test]
+fn upsert_replaces_and_delete_reports_whether_a_key_existed() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();
+    let scope = RequestScope::new("alice", "bot").unwrap();
+    let address = scope.address(DurableMemoryScope::User);
+
+    store
+        .upsert_memory(&address, "language", "English")
+        .unwrap();
+    store
+        .upsert_memory(&address, "language", "Russian")
+        .unwrap();
+    assert_eq!(
+        store.load_memory(&scope).unwrap().user_entries()["language"],
+        "Russian"
+    );
+    assert!(store.delete_memory(&address, "language").unwrap());
+    assert!(!store.delete_memory(&address, "language").unwrap());
 }

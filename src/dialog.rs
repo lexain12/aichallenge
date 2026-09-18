@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -8,6 +9,10 @@ use crate::chat::{Message, Role};
 use crate::client::TokenUsage;
 use crate::context::{ContextState, ContextSummary, UsageTotals};
 use crate::facts::{Facts, FactsState};
+use crate::memory::{
+    MemoryAddress, MemoryError, MemoryRepository, MemorySnapshot, RequestScope, memory_key,
+    memory_value,
+};
 
 pub struct DialogStore {
     connection: Connection,
@@ -99,6 +104,19 @@ impl DialogStore {
                  parent_dialog_id INTEGER REFERENCES dialogs(id),
                  checkpoint_message_count INTEGER NOT NULL CHECK (checkpoint_message_count >= 0),
                  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+             );
+             CREATE TABLE IF NOT EXISTS memory_entries (
+                 scope_type TEXT NOT NULL CHECK (scope_type IN ('user', 'task')),
+                 user_id TEXT NOT NULL,
+                 task_id TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
+                 CHECK (
+                     (scope_type = 'user' AND task_id = '') OR
+                     (scope_type = 'task' AND task_id <> '')
+                 ),
+                 PRIMARY KEY (scope_type, user_id, task_id, key)
              );",
         )?;
         connection.execute(
@@ -667,6 +685,91 @@ impl DialogStore {
     }
 }
 
+impl MemoryRepository for DialogStore {
+    type Error = StoreError;
+
+    fn load_memory(&self, scope: &RequestScope) -> Result<MemorySnapshot, Self::Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT scope_type, key, value
+             FROM memory_entries
+             WHERE user_id = ?1
+               AND (
+                   (scope_type = 'user' AND task_id = '') OR
+                   (scope_type = 'task' AND task_id = ?2)
+               )
+             ORDER BY scope_type, key",
+        )?;
+        let rows = statement.query_map(params![scope.user_id(), scope.task_id()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut user = BTreeMap::new();
+        let mut task = BTreeMap::new();
+        for row in rows {
+            let (scope_type, key, value) = row?;
+            match scope_type.as_str() {
+                "user" => {
+                    user.insert(key, value);
+                }
+                "task" => {
+                    task.insert(key, value);
+                }
+                _ => return Err(rusqlite::Error::InvalidQuery.into()),
+            }
+        }
+        Ok(MemorySnapshot::new(scope.clone(), user, task))
+    }
+
+    fn upsert_memory(
+        &mut self,
+        address: &MemoryAddress,
+        key: &str,
+        value: &str,
+    ) -> Result<(), Self::Error> {
+        let key = memory_key(key)?;
+        let value = memory_value(value)?;
+        let (scope_type, task_id) = address_parts(address);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO memory_entries (scope_type, user_id, task_id, key, value)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(scope_type, user_id, task_id, key) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
+            params![scope_type, address.user_id(), task_id, key, value],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn delete_memory(&mut self, address: &MemoryAddress, key: &str) -> Result<bool, Self::Error> {
+        let key = memory_key(key)?;
+        let (scope_type, task_id) = address_parts(address);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
+            "DELETE FROM memory_entries
+             WHERE scope_type = ?1 AND user_id = ?2 AND task_id = ?3 AND key = ?4",
+            params![scope_type, address.user_id(), task_id, key],
+        )?;
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+}
+
+fn address_parts(address: &MemoryAddress) -> (&'static str, &str) {
+    match address {
+        MemoryAddress::User { .. } => ("user", ""),
+        MemoryAddress::Task { task_id, .. } => ("task", task_id),
+    }
+}
+
 type StoredContextRow = (String, i64, i64, i64, i64, i64, i64);
 type StoredFactsRow = (String, i64, i64, i64, i64, i64, i64);
 
@@ -763,6 +866,8 @@ pub enum StoreError {
     Usage(#[from] serde_json::Error),
     #[error("dialog database error: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("invalid durable memory: {0}")]
+    InvalidMemory(#[from] MemoryError),
     #[error("dialog {0} was not found")]
     NotFound(i64),
     #[error("dialog {0} changed in another session; restart with --resume {0}")]
