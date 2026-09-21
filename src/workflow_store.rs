@@ -1,4 +1,8 @@
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use std::collections::BTreeMap;
+
+use rusqlite::{
+    Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, types::Value,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::chat::{Message, Role};
@@ -6,11 +10,23 @@ use crate::client::TokenUsage;
 use crate::dialog::{DialogStore, StoreError};
 use crate::memory::RequestScope;
 use crate::workflow::{
-    PatchContext, StageRunId, StateMachine, TaskPhase, TaskStatePatch, TaskStatus, WorkflowInput,
-    WorkflowInputSource, WorkflowIntent, WorkflowTaskId, WorkflowTaskState,
+    PatchContext, StageChangeAuthorization, StageRunId, StateMachine, TaskPhase, TaskStatePatch,
+    TaskStatus, TransitionEvent, WorkflowInput, WorkflowInputSource, WorkflowIntent,
+    WorkflowTaskId, WorkflowTaskState,
 };
+use crate::workflow_model::{HandoffPayload, project_handoff};
 
 pub trait WorkflowRepository {
+    fn copy_workflow_branch(
+        tx: &Transaction<'_>,
+        source_dialog_id: i64,
+        target_dialog_id: i64,
+        message_id_map: &BTreeMap<i64, i64>,
+    ) -> Result<(), StoreError>;
+    fn commit_stage_change(
+        &mut self,
+        command: TransitionCommit<'_>,
+    ) -> Result<PersistedTransition, StoreError>;
     fn lease_processing(
         &mut self,
         processing_id: i64,
@@ -70,6 +86,25 @@ pub trait WorkflowRepository {
         dialog_id: i64,
         current_version: u64,
     ) -> Result<usize, StoreError>;
+}
+
+pub struct TransitionCommit<'a> {
+    pub dialog_id: i64,
+    pub source_task: &'a WorkflowTaskState,
+    pub authorization: &'a StageChangeAuthorization,
+    pub triggering_input: &'a WorkflowInput,
+    pub protocol_text: &'a str,
+    pub confidence: Option<f32>,
+    pub accepted_patch: Option<&'a TaskStatePatch>,
+    pub handoff: &'a HandoffPayload,
+    pub processing_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedTransition {
+    pub transition_id: i64,
+    pub input_message_id: i64,
+    pub target_state: WorkflowTaskState,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +193,12 @@ pub enum ProcessingLeaseMode {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProcessingResult {
+    Transition {
+        transition_id: i64,
+        input_message_id: i64,
+        workflow_input_id: i64,
+        target_state: WorkflowTaskState,
+    },
     AwaitUser {
         task_version: u64,
     },
@@ -223,6 +264,26 @@ pub struct PendingProcessing {
 }
 
 impl WorkflowRepository for DialogStore {
+    fn copy_workflow_branch(
+        tx: &Transaction<'_>,
+        source_dialog_id: i64,
+        target_dialog_id: i64,
+        message_id_map: &BTreeMap<i64, i64>,
+    ) -> Result<(), StoreError> {
+        copy_workflow_branch(tx, source_dialog_id, target_dialog_id, message_id_map)
+    }
+    fn commit_stage_change(
+        &mut self,
+        command: TransitionCommit<'_>,
+    ) -> Result<PersistedTransition, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = commit_stage_change(&tx, &command)
+            .map_err(|error| workflow_conflict(error, command.dialog_id))?;
+        tx.commit()?;
+        Ok(result)
+    }
     fn lease_processing(
         &mut self,
         processing_id: i64,
@@ -568,6 +629,598 @@ impl WorkflowRepository for DialogStore {
     }
 }
 
+type IdMap = BTreeMap<i64, i64>;
+
+fn mapped_id(map: &IdMap, old: i64) -> Result<i64, StoreError> {
+    map.get(&old).copied().ok_or_else(|| {
+        StoreError::InvalidWorkflow(format!("branch reference {old} is outside copied history"))
+    })
+}
+
+fn remap_field(
+    row: &mut BTreeMap<String, Value>,
+    name: &str,
+    map: &IdMap,
+) -> Result<(), StoreError> {
+    match row.get_mut(name) {
+        Some(Value::Integer(id)) => {
+            *id = mapped_id(map, *id)?;
+            Ok(())
+        }
+        Some(Value::Null) => Ok(()),
+        _ => invalid("invalid branch reference"),
+    }
+}
+
+// Table names, columns and filters are application-owned constants. Every reference
+// is rewritten explicitly by the caller; missing mappings fail the whole fork.
+fn copy_rows(
+    connection: &Connection,
+    table: &str,
+    columns: &[&str],
+    filter: &str,
+    source_dialog: i64,
+    mut rewrite: impl FnMut(&mut BTreeMap<String, Value>) -> Result<(), StoreError>,
+) -> Result<IdMap, StoreError> {
+    let rows = {
+        let mut statement = connection.prepare(&format!(
+            "SELECT id, {} FROM {table} WHERE {filter} ORDER BY id",
+            columns.join(",")
+        ))?;
+        statement
+            .query_map([source_dialog], |row| {
+                let fields = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| Ok(((*name).to_owned(), row.get::<_, Value>(i + 1)?)))
+                    .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+                Ok((row.get::<_, i64>(0)?, fields))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let sql = format!(
+        "INSERT INTO {table} ({}) VALUES ({})",
+        columns.join(","),
+        vec!["?"; columns.len()].join(",")
+    );
+    let mut map = IdMap::new();
+    for (old, mut row) in rows {
+        rewrite(&mut row)?;
+        if connection.execute(
+            &sql,
+            rusqlite::params_from_iter(columns.iter().map(|name| &row[*name])),
+        )? != 1
+        {
+            return invalid("branch insertion did not insert one row");
+        }
+        map.insert(old, connection.last_insert_rowid());
+    }
+    Ok(map)
+}
+
+pub(crate) fn copy_workflow_branch(
+    tx: &Transaction<'_>,
+    source_dialog_id: i64,
+    target_dialog_id: i64,
+    message_id_map: &IdMap,
+) -> Result<(), StoreError> {
+    let tasks = copy_rows(
+        tx,
+        "workflow_tasks",
+        &[
+            "dialog_id",
+            "ordinal",
+            "phase",
+            "status",
+            "goal",
+            "plan_json",
+            "current_step_id",
+            "expected_action",
+            "checkpoint_json",
+            "current_stage_run_id",
+            "incoming_handoff_id",
+            "version",
+            "created_at",
+            "updated_at",
+        ],
+        "dialog_id=?1",
+        source_dialog_id,
+        |row| {
+            row.insert("dialog_id".into(), Value::Integer(target_dialog_id));
+            row.insert("current_stage_run_id".into(), Value::Null);
+            row.insert("incoming_handoff_id".into(), Value::Null);
+            Ok(())
+        },
+    )?;
+    let stages = copy_rows(
+        tx,
+        "task_stage_runs",
+        &[
+            "workflow_task_id",
+            "phase",
+            "sequence",
+            "started_at",
+            "finished_at",
+        ],
+        "workflow_task_id IN (SELECT id FROM workflow_tasks WHERE dialog_id=?1)",
+        source_dialog_id,
+        |row| remap_field(row, "workflow_task_id", &tasks),
+    )?;
+    for (old, new) in &stages {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_stage_context WHERE stage_run_id=?1)",
+            [old],
+            |r| r.get(0),
+        )?;
+        if exists {
+            require_one(tx.execute("INSERT INTO task_stage_context (stage_run_id,context_json,facts_json,updated_at) SELECT ?1,context_json,facts_json,updated_at FROM task_stage_context WHERE stage_run_id=?2", params![new,old])?, target_dialog_id)?;
+        }
+    }
+    for (old, new) in message_id_map {
+        let mapping: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT workflow_task_id,stage_run_id FROM message_task_stages WHERE message_id=?1",
+                [old],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((task, stage)) = mapping {
+            require_one(tx.execute("INSERT INTO message_task_stages (message_id,workflow_task_id,stage_run_id) VALUES (?1,?2,?3)", params![new,mapped_id(&tasks,task)?,mapped_id(&stages,stage)?])?,target_dialog_id)?;
+        }
+    }
+    let processing = copy_rows(
+        tx,
+        "response_processing",
+        &[
+            "assistant_message_id",
+            "checker_name",
+            "expected_version",
+            "status",
+            "attempts",
+            "result_json",
+            "last_error",
+            "created_at",
+            "updated_at",
+        ],
+        "assistant_message_id IN (SELECT id FROM messages WHERE dialog_id=?1)",
+        source_dialog_id,
+        |row| {
+            remap_field(row, "assistant_message_id", message_id_map)?;
+            row.insert("result_json".into(), Value::Null);
+            Ok(())
+        },
+    )?;
+    let inputs = copy_rows(
+        tx,
+        "workflow_inputs",
+        &[
+            "dialog_id",
+            "message_id",
+            "source",
+            "checker_name",
+            "model_name",
+            "triggering_assistant_message_id",
+            "intent_json",
+            "confidence",
+            "outcome",
+            "rejection_reason",
+            "processing_id",
+            "created_at",
+        ],
+        "dialog_id=?1",
+        source_dialog_id,
+        |row| {
+            row.insert("dialog_id".into(), Value::Integer(target_dialog_id));
+            remap_field(row, "message_id", message_id_map)?;
+            remap_field(row, "triggering_assistant_message_id", message_id_map)?;
+            remap_field(row, "processing_id", &processing)
+        },
+    )?;
+    let transitions = copy_rows(
+        tx,
+        "task_transitions",
+        &[
+            "workflow_task_id",
+            "from_stage_run_id",
+            "to_stage_run_id",
+            "workflow_input_id",
+            "event",
+            "source_version",
+            "handoff_json",
+            "created_at",
+        ],
+        "workflow_task_id IN (SELECT id FROM workflow_tasks WHERE dialog_id=?1)",
+        source_dialog_id,
+        |row| {
+            remap_field(row, "workflow_task_id", &tasks)?;
+            remap_field(row, "from_stage_run_id", &stages)?;
+            remap_field(row, "to_stage_run_id", &stages)?;
+            remap_field(row, "workflow_input_id", &inputs)
+        },
+    )?;
+    for (old, new) in &tasks {
+        let (stage, handoff): (i64, Option<i64>) = tx.query_row(
+            "SELECT current_stage_run_id,incoming_handoff_id FROM workflow_tasks WHERE id=?1",
+            [old],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if tx.execute(
+            "UPDATE workflow_tasks SET current_stage_run_id=?1,incoming_handoff_id=?2 WHERE id=?3",
+            params![
+                mapped_id(&stages, stage)?,
+                handoff.map(|id| mapped_id(&transitions, id)).transpose()?,
+                new
+            ],
+        )? != 1
+        {
+            return invalid("branch task update lost");
+        }
+    }
+    for (old, new) in &processing {
+        let (raw, status): (Option<String>, String) = tx.query_row(
+            "SELECT result_json,status FROM response_processing WHERE id=?1",
+            [old],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let copied = if let Some(raw) = raw {
+            match serde_json::from_str::<ProcessingResult>(&raw) {
+                Ok(mut result) => {
+                    match &mut result {
+                        ProcessingResult::AwaitUser { .. } => {}
+                        ProcessingResult::ControllerInput {
+                            message_id,
+                            workflow_input_id,
+                            ..
+                        } => {
+                            *message_id = mapped_id(message_id_map, *message_id)?;
+                            *workflow_input_id = mapped_id(&inputs, *workflow_input_id)?;
+                        }
+                        ProcessingResult::Transition {
+                            transition_id,
+                            input_message_id,
+                            workflow_input_id,
+                            target_state,
+                        } => {
+                            *transition_id = mapped_id(&transitions, *transition_id)?;
+                            *input_message_id = mapped_id(message_id_map, *input_message_id)?;
+                            *workflow_input_id = mapped_id(&inputs, *workflow_input_id)?;
+                            if target_state.dialog_id != source_dialog_id {
+                                return invalid("transition replay belongs to another dialog");
+                            }
+                            target_state.dialog_id = target_dialog_id;
+                            target_state.id = WorkflowTaskId(mapped_id(&tasks, target_state.id.0)?);
+                            target_state.current_stage_run_id = StageRunId(mapped_id(
+                                &stages,
+                                target_state.current_stage_run_id.0,
+                            )?);
+                            target_state.incoming_handoff_id = target_state
+                                .incoming_handoff_id
+                                .map(|id| mapped_id(&transitions, id))
+                                .transpose()?;
+                        }
+                    }
+                    Some(serde_json::to_string(&result)?)
+                }
+                Err(_) if status != "completed" => {
+                    json::<serde_json::Value>(&raw)?;
+                    Some(raw)
+                }
+                Err(_) => return invalid("invalid completed processing result in branch"),
+            }
+        } else {
+            None
+        };
+        if tx.execute(
+            "UPDATE response_processing SET result_json=?1 WHERE id=?2",
+            params![copied, new],
+        )? != 1
+        {
+            return invalid("branch processing update lost");
+        }
+    }
+    let selected: Option<i64> = tx
+        .query_row(
+            "SELECT current_task_id FROM dialog_workflow_state WHERE dialog_id=?1",
+            [source_dialog_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(selected) = selected {
+        require_one(
+            tx.execute(
+                "INSERT INTO dialog_workflow_state (dialog_id,current_task_id) VALUES (?1,?2)",
+                params![target_dialog_id, mapped_id(&tasks, selected)?],
+            )?,
+            target_dialog_id,
+        )?;
+        load_workflow(tx, target_dialog_id)?;
+    }
+    Ok(())
+}
+
+fn initialize_stage_context(connection: &Connection, stage: StageRunId) -> Result<(), StoreError> {
+    // These are the default ContextState/FactsState shapes, including usage boundaries.
+    let usage = serde_json::json!({"call_count":0,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"missing_usage_count":0});
+    let changed = connection.execute(
+        "INSERT INTO task_stage_context (stage_run_id, context_json, facts_json) VALUES (?1, ?2, ?3)",
+        params![stage.0, serde_json::json!({"summary":null,"compaction_usage":usage}).to_string(),
+            serde_json::json!({"facts":{},"covered_message_count":0,"update_usage":usage}).to_string()],
+    )?;
+    if changed != 1 {
+        return invalid("stage context insertion lost");
+    }
+    Ok(())
+}
+
+fn transition_projection(
+    command: &TransitionCommit<'_>,
+    source: &WorkflowTaskState,
+) -> Result<WorkflowTaskState, StoreError> {
+    let preview = if let Some(patch) = command.accepted_patch {
+        if patch.expected_version != source.version {
+            return Err(StoreError::WorkflowConflict(command.dialog_id));
+        }
+        let context = if matches!(
+            command.triggering_input.intent,
+            WorkflowIntent::ProposeTransition {
+                event: TransitionEvent::ValidationFailed,
+                ..
+            }
+        ) {
+            PatchContext::ValidationRepair
+        } else {
+            PatchContext::Normal
+        };
+        source.preview_patch(patch, context).map_err(domain_error)?
+    } else {
+        source.clone()
+    };
+    let authorization = match &command.triggering_input.intent {
+        WorkflowIntent::ProposeTransition { event, evidence } => {
+            StageChangeAuthorization::Transition(
+                StateMachine::authorize(&preview, *event, evidence).map_err(domain_error)?,
+            )
+        }
+        WorkflowIntent::ReplanCurrent { change_request } => StageChangeAuthorization::Replan(
+            StateMachine::authorize_replan(
+                &preview,
+                &command.triggering_input.source,
+                change_request.clone(),
+            )
+            .map_err(domain_error)?,
+        ),
+        _ => return invalid("stage change requires transition or replan input"),
+    };
+    if &authorization != command.authorization {
+        return Err(StoreError::WorkflowConflict(command.dialog_id));
+    }
+    let mut target = project_handoff(&preview, &authorization, command.handoff)
+        .map_err(|error| StoreError::InvalidWorkflow(error.to_string()))?;
+    target.version = next_version(source.version)?;
+    target.current_stage_sequence = source
+        .current_stage_sequence
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidWorkflow("stage sequence overflow".into()))?;
+    Ok(target)
+}
+
+fn transition_event(authorization: &StageChangeAuthorization) -> Result<String, StoreError> {
+    match authorization {
+        StageChangeAuthorization::Transition(auth) => enum_text(&auth.event),
+        StageChangeAuthorization::Replan(_) => Ok("replan_requested".into()),
+    }
+}
+
+fn enum_text(value: &impl Serialize) -> Result<String, StoreError> {
+    Ok(serde_json::to_value(value)?
+        .as_str()
+        .ok_or_else(|| StoreError::InvalidWorkflow("expected text enum".into()))?
+        .to_owned())
+}
+
+fn commit_stage_change(
+    connection: &Connection,
+    command: &TransitionCommit<'_>,
+) -> Result<PersistedTransition, StoreError> {
+    validate_protocol_text(command.protocol_text)?;
+    validate_confidence(command.confidence)?;
+    command.triggering_input.validate().map_err(domain_error)?;
+    let source = command.source_task;
+    if source.dialog_id != command.dialog_id {
+        return Err(StoreError::WorkflowConflict(command.dialog_id));
+    }
+    let (source_name, checker, model, assistant) = match &command.triggering_input.source {
+        WorkflowInputSource::Human => {
+            if command.processing_id.is_some() || command.accepted_patch.is_some() {
+                return invalid("human stage changes cannot carry processing or checker patches");
+            }
+            ("human", None, None, None)
+        }
+        WorkflowInputSource::Controller {
+            checker,
+            model,
+            triggering_assistant_message_id,
+        } => {
+            if command.processing_id.is_none() {
+                return invalid("controller stage changes require processing");
+            }
+            active_task(source)?;
+            (
+                "controller",
+                Some(checker.as_str()),
+                Some(model.as_str()),
+                Some(*triggering_assistant_message_id),
+            )
+        }
+    };
+    let mut target = transition_projection(command, source)?;
+    let processing = command
+        .processing_id
+        .map(|id| processing_row(connection, id))
+        .transpose()?;
+    let completed = if let Some(processing) = &processing {
+        processing.check_identity(source.id, source.current_stage_run_id, source.version)?;
+        if Some(processing.assistant_message_id) != assistant
+            || Some(processing.checker.as_str()) != checker
+            || processing.dialog_id != command.dialog_id
+        {
+            return Err(StoreError::WorkflowConflict(command.dialog_id));
+        }
+        processing.completed_result()?
+    } else {
+        None
+    };
+    let prior: Option<(i64, i64, i64)> = connection
+        .query_row(
+            "SELECT id, workflow_input_id, to_stage_run_id FROM task_transitions
+         WHERE workflow_task_id=?1 AND from_stage_run_id=?2 AND source_version=?3",
+            params![
+                source.id.0,
+                source.current_stage_run_id.0,
+                sqlite_version(source.version)?
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((transition_id, workflow_input_id, stage_id)) = prior {
+        target.current_stage_run_id = StageRunId(stage_id);
+        target.incoming_handoff_id = Some(transition_id);
+        let message: Option<i64> = connection
+            .query_row(
+                "SELECT i.message_id FROM task_transitions t
+             JOIN workflow_inputs i ON i.id=t.workflow_input_id
+             JOIN messages m ON m.id=i.message_id
+             JOIN message_task_stages ms ON ms.message_id=m.id
+             JOIN task_stage_runs old ON old.id=t.from_stage_run_id
+             JOIN task_stage_runs new ON new.id=t.to_stage_run_id
+             JOIN workflow_tasks wt ON wt.id=t.workflow_task_id
+             WHERE t.id=?1 AND i.id=?2 AND t.event=?3 AND t.handoff_json=?4
+               AND i.dialog_id=?5 AND m.dialog_id=?5 AND wt.dialog_id=?5
+               AND m.role='user' AND m.content=?6 AND i.intent_json=?7 AND i.confidence IS ?8
+               AND i.source=?9 AND i.checker_name IS ?10 AND i.model_name IS ?11
+               AND i.triggering_assistant_message_id IS ?12 AND i.processing_id IS ?13
+               AND i.outcome='accepted' AND ms.workflow_task_id=?14 AND ms.stage_run_id=?15
+               AND old.workflow_task_id=?14 AND new.workflow_task_id=?14
+               AND old.phase=?16 AND new.phase=?17 AND old.sequence=?18 AND new.sequence=?19
+               AND old.finished_at IS NOT NULL",
+                params![
+                    transition_id,
+                    workflow_input_id,
+                    transition_event(command.authorization)?,
+                    serde_json::to_string(command.handoff)?,
+                    command.dialog_id,
+                    command.protocol_text,
+                    serde_json::to_string(&command.triggering_input.intent)?,
+                    command.confidence,
+                    source_name,
+                    checker,
+                    model,
+                    assistant,
+                    command.processing_id,
+                    source.id.0,
+                    stage_id,
+                    enum_text(&source.phase)?,
+                    enum_text(&target.phase)?,
+                    source.current_stage_sequence,
+                    target.current_stage_sequence
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let input_message_id = message.ok_or(StoreError::WorkflowConflict(command.dialog_id))?;
+        if processing.is_some()
+            && completed
+                != Some(ProcessingResult::Transition {
+                    transition_id,
+                    input_message_id,
+                    workflow_input_id,
+                    target_state: target.clone(),
+                })
+        {
+            return Err(StoreError::WorkflowConflict(command.dialog_id));
+        }
+        return Ok(PersistedTransition {
+            transition_id,
+            input_message_id,
+            target_state: target,
+        });
+    }
+    if completed.is_some() {
+        return Err(StoreError::WorkflowConflict(command.dialog_id));
+    }
+    let current = current_task(
+        connection,
+        command.dialog_id,
+        source.id,
+        source.current_stage_run_id,
+        source.version,
+    )?;
+    if &current != source {
+        return Err(StoreError::WorkflowConflict(command.dialog_id));
+    }
+    target = transition_projection(command, &current)?;
+    if let Some(processing) = &processing {
+        processing.require_leased()?;
+        processing.current_task(connection)?;
+    }
+    let input_message_id =
+        insert_message(connection, command.dialog_id, "user", command.protocol_text)?;
+    require_one(connection.execute(
+        "INSERT INTO workflow_inputs (dialog_id,message_id,source,checker_name,model_name,triggering_assistant_message_id,intent_json,confidence,outcome,processing_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9)",
+        params![command.dialog_id,input_message_id,source_name,checker,model,assistant,serde_json::to_string(&command.triggering_input.intent)?,command.confidence,command.processing_id],
+    )?, command.dialog_id)?;
+    let workflow_input_id = connection.last_insert_rowid();
+    if connection.execute("UPDATE task_stage_runs SET finished_at=strftime('%Y-%m-%d %H:%M:%f','now') WHERE id=?1 AND workflow_task_id=?2 AND finished_at IS NULL", params![source.current_stage_run_id.0,source.id.0])? != 1 {
+        return Err(StoreError::WorkflowConflict(command.dialog_id));
+    }
+    // The destination must exist before its non-null transition foreign key is inserted.
+    require_one(
+        connection.execute(
+            "INSERT INTO task_stage_runs (workflow_task_id,phase,sequence) VALUES (?1,?2,?3)",
+            params![
+                source.id.0,
+                enum_text(&target.phase)?,
+                target.current_stage_sequence
+            ],
+        )?,
+        command.dialog_id,
+    )?;
+    target.current_stage_run_id = StageRunId(connection.last_insert_rowid());
+    require_one(connection.execute("INSERT INTO task_transitions (workflow_task_id,from_stage_run_id,to_stage_run_id,workflow_input_id,event,source_version,handoff_json) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![source.id.0,source.current_stage_run_id.0,target.current_stage_run_id.0,workflow_input_id,transition_event(command.authorization)?,sqlite_version(source.version)?,serde_json::to_string(command.handoff)?])?, command.dialog_id)?;
+    let transition_id = connection.last_insert_rowid();
+    target.incoming_handoff_id = Some(transition_id);
+    target.validate().map_err(domain_error)?;
+    map_message(connection, input_message_id, &target)?;
+    if connection.execute(
+        "UPDATE workflow_tasks SET phase=?1,status='active',plan_json=?2,current_step_id=?3,expected_action=?4,checkpoint_json=?5,current_stage_run_id=?6,incoming_handoff_id=?7,version=version+1,updated_at=strftime('%Y-%m-%d %H:%M:%f','now') WHERE id=?8 AND version=?9 AND current_stage_run_id=?10 AND dialog_id=?11",
+        params![enum_text(&target.phase)?,serde_json::to_string(&target.plan)?,target.current_step_id,target.expected_action,serde_json::to_string(&target.checkpoint)?,target.current_stage_run_id.0,transition_id,source.id.0,sqlite_version(source.version)?,source.current_stage_run_id.0,command.dialog_id],
+    )? != 1 { return Err(StoreError::WorkflowConflict(command.dialog_id)); }
+    if connection.execute("UPDATE dialog_workflow_state SET current_task_id=?1 WHERE dialog_id=?2 AND current_task_id=?1", params![source.id.0,command.dialog_id])? != 1 {
+        return Err(StoreError::WorkflowConflict(command.dialog_id));
+    }
+    initialize_stage_context(connection, target.current_stage_run_id)?;
+    if let Some(processing) = &processing {
+        complete_processing(
+            connection,
+            processing,
+            &ProcessingResult::Transition {
+                transition_id,
+                input_message_id,
+                workflow_input_id,
+                target_state: target.clone(),
+            },
+        )?;
+    }
+    touch_dialog(connection, command.dialog_id, input_message_id)?;
+    Ok(PersistedTransition {
+        transition_id,
+        input_message_id,
+        target_state: target,
+    })
+}
+
 fn create_task(
     connection: &Connection,
     dialog_id: i64,
@@ -604,6 +1257,7 @@ fn create_task(
     task.id = WorkflowTaskId(connection.last_insert_rowid());
     connection.execute("INSERT INTO task_stage_runs (workflow_task_id, phase, sequence) VALUES (?1, 'planning', 1)", [task.id.0])?;
     task.current_stage_run_id = StageRunId(connection.last_insert_rowid());
+    initialize_stage_context(connection, task.current_stage_run_id)?;
     let changed = connection.execute(
         "UPDATE workflow_tasks SET current_stage_run_id = ?1 WHERE id = ?2",
         params![task.current_stage_run_id.0, task.id.0],
@@ -694,6 +1348,24 @@ impl ProcessingRow {
             StoreError::InvalidWorkflow("completed processing has no result".into())
         })?)?;
         match &result {
+            ProcessingResult::Transition {
+                transition_id,
+                input_message_id,
+                workflow_input_id,
+                target_state,
+            } => {
+                positive(*transition_id, "transition id")?;
+                positive(*input_message_id, "transition message id")?;
+                positive(*workflow_input_id, "transition input id")?;
+                target_state.validate().map_err(domain_error)?;
+                if target_state.id != self.task_id
+                    || target_state.dialog_id != self.dialog_id
+                    || target_state.version != next_version(self.expected_version)?
+                    || target_state.incoming_handoff_id != Some(*transition_id)
+                {
+                    return invalid("invalid transition completion");
+                }
+            }
             ProcessingResult::AwaitUser { task_version } => {
                 if *task_version != self.expected_version
                     && *task_version != next_version(self.expected_version)?
@@ -1101,9 +1773,12 @@ fn insert_message(
     role: &str,
     text: &str,
 ) -> Result<i64, StoreError> {
-    connection.execute(
-        "INSERT INTO messages (dialog_id, role, content) VALUES (?1, ?2, ?3)",
-        params![dialog_id, role, text],
+    require_one(
+        connection.execute(
+            "INSERT INTO messages (dialog_id, role, content) VALUES (?1, ?2, ?3)",
+            params![dialog_id, role, text],
+        )?,
+        dialog_id,
     )?;
     Ok(connection.last_insert_rowid())
 }
@@ -1113,7 +1788,14 @@ fn map_message(
     message_id: i64,
     task: &WorkflowTaskState,
 ) -> Result<(), StoreError> {
-    connection.execute("INSERT INTO message_task_stages (message_id, workflow_task_id, stage_run_id) VALUES (?1, ?2, ?3)", params![message_id, task.id.0, task.current_stage_run_id.0])?;
+    require_one(connection.execute("INSERT INTO message_task_stages (message_id, workflow_task_id, stage_run_id) VALUES (?1, ?2, ?3)", params![message_id, task.id.0, task.current_stage_run_id.0])?, task.dialog_id)?;
+    Ok(())
+}
+
+fn require_one(changed: usize, dialog_id: i64) -> Result<(), StoreError> {
+    if changed != 1 {
+        return Err(StoreError::WorkflowConflict(dialog_id));
+    }
     Ok(())
 }
 
@@ -1352,7 +2034,9 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             source_version INTEGER NOT NULL CHECK (source_version >= 0),
             handoff_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
-        );",
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS one_transition_per_source_stage
+        ON task_transitions(workflow_task_id, from_stage_run_id, source_version);",
     )?;
     if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
         return Err(StoreError::InvalidWorkflow(

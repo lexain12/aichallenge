@@ -487,6 +487,24 @@ fn transcript_hides_only_controller_inputs_while_stage_protocol_keeps_them() {
     assert_eq!(protocol[3].source, ProtocolSource::Controller);
     assert_eq!(protocol[3].message.role(), Role::User);
     assert_eq!(store.list().unwrap()[0].title, "legacy user");
+    let branch = store.fork_dialog(id, 5).unwrap().new_dialog_id;
+    let copied = store.load(branch).unwrap();
+    assert_eq!(copied.messages, dialog.messages);
+    assert_eq!(copied.branch.unwrap().checkpoint_message_count, 5);
+    assert_eq!(store.load(id).unwrap().messages.len(), 4);
+    let copied_task = store.load_workflow(branch).unwrap().current_task.unwrap();
+    let copied_protocol = store
+        .load_stage_messages(copied_task.current_stage_run_id)
+        .unwrap();
+    assert_eq!(copied_protocol.len(), 5);
+    assert_eq!(copied_protocol[3].source, ProtocolSource::Controller);
+    assert!(
+        !connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap()
+    );
 }
 
 #[test]

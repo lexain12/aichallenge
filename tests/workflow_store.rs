@@ -1,15 +1,1087 @@
 use deepseek_cli::client::TokenUsage;
 use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::memory::RequestScope;
+use deepseek_cli::workflow::{
+    PatchContext, StageChangeAuthorization, StateMachine, TransitionEvent, WorkflowTaskState,
+};
 use deepseek_cli::workflow::{PlanAppend, PlanStepStatus, StepStatusUpdate, TaskStatePatch};
 use deepseek_cli::workflow::{StageRunId, TaskPhase, TaskStatus};
 use deepseek_cli::workflow::{WorkflowInput, WorkflowInputSource, WorkflowIntent, WorkflowTaskId};
+use deepseek_cli::workflow_model::HandoffPayload;
+use deepseek_cli::workflow_store::TransitionCommit;
 use deepseek_cli::workflow_store::{
     AcceptedInputEffect, AnswerCommit, ExpectedCurrentTask, InputCommit,
 };
 use deepseek_cli::workflow_store::{ControllerInputCommit, ProcessingLeaseMode, ProcessingResult};
 use deepseek_cli::workflow_store::{ProcessingStatus, ProtocolSource, WorkflowRepository};
 use rusqlite::Connection;
+
+fn handoff() -> HandoffPayload {
+    HandoffPayload {
+        summary: "Implementation complete".into(),
+        completed_step_ids: vec![],
+        next_step_id: None,
+        expected_action: Some("Run validation".into()),
+        plan_changes: vec![],
+        decisions: vec!["Keep scope".into()],
+        open_issues: vec![],
+    }
+}
+
+fn transition_input(event: TransitionEvent) -> WorkflowInput {
+    WorkflowInput {
+        source: WorkflowInputSource::Human,
+        intent: WorkflowIntent::ProposeTransition {
+            event,
+            evidence: vec!["Tests pass => 12 tests passed".into()],
+        },
+    }
+}
+
+fn authorize(
+    task: &WorkflowTaskState,
+    input: &WorkflowInput,
+    patch: Option<&TaskStatePatch>,
+) -> StageChangeAuthorization {
+    let preview = patch
+        .map(|p| task.preview_patch(p, PatchContext::Normal).unwrap())
+        .unwrap_or_else(|| task.clone());
+    match &input.intent {
+        WorkflowIntent::ProposeTransition { event, evidence } => {
+            StageChangeAuthorization::Transition(
+                StateMachine::authorize(&preview, *event, evidence).unwrap(),
+            )
+        }
+        WorkflowIntent::ReplanCurrent { change_request } => StageChangeAuthorization::Replan(
+            StateMachine::authorize_replan(&preview, &input.source, change_request.clone())
+                .unwrap(),
+        ),
+        _ => panic!("not a stage change"),
+    }
+}
+
+fn transition_command<'a>(
+    task: &'a WorkflowTaskState,
+    input: &'a WorkflowInput,
+    auth: &'a StageChangeAuthorization,
+    handoff: &'a HandoffPayload,
+) -> TransitionCommit<'a> {
+    TransitionCommit {
+        dialog_id: task.dialog_id,
+        source_task: task,
+        authorization: auth,
+        triggering_input: input,
+        protocol_text: "start validation",
+        confidence: Some(0.9),
+        accepted_patch: None,
+        handoff,
+        processing_id: None,
+    }
+}
+
+#[test]
+fn transition_closes_old_stage_and_projects_handoff_in_one_commit() {
+    let mut fixture = Fixture::new();
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let input = transition_input(TransitionEvent::PlanningCompleted);
+    let auth = authorize(&source, &input, None);
+    let payload = handoff();
+    let result = fixture
+        .store
+        .commit_stage_change(transition_command(&source, &input, &auth, &payload))
+        .unwrap();
+    let current = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(result.target_state, current);
+    assert_eq!(
+        (current.phase, current.status, current.version),
+        (TaskPhase::Execution, TaskStatus::Active, 4)
+    );
+    assert_eq!(current.current_stage_sequence, 2);
+    assert_ne!(current.current_stage_run_id, source.current_stage_run_id);
+    assert_eq!(current.incoming_handoff_id, Some(result.transition_id));
+    assert_eq!(current.checkpoint.summary, "Implementation complete");
+    assert_eq!(current.current_step_id, None);
+    let messages = fixture
+        .store
+        .load_stage_messages(current.current_stage_run_id)
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        (messages[0].message_id, messages[0].source),
+        (result.input_message_id, ProtocolSource::Human)
+    );
+    assert_eq!(fixture.store.load(1).unwrap().messages.len(), 2);
+    assert!(
+        fixture
+            .connection
+            .query_row(
+                "SELECT finished_at IS NOT NULL FROM task_stage_runs WHERE id=1",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+    assert_eq!(count(&fixture.connection, "task_stage_context"), 1);
+    assert!(
+        !fixture
+            .connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap()
+    );
+}
+
+#[test]
+fn human_transition_replay_returns_original_after_later_replan() {
+    let mut fixture = Fixture::new();
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let input = transition_input(TransitionEvent::PlanningCompleted);
+    let auth = authorize(&source, &input, None);
+    let payload = handoff();
+    let original = fixture
+        .store
+        .commit_stage_change(transition_command(&source, &input, &auth, &payload))
+        .unwrap();
+    let replan = WorkflowInput {
+        source: WorkflowInputSource::Human,
+        intent: WorkflowIntent::ReplanCurrent {
+            change_request: "Change approach".into(),
+        },
+    };
+    let replan_auth = authorize(&original.target_state, &replan, None);
+    let replanned = fixture
+        .store
+        .commit_stage_change(transition_command(
+            &original.target_state,
+            &replan,
+            &replan_auth,
+            &payload,
+        ))
+        .unwrap();
+    assert_eq!(
+        (
+            replanned.target_state.phase,
+            replanned.target_state.plan.revision,
+            replanned.target_state.version
+        ),
+        (TaskPhase::Planning, 2, 5)
+    );
+    assert!(
+        replanned
+            .target_state
+            .checkpoint
+            .open_issues
+            .contains(&"Change approach".into())
+    );
+    assert_eq!(
+        fixture
+            .store
+            .commit_stage_change(transition_command(&source, &input, &auth, &payload))
+            .unwrap(),
+        original
+    );
+    let mut changed = payload.clone();
+    changed.summary = "different".into();
+    assert!(matches!(
+        fixture
+            .store
+            .commit_stage_change(transition_command(&source, &input, &auth, &changed)),
+        Err(StoreError::WorkflowConflict(1))
+    ));
+    assert_eq!(count(&fixture.connection, "task_transitions"), 2);
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        replanned.target_state
+    );
+}
+
+#[test]
+fn replan_always_creates_a_new_planning_run_including_planning_and_done() {
+    for phase in ["planning", "execution", "validation", "done"] {
+        let mut fixture = Fixture::new();
+        fixture
+            .connection
+            .execute(
+                "UPDATE workflow_tasks SET phase=?1, status='active'",
+                [phase],
+            )
+            .unwrap();
+        fixture
+            .connection
+            .execute("UPDATE task_stage_runs SET phase=?1", [phase])
+            .unwrap();
+        let source = fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap();
+        let input = WorkflowInput {
+            source: WorkflowInputSource::Human,
+            intent: WorkflowIntent::ReplanCurrent {
+                change_request: "Revise approach".into(),
+            },
+        };
+        let auth = authorize(&source, &input, None);
+        let result = fixture
+            .store
+            .commit_stage_change(transition_command(&source, &input, &auth, &handoff()))
+            .unwrap();
+        assert_eq!(
+            (
+                result.target_state.id,
+                result.target_state.phase,
+                result.target_state.version,
+                result.target_state.plan.revision
+            ),
+            (source.id, TaskPhase::Planning, 4, 2)
+        );
+        assert_ne!(
+            result.target_state.current_stage_run_id,
+            source.current_stage_run_id
+        );
+        assert_eq!(
+            fixture
+                .connection
+                .query_row("SELECT event FROM task_transitions", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "replan_requested"
+        );
+    }
+}
+
+#[test]
+fn transition_rejects_stale_or_forged_authorization_and_human_patch_without_writes() {
+    let mut fixture = Fixture::new();
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let input = transition_input(TransitionEvent::PlanningCompleted);
+    let auth = authorize(&source, &input, None);
+    let payload = handoff();
+    let patch = patch(3);
+    let mut command = transition_command(&source, &input, &auth, &payload);
+    command.accepted_patch = Some(&patch);
+    assert!(fixture.store.commit_stage_change(command).is_err());
+    let mut forged = auth.clone();
+    if let StageChangeAuthorization::Transition(ref mut auth) = forged {
+        auth.to_phase = TaskPhase::Done;
+    }
+    assert!(
+        fixture
+            .store
+            .commit_stage_change(transition_command(&source, &input, &forged, &payload))
+            .is_err()
+    );
+    fixture
+        .connection
+        .execute("UPDATE workflow_tasks SET version=4", [])
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .store
+            .commit_stage_change(transition_command(&source, &input, &auth, &payload)),
+        Err(StoreError::WorkflowConflict(1))
+    ));
+    assert_eq!(count(&fixture.connection, "messages"), 1);
+    assert_eq!(count(&fixture.connection, "task_transitions"), 0);
+}
+
+#[test]
+fn every_created_stage_initializes_empty_reduction_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("context.sqlite3");
+    let mut store = DialogStore::open(&path).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "System", "build")
+        .unwrap();
+    let connection = Connection::open(path).unwrap();
+    let (context, facts): (String, String) = connection
+        .query_row(
+            "SELECT context_json, facts_json FROM task_stage_context WHERE stage_run_id=?1",
+            [started.stage_run_id.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&context).unwrap(),
+        serde_json::json!({"summary":null,"compaction_usage":{"call_count":0,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"missing_usage_count":0}})
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&facts).unwrap(),
+        serde_json::json!({"facts":{},"covered_message_count":0,"update_usage":{"call_count":0,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"missing_usage_count":0}})
+    );
+}
+
+#[test]
+fn workflow_branch_deep_copies_history_provenance_processing_and_replay_ids() {
+    let (mut fixture, processing, assistant) = pending_fixture();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let mut input = transition_input(TransitionEvent::PlanningCompleted);
+    input.source = WorkflowInputSource::Controller {
+        checker: "continuation".into(),
+        model: "checker-model".into(),
+        triggering_assistant_message_id: assistant,
+    };
+    let auth = authorize(&source, &input, None);
+    let payload = handoff();
+    let mut command = transition_command(&source, &input, &auth, &payload);
+    command.processing_id = Some(processing);
+    let original = fixture.store.commit_stage_change(command).unwrap();
+    let context = r#"{"summary":{"content":"branch summary","covered_message_count":1},"compaction_usage":{"call_count":1,"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,"missing_usage_count":0}}"#;
+    fixture
+        .connection
+        .execute("UPDATE task_stage_context SET context_json=?1", [context])
+        .unwrap();
+    let branch = fixture.store.fork_dialog(1, 3).unwrap().new_dialog_id;
+    let copy = fixture
+        .store
+        .load_workflow(branch)
+        .unwrap()
+        .current_task
+        .expect("branch must retain workflow");
+    assert_ne!(copy.id, original.target_state.id);
+    assert_ne!(
+        copy.current_stage_run_id,
+        original.target_state.current_stage_run_id
+    );
+    assert_ne!(
+        copy.incoming_handoff_id,
+        original.target_state.incoming_handoff_id
+    );
+    assert_eq!(copy.checkpoint, original.target_state.checkpoint);
+    assert_eq!(
+        fixture.store.load(branch).unwrap().messages,
+        fixture.store.load(1).unwrap().messages
+    );
+    assert_eq!(
+        fixture
+            .store
+            .load_stage_messages(copy.current_stage_run_id)
+            .unwrap()[0]
+            .source,
+        ProtocolSource::Controller
+    );
+    assert_eq!(
+        fixture
+            .connection
+            .query_row(
+                "SELECT context_json FROM task_stage_context WHERE stage_run_id=?1",
+                [copy.current_stage_run_id.0],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        context
+    );
+    let (copied_processing, copied_assistant, raw): (i64, i64, String) = fixture.connection.query_row("SELECT p.id,p.assistant_message_id,p.result_json FROM response_processing p JOIN messages m ON m.id=p.assistant_message_id WHERE m.dialog_id=?1", [branch], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_ne!(copied_processing, processing);
+    assert_ne!(copied_assistant, assistant);
+    let ProcessingResult::Transition {
+        transition_id,
+        input_message_id,
+        workflow_input_id,
+        target_state,
+    } = serde_json::from_str(&raw).unwrap()
+    else {
+        panic!("transition result")
+    };
+    assert_eq!(target_state, copy);
+    assert_eq!(Some(transition_id), copy.incoming_handoff_id);
+    assert_ne!(input_message_id, original.input_message_id);
+    let linked: (i64, i64, i64, i64) = fixture.connection.query_row("SELECT i.message_id,i.processing_id,i.triggering_assistant_message_id,i.dialog_id FROM workflow_inputs i WHERE i.id=?1", [workflow_input_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(
+        linked,
+        (
+            input_message_id,
+            copied_processing,
+            copied_assistant,
+            branch
+        )
+    );
+    let old_stage: i64 = fixture
+        .connection
+        .query_row(
+            "SELECT from_stage_run_id FROM task_transitions WHERE id=?1",
+            [transition_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut copy_source = source.clone();
+    copy_source.id = copy.id;
+    copy_source.dialog_id = branch;
+    copy_source.current_stage_run_id = StageRunId(old_stage);
+    let mut copy_input = input.clone();
+    if let WorkflowInputSource::Controller {
+        triggering_assistant_message_id,
+        ..
+    } = &mut copy_input.source
+    {
+        *triggering_assistant_message_id = copied_assistant;
+    }
+    let mut replay = transition_command(&copy_source, &copy_input, &auth, &payload);
+    replay.processing_id = Some(copied_processing);
+    assert_eq!(
+        fixture
+            .store
+            .commit_stage_change(replay)
+            .unwrap()
+            .target_state,
+        copy
+    );
+    let replan = WorkflowInput {
+        source: WorkflowInputSource::Human,
+        intent: WorkflowIntent::ReplanCurrent {
+            change_request: "Branch only".into(),
+        },
+    };
+    let replan_auth = authorize(&copy, &replan, None);
+    fixture
+        .store
+        .commit_stage_change(transition_command(&copy, &replan, &replan_auth, &payload))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        original.target_state
+    );
+    assert!(
+        !fixture
+            .connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap()
+    );
+}
+
+#[test]
+fn workflow_branch_failure_rolls_back_dialog_and_every_workflow_copy() {
+    for table in [
+        "workflow_tasks",
+        "task_stage_runs",
+        "message_task_stages",
+        "response_processing",
+        "workflow_inputs",
+        "task_transitions",
+        "task_stage_context",
+        "dialog_workflow_state",
+    ] {
+        let (mut fixture, _, _) = pending_fixture();
+        let source = fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap();
+        let input = transition_input(TransitionEvent::PlanningCompleted);
+        let auth = authorize(&source, &input, None);
+        fixture
+            .store
+            .commit_stage_change(transition_command(&source, &input, &auth, &handoff()))
+            .unwrap();
+        let tables = [
+            "dialogs",
+            "messages",
+            "dialog_branches",
+            "workflow_tasks",
+            "task_stage_runs",
+            "message_task_stages",
+            "response_processing",
+            "workflow_inputs",
+            "task_transitions",
+            "task_stage_context",
+            "dialog_workflow_state",
+        ];
+        let counts: Vec<_> = tables
+            .iter()
+            .map(|t| count(&fixture.connection, t))
+            .collect();
+        fixture.connection.execute_batch(&format!("CREATE TRIGGER fail BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'injected'); END;")).unwrap();
+        assert!(fixture.store.fork_dialog(1, 3).is_err(), "{table}");
+        for (t, expected) in tables.iter().zip(counts) {
+            assert_eq!(count(&fixture.connection, t), expected, "{table}: {t}");
+        }
+    }
+}
+
+#[test]
+fn transition_failure_at_every_write_rolls_back_all_effects() {
+    for (table, operation) in [
+        ("messages", "INSERT"),
+        ("workflow_inputs", "INSERT"),
+        ("task_stage_runs", "UPDATE"),
+        ("task_stage_runs", "INSERT"),
+        ("task_transitions", "INSERT"),
+        ("message_task_stages", "INSERT"),
+        ("workflow_tasks", "UPDATE"),
+        ("dialog_workflow_state", "UPDATE"),
+        ("task_stage_context", "INSERT"),
+        ("dialogs", "UPDATE"),
+    ] {
+        let mut fixture = Fixture::new();
+        let source = fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap();
+        let input = transition_input(TransitionEvent::PlanningCompleted);
+        let auth = authorize(&source, &input, None);
+        fixture.connection.execute_batch(&format!("CREATE TRIGGER fail BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, 'injected'); END;")).unwrap();
+        assert!(
+            fixture
+                .store
+                .commit_stage_change(transition_command(&source, &input, &auth, &handoff()))
+                .is_err(),
+            "{table} {operation}"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .load_workflow(1)
+                .unwrap()
+                .current_task
+                .unwrap(),
+            source
+        );
+        for (checked, expected) in [
+            ("messages", 1),
+            ("workflow_inputs", 0),
+            ("task_stage_runs", 1),
+            ("task_transitions", 0),
+            ("task_stage_context", 0),
+            ("message_task_stages", 1),
+        ] {
+            assert_eq!(
+                count(&fixture.connection, checked),
+                expected,
+                "{table} {operation}: {checked}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ignored_transition_writes_cannot_commit_partial_state() {
+    for (table, operation) in [
+        ("messages", "INSERT"),
+        ("workflow_inputs", "INSERT"),
+        ("task_stage_runs", "UPDATE"),
+        ("task_stage_runs", "INSERT"),
+        ("task_transitions", "INSERT"),
+        ("message_task_stages", "INSERT"),
+        ("workflow_tasks", "UPDATE"),
+        ("dialog_workflow_state", "UPDATE"),
+        ("task_stage_context", "INSERT"),
+        ("dialogs", "UPDATE"),
+    ] {
+        let mut fixture = Fixture::new();
+        let source = fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap();
+        let input = transition_input(TransitionEvent::PlanningCompleted);
+        let auth = authorize(&source, &input, None);
+        fixture.connection.execute_batch(&format!("CREATE TRIGGER ignore_write BEFORE {operation} ON {table} BEGIN SELECT RAISE(IGNORE); END;")).unwrap();
+        assert!(
+            fixture
+                .store
+                .commit_stage_change(transition_command(&source, &input, &auth, &handoff()))
+                .is_err(),
+            "{table} {operation}"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .load_workflow(1)
+                .unwrap()
+                .current_task
+                .unwrap(),
+            source
+        );
+        assert_eq!(count(&fixture.connection, "messages"), 1);
+        assert_eq!(count(&fixture.connection, "task_transitions"), 0);
+    }
+}
+
+#[test]
+fn ignored_branch_mapping_context_or_pointer_rolls_back_copy() {
+    for table in [
+        "task_stage_context",
+        "message_task_stages",
+        "dialog_workflow_state",
+    ] {
+        let mut fixture = Fixture::new();
+        let source = fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap();
+        let input = transition_input(TransitionEvent::PlanningCompleted);
+        let auth = authorize(&source, &input, None);
+        fixture
+            .store
+            .commit_stage_change(transition_command(&source, &input, &auth, &handoff()))
+            .unwrap();
+        fixture.connection.execute_batch(&format!("CREATE TRIGGER ignore_write BEFORE INSERT ON {table} BEGIN SELECT RAISE(IGNORE); END;")).unwrap();
+        assert!(fixture.store.fork_dialog(1, 2).is_err(), "{table}");
+        assert_eq!(count(&fixture.connection, "dialogs"), 1);
+    }
+}
+
+#[test]
+fn terminal_done_stage_rejects_work_and_allows_only_next_human_task() {
+    let mut fixture = Fixture::new();
+    fixture.connection.execute_batch("UPDATE workflow_tasks SET phase='validation',status='active'; UPDATE task_stage_runs SET phase='validation';").unwrap();
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    for status in ["active", "paused"] {
+        fixture
+            .connection
+            .execute("UPDATE workflow_tasks SET status=?1", [status])
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .create_task_with_human_input(
+                    1,
+                    "next",
+                    "next",
+                    ExpectedCurrentTask::Present {
+                        task_id: source.id,
+                        version: 3
+                    }
+                )
+                .is_err()
+        );
+    }
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let input = transition_input(TransitionEvent::ValidationPassed);
+    let auth = authorize(&source, &input, None);
+    let done = fixture
+        .store
+        .commit_stage_change(transition_command(&source, &input, &auth, &handoff()))
+        .unwrap()
+        .target_state;
+    assert_eq!(
+        (done.phase, done.status, done.current_stage_sequence),
+        (TaskPhase::Done, TaskStatus::Active, 2)
+    );
+    assert_eq!(
+        fixture
+            .connection
+            .query_row(
+                "SELECT phase FROM task_stage_runs WHERE id=?1",
+                [done.current_stage_run_id.0],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "done"
+    );
+    assert!(
+        fixture
+            .store
+            .append_answer_for_processing(AnswerCommit {
+                dialog_id: 1,
+                task_id: done.id,
+                stage_run_id: done.current_stage_run_id,
+                expected_version: done.version,
+                content: "must not work",
+                usage: None
+            })
+            .is_err()
+    );
+    let controller = WorkflowInput {
+        source: WorkflowInputSource::Controller {
+            checker: "continuation".into(),
+            model: "checker".into(),
+            triggering_assistant_message_id: 1,
+        },
+        intent: WorkflowIntent::StartNewTask {
+            goal: "forbidden".into(),
+        },
+    };
+    assert!(
+        fixture
+            .store
+            .append_input(
+                InputCommit {
+                    dialog_id: 1,
+                    input: &controller,
+                    protocol_text: "forbidden",
+                    confidence: Some(1.0),
+                    expected_current_task: ExpectedCurrentTask::Present {
+                        task_id: done.id,
+                        version: done.version
+                    }
+                },
+                AcceptedInputEffect::ContinueSameStage
+            )
+            .is_err()
+    );
+    let next = fixture
+        .store
+        .create_task_with_human_input(
+            1,
+            "next",
+            "next",
+            ExpectedCurrentTask::Present {
+                task_id: done.id,
+                version: done.version,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (next.task.ordinal, next.task.phase),
+        (2, TaskPhase::Planning)
+    );
+    assert_ne!(next.task.id, done.id);
+    let branch = fixture.store.fork_dialog(1, 3).unwrap().new_dialog_id;
+    assert_eq!(
+        fixture
+            .connection
+            .query_row(
+                "SELECT count(*) FROM workflow_tasks WHERE dialog_id=?1",
+                [branch],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(branch)
+            .unwrap()
+            .current_task
+            .unwrap()
+            .ordinal,
+        2
+    );
+    assert!(
+        !fixture
+            .connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap()
+    );
+}
+
+#[test]
+fn controller_transition_failure_preserves_leased_answer_patch_and_source() {
+    for operation in ["ABORT, 'injected'", "IGNORE"] {
+        let (mut fixture, processing, assistant) = pending_fixture();
+        fixture
+            .store
+            .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+            .unwrap();
+        let source = fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap();
+        let mut input = transition_input(TransitionEvent::PlanningCompleted);
+        input.source = WorkflowInputSource::Controller {
+            checker: "continuation".into(),
+            model: "checker-model".into(),
+            triggering_assistant_message_id: assistant,
+        };
+        let auth = authorize(&source, &input, None);
+        let patch = patch(3);
+        let payload = handoff();
+        fixture.connection.execute_batch(&format!("CREATE TRIGGER fail_completion BEFORE UPDATE ON response_processing BEGIN SELECT RAISE({operation}); END;")).unwrap();
+        let mut command = transition_command(&source, &input, &auth, &payload);
+        command.accepted_patch = Some(&patch);
+        command.processing_id = Some(processing);
+        assert!(fixture.store.commit_stage_change(command).is_err());
+        assert_eq!(
+            fixture
+                .store
+                .load_workflow(1)
+                .unwrap()
+                .current_task
+                .unwrap(),
+            source
+        );
+        assert_eq!(
+            fixture.store.load_pending_processing(1).unwrap()[0].status,
+            ProcessingStatus::Processing
+        );
+        assert_eq!(count(&fixture.connection, "messages"), 2);
+        assert_eq!(count(&fixture.connection, "task_transitions"), 0);
+        assert_eq!(count(&fixture.connection, "task_stage_runs"), 1);
+        assert_eq!(count(&fixture.connection, "workflow_inputs"), 0);
+    }
+}
+
+#[test]
+fn controller_transition_rejects_forged_provenance_and_stale_processing() {
+    let (mut fixture, processing, assistant) = pending_fixture();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let input = transition_input(TransitionEvent::PlanningCompleted);
+    let auth = authorize(&source, &input, None);
+    let payload = handoff();
+    for corruption in 0..7 {
+        let mut input = input.clone();
+        input.source = WorkflowInputSource::Controller {
+            checker: if corruption == 0 {
+                "wrong"
+            } else {
+                "continuation"
+            }
+            .into(),
+            model: if corruption == 1 {
+                " "
+            } else {
+                "checker-model"
+            }
+            .into(),
+            triggering_assistant_message_id: if corruption == 2 { 1 } else { assistant },
+        };
+        let mut command = transition_command(&source, &input, &auth, &payload);
+        command.processing_id = if corruption == 3 {
+            None
+        } else {
+            Some(processing)
+        };
+        if corruption == 4 {
+            command.confidence = Some(f32::NAN);
+        }
+        if corruption == 5 {
+            command.protocol_text = " ";
+        }
+        if corruption == 6 {
+            fixture
+                .connection
+                .execute("UPDATE workflow_tasks SET version=4", [])
+                .unwrap();
+        }
+        assert!(
+            fixture.store.commit_stage_change(command).is_err(),
+            "case {corruption}"
+        );
+    }
+    assert_eq!(count(&fixture.connection, "messages"), 2);
+    assert_eq!(count(&fixture.connection, "task_transitions"), 0);
+}
+
+#[test]
+fn branch_remaps_same_stage_controller_result_and_pending_processing_independently() {
+    let (mut fixture, processing, assistant) = pending_fixture();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    let intent = WorkflowIntent::human_continue("Do next").unwrap();
+    let accepted_patch = patch(3);
+    fixture
+        .store
+        .commit_controller_decision(controller_command(
+            processing,
+            assistant,
+            &intent,
+            &accepted_patch,
+        ))
+        .unwrap();
+    let answer = fixture
+        .store
+        .append_answer_for_processing(answer_command(4))
+        .unwrap();
+    let branch = fixture.store.fork_dialog(1, 4).unwrap().new_dialog_id;
+    let copy = fixture
+        .store
+        .load_workflow(branch)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let pending = fixture.store.load_pending_processing(branch).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_ne!(pending[0].id, answer.processing_id);
+    assert_ne!(pending[0].assistant_message_id, answer.message_id);
+    let (copy_processing,copy_assistant,raw):(i64,i64,String)=fixture.connection.query_row("SELECT p.id,p.assistant_message_id,p.result_json FROM response_processing p JOIN messages m ON m.id=p.assistant_message_id WHERE m.dialog_id=?1 AND p.status='completed'",[branch],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    let mut replay = controller_command(copy_processing, copy_assistant, &intent, &accepted_patch);
+    replay.task_id = copy.id;
+    replay.stage_run_id = copy.current_stage_run_id;
+    assert_eq!(
+        fixture.store.commit_controller_decision(replay).unwrap(),
+        serde_json::from_str::<ProcessingResult>(&raw).unwrap()
+    );
+    fixture
+        .store
+        .lease_processing(pending[0].id, 4, ProcessingLeaseMode::Normal)
+        .unwrap();
+    fixture
+        .store
+        .commit_await_user(
+            pending[0].id,
+            copy.id,
+            copy.current_stage_run_id,
+            4,
+            &patch(4),
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap()
+            .version,
+        4
+    );
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(branch)
+            .unwrap()
+            .current_task
+            .unwrap()
+            .version,
+        5
+    );
+    assert_eq!(
+        fixture.store.load_pending_processing(1).unwrap()[0].status,
+        ProcessingStatus::Pending
+    );
+    assert!(
+        !fixture
+            .connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap()
+    );
+}
+
+#[test]
+fn patch_and_transition_increment_version_once_and_complete_processing() {
+    let (mut fixture, processing, assistant) = pending_fixture();
+    fixture.connection.execute_batch("UPDATE workflow_tasks SET phase='execution'; UPDATE task_stage_runs SET phase='execution';").unwrap();
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    let mut input = transition_input(TransitionEvent::ExecutionCompleted);
+    input.source = WorkflowInputSource::Controller {
+        checker: "continuation".into(),
+        model: "checker-model".into(),
+        triggering_assistant_message_id: assistant,
+    };
+    let mut patch = patch(3);
+    patch.step_updates.push(StepStatusUpdate {
+        step_id: "design".into(),
+        status: PlanStepStatus::Completed,
+        evidence: vec!["Implementation saved".into()],
+    });
+    let auth = authorize(&source, &input, Some(&patch));
+    let payload = handoff();
+    let mut command = transition_command(&source, &input, &auth, &payload);
+    command.processing_id = Some(processing);
+    command.accepted_patch = Some(&patch);
+    let result = fixture.store.commit_stage_change(command).unwrap();
+    assert_eq!(
+        (result.target_state.phase, result.target_state.version),
+        (TaskPhase::Validation, 4)
+    );
+    assert_eq!(
+        result.target_state.plan.steps[0].status,
+        PlanStepStatus::Completed
+    );
+    assert_eq!(fixture.store.load(1).unwrap().messages.len(), 2);
+    assert_eq!(
+        fixture
+            .store
+            .load_stage_messages(result.target_state.current_stage_run_id)
+            .unwrap()[0]
+            .source,
+        ProtocolSource::Controller
+    );
+    assert_eq!(
+        fixture
+            .connection
+            .query_row(
+                "SELECT status FROM response_processing WHERE id=?1",
+                [processing],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "completed"
+    );
+    let mut command = transition_command(&source, &input, &auth, &payload);
+    command.processing_id = Some(processing);
+    command.accepted_patch = Some(&patch);
+    assert_eq!(fixture.store.commit_stage_change(command).unwrap(), result);
+    assert_eq!(count(&fixture.connection, "task_transitions"), 1);
+    assert_eq!(count(&fixture.connection, "messages"), 3);
+}
 
 fn patch(version: u64) -> TaskStatePatch {
     TaskStatePatch {

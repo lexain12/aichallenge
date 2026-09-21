@@ -492,7 +492,7 @@ impl DialogStore {
         }
         let source_messages = {
             let mut statement = tx.prepare(
-                "SELECT m.role, m.content, m.created_at, u.usage_json
+                "SELECT m.role, m.content, m.created_at, u.usage_json, m.id
                  FROM messages m
                  LEFT JOIN message_usage u ON u.message_id = m.id
                  WHERE m.dialog_id = ?1 ORDER BY m.id",
@@ -504,18 +504,21 @@ impl DialogStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut last_message_id = 0;
-        for (role, content, created_at, usage_json) in source_messages {
+        let mut message_id_map = BTreeMap::new();
+        for (role, content, created_at, usage_json, old_message_id) in source_messages {
             tx.execute(
                 "INSERT INTO messages (dialog_id, role, content, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![new_dialog_id, role, content, created_at],
             )?;
             last_message_id = tx.last_insert_rowid();
+            message_id_map.insert(old_message_id, last_message_id);
             if let Some(usage_json) = usage_json {
                 tx.execute(
                     "INSERT INTO message_usage (message_id, usage_json) VALUES (?1, ?2)",
@@ -523,6 +526,7 @@ impl DialogStore {
                 )?;
             }
         }
+        crate::workflow_store::copy_workflow_branch(&tx, id, new_dialog_id, &message_id_map)?;
         tx.execute(
             "UPDATE dialogs SET last_message_id = ?1 WHERE id = ?2",
             params![last_message_id, new_dialog_id],
@@ -702,7 +706,18 @@ impl DialogStore {
                 },
             )
             .optional()?;
-        let branch = decode_branch(id, stored_branch, messages.len())?;
+        // Fork checkpoints include hidden protocol messages, unlike transcript replay.
+        let protocol_count: i64 = tx.query_row(
+            "SELECT count(*) FROM messages WHERE dialog_id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        let branch = decode_branch(
+            id,
+            stored_branch,
+            usize::try_from(protocol_count)
+                .map_err(|_| StoreError::InvalidBranch("invalid protocol count"))?,
+        )?;
         tx.commit()?;
         Ok(StoredDialog {
             id,
