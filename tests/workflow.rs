@@ -1,8 +1,8 @@
 use deepseek_cli::workflow::{
-    PatchContext, PlanAppend, PlanStep, PlanStepStatus, StageCheckpoint, StageRunId, StateMachine,
-    StepStatusUpdate, TaskPhase, TaskPlan, TaskStatePatch, TaskStatus, TransitionEvent,
-    WorkflowError, WorkflowInputSource, WorkflowIntent, WorkflowTaskId, WorkflowTaskState,
-    render_task_state,
+    MAX_ACCEPTANCE_CRITERIA, MAX_ACCEPTANCE_CRITERION_CHARS, PatchContext, PlanAppend, PlanStep,
+    PlanStepStatus, StageCheckpoint, StageRunId, StateMachine, StepStatusUpdate, TaskPhase,
+    TaskPlan, TaskStatePatch, TaskStatus, TransitionEvent, WorkflowError, WorkflowInputSource,
+    WorkflowIntent, WorkflowTaskId, WorkflowTaskState, render_task_state,
 };
 
 fn state(phase: TaskPhase) -> WorkflowTaskState {
@@ -55,46 +55,54 @@ fn done_state() -> WorkflowTaskState {
     state(TaskPhase::Done)
 }
 
-#[test]
-fn only_declared_phase_transitions_have_targets() {
-    let cases = [
-        (
-            TaskPhase::Planning,
-            TransitionEvent::PlanningCompleted,
-            TaskPhase::Execution,
-        ),
-        (
-            TaskPhase::Execution,
-            TransitionEvent::ExecutionCompleted,
-            TaskPhase::Validation,
-        ),
-        (
-            TaskPhase::Validation,
-            TransitionEvent::ValidationPassed,
-            TaskPhase::Done,
-        ),
-        (
-            TaskPhase::Validation,
-            TransitionEvent::ValidationFailed,
-            TaskPhase::Execution,
-        ),
-    ];
-    for (from, event, to) in cases {
-        assert_eq!(
-            deepseek_cli::workflow::target_phase(from, event).unwrap(),
-            to
-        );
+fn empty_patch(expected_version: u64) -> TaskStatePatch {
+    TaskStatePatch {
+        expected_version,
+        plan_append: PlanAppend::default(),
+        step_updates: vec![],
+        current_step_id: None,
+        expected_action: None,
+        checkpoint: None,
     }
-    for (from, event) in [
-        (TaskPhase::Planning, TransitionEvent::ExecutionCompleted),
-        (TaskPhase::Planning, TransitionEvent::ValidationPassed),
-        (TaskPhase::Execution, TransitionEvent::ValidationPassed),
-        (TaskPhase::Done, TransitionEvent::PlanningCompleted),
-    ] {
-        assert!(matches!(
-            deepseek_cli::workflow::target_phase(from, event),
-            Err(WorkflowError::IllegalTransition { .. })
-        ));
+}
+
+#[test]
+fn phase_transition_matrix_is_exhaustive() {
+    let phases = [
+        TaskPhase::Planning,
+        TaskPhase::Execution,
+        TaskPhase::Validation,
+        TaskPhase::Done,
+    ];
+    let events = [
+        TransitionEvent::PlanningCompleted,
+        TransitionEvent::ExecutionCompleted,
+        TransitionEvent::ValidationPassed,
+        TransitionEvent::ValidationFailed,
+    ];
+    for from in phases {
+        for event in events {
+            let expected = match (from, event) {
+                (TaskPhase::Planning, TransitionEvent::PlanningCompleted) => {
+                    Some(TaskPhase::Execution)
+                }
+                (TaskPhase::Execution, TransitionEvent::ExecutionCompleted) => {
+                    Some(TaskPhase::Validation)
+                }
+                (TaskPhase::Validation, TransitionEvent::ValidationPassed) => Some(TaskPhase::Done),
+                (TaskPhase::Validation, TransitionEvent::ValidationFailed) => {
+                    Some(TaskPhase::Execution)
+                }
+                _ => None,
+            };
+            match expected {
+                Some(to) => assert_eq!(deepseek_cli::workflow::target_phase(from, event), Ok(to)),
+                None => assert!(matches!(
+                    deepseek_cli::workflow::target_phase(from, event),
+                    Err(WorkflowError::IllegalTransition { .. })
+                )),
+            }
+        }
     }
 }
 
@@ -112,9 +120,13 @@ fn transition_authorization_enforces_phase_specific_guards() {
             steps: vec![],
             acceptance_criteria: vec![],
         },
+        current_step_id: None,
         ..planning.clone()
     };
-    assert!(StateMachine::authorize(&empty_plan, TransitionEvent::PlanningCompleted, &[]).is_err());
+    assert_eq!(
+        StateMachine::authorize(&empty_plan, TransitionEvent::PlanningCompleted, &[]),
+        Err(WorkflowError::PlanningRequirementsIncomplete)
+    );
 
     assert!(
         StateMachine::authorize(
@@ -147,7 +159,7 @@ fn transition_authorization_enforces_phase_specific_guards() {
         StateMachine::authorize(
             &validation,
             TransitionEvent::ValidationPassed,
-            &["focused tests pass".into()],
+            &["focused tests pass => observed".into()],
         )
         .is_ok()
     );
@@ -183,20 +195,29 @@ fn source_status_and_dialog_guards_are_local_and_exhaustive() {
 
 #[test]
 fn only_humans_can_authorize_a_replan_from_every_phase() {
+    for phase in [
+        TaskPhase::Planning,
+        TaskPhase::Execution,
+        TaskPhase::Validation,
+        TaskPhase::Done,
+    ] {
+        let task = state(phase);
+        let authorization = StateMachine::authorize_replan(
+            &task,
+            &WorkflowInputSource::Human,
+            "Support the repaired deployment".into(),
+        )
+        .unwrap();
+        assert_eq!(authorization.from_phase, phase);
+        assert_eq!(authorization.to_phase, TaskPhase::Planning);
+        assert_eq!(authorization.source_version, task.version);
+        assert_eq!(authorization.next_plan_revision, task.plan.revision + 1);
+        assert_eq!(
+            authorization.change_request,
+            "Support the repaired deployment"
+        );
+    }
     let done = done_state();
-    let authorization = StateMachine::authorize_replan(
-        &done,
-        &WorkflowInputSource::Human,
-        "Support the repaired deployment".into(),
-    )
-    .unwrap();
-    assert_eq!(authorization.from_phase, TaskPhase::Done);
-    assert_eq!(authorization.to_phase, TaskPhase::Planning);
-    assert_eq!(authorization.next_plan_revision, 1);
-    assert_eq!(
-        authorization.change_request,
-        "Support the repaired deployment"
-    );
     assert!(
         StateMachine::authorize_replan(
             &done,
@@ -209,6 +230,12 @@ fn only_humans_can_authorize_a_replan_from_every_phase() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn pause_then_resume_preserves_every_other_state_field() {
+    let active = state(TaskPhase::Validation);
+    assert_eq!(active.clone().pause().unwrap().resume().unwrap(), active);
 }
 
 #[test]
@@ -307,6 +334,159 @@ fn patches_are_versioned_monotonic_and_context_guarded() {
                 PatchContext::Normal,
             )
             .is_err()
+    );
+}
+
+#[test]
+fn patch_rejects_completed_appends_and_duplicate_or_unknown_step_references() {
+    let planning = state(TaskPhase::Planning);
+    let completed_append = TaskStatePatch {
+        plan_append: PlanAppend {
+            steps: vec![PlanStep {
+                id: "evidence-bypass".into(),
+                description: "Must not begin complete".into(),
+                status: PlanStepStatus::Completed,
+            }],
+            acceptance_criteria: vec![],
+        },
+        ..empty_patch(planning.version)
+    };
+    assert!(matches!(
+        planning.preview_patch(&completed_append, PatchContext::Normal),
+        Err(WorkflowError::AppendedStepMustStartPending(id)) if id == "evidence-bypass"
+    ));
+
+    let duplicate_updates = TaskStatePatch {
+        step_updates: vec![
+            StepStatusUpdate {
+                step_id: "implement".into(),
+                status: PlanStepStatus::InProgress,
+                evidence: vec![],
+            },
+            StepStatusUpdate {
+                step_id: "implement".into(),
+                status: PlanStepStatus::Blocked,
+                evidence: vec![],
+            },
+        ],
+        ..empty_patch(planning.version)
+    };
+    assert_eq!(
+        planning.preview_patch(&duplicate_updates, PatchContext::Normal),
+        Err(WorkflowError::DuplicateStepUpdate("implement".into()))
+    );
+
+    let unknown_update = TaskStatePatch {
+        step_updates: vec![StepStatusUpdate {
+            step_id: "missing".into(),
+            status: PlanStepStatus::InProgress,
+            evidence: vec![],
+        }],
+        ..empty_patch(planning.version)
+    };
+    assert_eq!(
+        planning.preview_patch(&unknown_update, PatchContext::Normal),
+        Err(WorkflowError::UnknownStepId("missing".into()))
+    );
+
+    let trimmed_duplicate_criterion = TaskStatePatch {
+        plan_append: PlanAppend {
+            steps: vec![],
+            acceptance_criteria: vec![" focused tests pass ".into()],
+        },
+        ..empty_patch(planning.version)
+    };
+    assert_eq!(
+        planning.preview_patch(&trimmed_duplicate_criterion, PatchContext::Normal),
+        Err(WorkflowError::DuplicateAcceptanceCriterion(
+            " focused tests pass ".into()
+        ))
+    );
+}
+
+#[test]
+fn validation_evidence_covers_the_maximum_criteria_without_ambiguity() {
+    let mut validation = state(TaskPhase::Validation);
+    let criteria: Vec<_> = (0..MAX_ACCEPTANCE_CRITERIA)
+        .map(|index| {
+            format!(
+                "{index:02}-{}",
+                "x".repeat(MAX_ACCEPTANCE_CRITERION_CHARS - 3)
+            )
+        })
+        .collect();
+    validation.plan.acceptance_criteria = criteria.clone();
+    let evidence: Vec<_> = criteria
+        .iter()
+        .map(|criterion| format!("  {criterion} => observed result  "))
+        .collect();
+    assert!(
+        StateMachine::authorize(&validation, TransitionEvent::ValidationPassed, &evidence,).is_ok()
+    );
+
+    validation.plan.acceptance_criteria = (0..(MAX_ACCEPTANCE_CRITERIA + 1))
+        .map(|index| format!("criterion-{index}"))
+        .collect();
+    assert!(matches!(
+        validation.validate(),
+        Err(WorkflowError::TooManyItems {
+            field: "acceptance criteria",
+            ..
+        })
+    ));
+
+    validation.plan.acceptance_criteria = vec!["x".repeat(MAX_ACCEPTANCE_CRITERION_CHARS + 1)];
+    assert!(matches!(
+        validation.validate(),
+        Err(WorkflowError::StringTooLong {
+            field: "acceptance criterion",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn validation_pass_rejects_missing_duplicate_malformed_and_blank_result_coverage() {
+    let validation = state(TaskPhase::Validation);
+    let cases = [
+        (vec![], WorkflowError::ValidationEvidenceRequired),
+        (
+            vec![
+                "focused tests pass => observed".into(),
+                "focused tests pass => again".into(),
+            ],
+            WorkflowError::DuplicateCriterionCoverage("focused tests pass".into()),
+        ),
+        (
+            vec!["focused tests pass observed".into()],
+            WorkflowError::MalformedValidationEvidence("focused tests pass observed".into()),
+        ),
+        (
+            vec!["focused tests pass =>   ".into()],
+            WorkflowError::MalformedValidationEvidence("focused tests pass =>".into()),
+        ),
+    ];
+    for (evidence, expected) in cases {
+        assert_eq!(
+            StateMachine::authorize(&validation, TransitionEvent::ValidationPassed, &evidence),
+            Err(expected)
+        );
+    }
+
+    let mut two_criteria = validation;
+    two_criteria
+        .plan
+        .acceptance_criteria
+        .push("second criterion".into());
+    assert_eq!(
+        StateMachine::authorize(
+            &two_criteria,
+            TransitionEvent::ValidationPassed,
+            &["focused tests pass => observed".into()],
+        ),
+        Err(WorkflowError::MissingCriterionCoverage(
+            "second criterion".into()
+        ))
     );
 }
 

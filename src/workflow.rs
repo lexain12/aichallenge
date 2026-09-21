@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_WORKFLOW_TEXT_CHARS: usize = 8_192;
 pub const MAX_PLAN_STEPS: usize = 256;
-pub const MAX_ACCEPTANCE_CRITERIA: usize = 128;
+pub const MAX_ACCEPTANCE_CRITERIA: usize = 32;
+pub const MAX_ACCEPTANCE_CRITERION_CHARS: usize = 1_024;
 pub const MAX_CHECKPOINT_ITEMS: usize = 128;
 pub const MAX_EVIDENCE_ITEMS: usize = 32;
 pub const MAX_EVIDENCE_ITEM_CHARS: usize = 2_048;
@@ -248,6 +249,9 @@ impl WorkflowTaskState {
             .collect();
         for step in &append.steps {
             step.validate()?;
+            if step.status != PlanStepStatus::Pending {
+                return Err(WorkflowError::AppendedStepMustStartPending(step.id.clone()));
+            }
             if !step_ids.insert(step.id.as_str()) {
                 return Err(WorkflowError::DuplicateStepId(step.id.clone()));
             }
@@ -263,11 +267,11 @@ impl WorkflowTaskState {
             .plan
             .acceptance_criteria
             .iter()
-            .map(String::as_str)
+            .map(|criterion| criterion.trim())
             .collect();
         for criterion in &append.acceptance_criteria {
-            validate_required_text(criterion, "acceptance criterion", MAX_WORKFLOW_TEXT_CHARS)?;
-            if !criteria.insert(criterion.as_str()) {
+            validate_acceptance_criterion(criterion)?;
+            if !criteria.insert(criterion.trim()) {
                 return Err(WorkflowError::DuplicateAcceptanceCriterion(
                     criterion.clone(),
                 ));
@@ -341,8 +345,8 @@ impl TaskPlan {
         }
         let mut criteria = HashSet::new();
         for criterion in &self.acceptance_criteria {
-            validate_required_text(criterion, "acceptance criterion", MAX_WORKFLOW_TEXT_CHARS)?;
-            if !criteria.insert(criterion.as_str()) {
+            validate_acceptance_criterion(criterion)?;
+            if !criteria.insert(criterion.trim()) {
                 return Err(WorkflowError::DuplicateAcceptanceCriterion(
                     criterion.clone(),
                 ));
@@ -566,12 +570,8 @@ impl StateMachine {
             }
             TransitionEvent::ValidationPassed | TransitionEvent::ValidationFailed => {
                 validate_evidence(evidence, true)?;
-                if event == TransitionEvent::ValidationPassed
-                    && state.plan.acceptance_criteria.iter().any(|criterion| {
-                        !evidence.iter().any(|item| item.trim() == criterion.trim())
-                    })
-                {
-                    return Err(WorkflowError::AcceptanceCriteriaNotMet);
+                if event == TransitionEvent::ValidationPassed {
+                    validate_criterion_coverage(&state.plan.acceptance_criteria, evidence)?;
                 }
             }
         }
@@ -666,7 +666,7 @@ impl TaskStatePatch {
             step.validate()?;
         }
         for criterion in &self.plan_append.acceptance_criteria {
-            validate_required_text(criterion, "acceptance criterion", MAX_WORKFLOW_TEXT_CHARS)?;
+            validate_acceptance_criterion(criterion)?;
         }
         if let Some(current_step_id) = &self.current_step_id {
             validate_required_text(current_step_id, "current step id", MAX_WORKFLOW_TEXT_CHARS)?;
@@ -751,12 +751,16 @@ pub enum WorkflowError {
     DuplicateAcceptanceCriterion(String),
     DuplicateStepUpdate(String),
     UnknownStepId(String),
+    AppendedStepMustStartPending(String),
     CompletedStepImmutable(String),
     CompletionEvidenceRequired,
     PlanningRequirementsIncomplete,
     IncompletePlan,
     ValidationEvidenceRequired,
     AcceptanceCriteriaNotMet,
+    MissingCriterionCoverage(String),
+    DuplicateCriterionCoverage(String),
+    MalformedValidationEvidence(String),
     ControllerIntentForbidden {
         intent: &'static str,
     },
@@ -803,6 +807,9 @@ impl fmt::Display for WorkflowError {
             }
             Self::DuplicateStepUpdate(id) => write!(formatter, "duplicate update for step: {id}"),
             Self::UnknownStepId(id) => write!(formatter, "unknown plan step id: {id}"),
+            Self::AppendedStepMustStartPending(id) => {
+                write!(formatter, "appended plan step must start pending: {id}")
+            }
             Self::CompletedStepImmutable(id) => {
                 write!(formatter, "completed step cannot change: {id}")
             }
@@ -818,6 +825,21 @@ impl fmt::Display for WorkflowError {
             }
             Self::AcceptanceCriteriaNotMet => {
                 write!(formatter, "validation evidence misses acceptance criteria")
+            }
+            Self::MissingCriterionCoverage(criterion) => {
+                write!(
+                    formatter,
+                    "validation evidence misses criterion: {criterion}"
+                )
+            }
+            Self::DuplicateCriterionCoverage(criterion) => {
+                write!(
+                    formatter,
+                    "validation evidence repeats criterion: {criterion}"
+                )
+            }
+            Self::MalformedValidationEvidence(evidence) => {
+                write!(formatter, "malformed validation evidence: {evidence}")
             }
             Self::ControllerIntentForbidden { intent } => {
                 write!(formatter, "controller cannot submit {intent}")
@@ -892,6 +914,14 @@ fn validate_text_list(
     Ok(())
 }
 
+fn validate_acceptance_criterion(criterion: &str) -> Result<(), WorkflowError> {
+    validate_required_text(
+        criterion,
+        "acceptance criterion",
+        MAX_ACCEPTANCE_CRITERION_CHARS,
+    )
+}
+
 fn validate_evidence(evidence: &[String], required: bool) -> Result<(), WorkflowError> {
     if required && evidence.is_empty() {
         return Err(WorkflowError::ValidationEvidenceRequired);
@@ -907,6 +937,41 @@ fn validate_evidence(evidence: &[String], required: bool) -> Result<(), Workflow
     }
     if !required && evidence.is_empty() {
         return Ok(());
+    }
+    Ok(())
+}
+
+fn validate_criterion_coverage(
+    criteria: &[String],
+    evidence: &[String],
+) -> Result<(), WorkflowError> {
+    let mut covered = HashSet::new();
+    for item in evidence {
+        let item = item.trim();
+        let criterion = criteria
+            .iter()
+            .map(|criterion| criterion.trim())
+            .filter_map(|criterion| {
+                item.strip_prefix(criterion)
+                    .and_then(|remainder| remainder.strip_prefix(" => "))
+                    .filter(|result| !result.trim().is_empty())
+                    .map(|_| criterion)
+            })
+            .max_by_key(|criterion| criterion.chars().count())
+            .ok_or_else(|| WorkflowError::MalformedValidationEvidence(item.to_owned()))?;
+        if !covered.insert(criterion) {
+            return Err(WorkflowError::DuplicateCriterionCoverage(
+                criterion.to_owned(),
+            ));
+        }
+    }
+    for criterion in criteria {
+        let criterion = criterion.trim();
+        if !covered.contains(criterion) {
+            return Err(WorkflowError::MissingCriterionCoverage(
+                criterion.to_owned(),
+            ));
+        }
     }
     Ok(())
 }
