@@ -16,7 +16,7 @@ fn config(server: &MockServer) -> Config {
     let mut file = NamedTempFile::new().unwrap();
     write!(
         file,
-        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[context]\nstrategy = \"summary\"\n",
+        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[workflow]\nenabled = false\n[context]\nstrategy = \"summary\"\n",
         server.uri()
     )
     .unwrap();
@@ -31,7 +31,7 @@ fn compression_config(server: &MockServer, threshold: u64, keep: usize) -> Confi
     let mut file = NamedTempFile::new().unwrap();
     write!(
         file,
-        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[context]\nstrategy = \"summary\"\ncompact_after_prompt_tokens = {threshold}\nkeep_last_messages = {keep}\nsummary_max_tokens = 64\n",
+        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[workflow]\nenabled = false\n[context]\nstrategy = \"summary\"\ncompact_after_prompt_tokens = {threshold}\nkeep_last_messages = {keep}\nsummary_max_tokens = 64\n",
         server.uri(),
     )
     .unwrap();
@@ -42,7 +42,7 @@ fn sticky_config(server: &MockServer, keep: usize) -> Config {
     let mut file = NamedTempFile::new().unwrap();
     write!(
         file,
-        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[context]\nstrategy = \"sticky_facts\"\nkeep_last_messages = {keep}\nfacts_max_tokens = 64\n",
+        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[workflow]\nenabled = false\n[context]\nstrategy = \"sticky_facts\"\nkeep_last_messages = {keep}\nfacts_max_tokens = 64\n",
         server.uri(),
     )
     .unwrap();
@@ -53,7 +53,7 @@ fn branching_config(server: &MockServer) -> Config {
     let mut file = NamedTempFile::new().unwrap();
     write!(
         file,
-        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[context]\nstrategy = \"branching\"\n",
+        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Be concise.\"\n[workflow]\nenabled = false\n[context]\nstrategy = \"branching\"\n",
         server.uri(),
     )
     .unwrap();
@@ -443,7 +443,7 @@ async fn durable_memory_metadata_appears_only_in_ordinary_requests() {
     let log_path = directory.path().join("context.jsonl");
     let mut file = NamedTempFile::new().unwrap();
     write!(file,
-        "api_key = \"test-key\"\nbase_url = \"{}\"\n[context]\nstrategy = \"summary\"\ncompact_after_prompt_tokens = 3\nkeep_last_messages = 2\n[debug]\nlog_path = \"{}\"\nlog_payloads = false\n",
+        "api_key = \"test-key\"\nbase_url = \"{}\"\n[workflow]\nenabled = false\n[context]\nstrategy = \"summary\"\ncompact_after_prompt_tokens = 3\nkeep_last_messages = 2\n[debug]\nlog_path = \"{}\"\nlog_payloads = false\n",
         server.uri(), log_path.display(),
     ).unwrap();
     let mut agent = Agent::with_store(
@@ -696,7 +696,7 @@ async fn persists_input_before_answer_and_restores_original_system_and_messages(
     let mut changed = NamedTempFile::new().unwrap();
     write!(
         changed,
-        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Changed system\"\n[context]\nstrategy = \"summary\"\n",
+        "api_key = \"test-key\"\nbase_url = \"{}\"\nsystem_prompt = \"Changed system\"\n[workflow]\nenabled = false\n[context]\nstrategy = \"summary\"\n",
         server.uri()
     )
     .unwrap();
@@ -1184,7 +1184,7 @@ async fn resumed_retention_increase_keeps_the_previous_summary_in_compaction() {
     let log_path = directory.path().join("resumed.jsonl");
     let resumed_config = Config::from_toml(
         &format!(
-            "api_key = \"test-key\"\nbase_url = {:?}\n[context]\nstrategy = \"summary\"\ncompact_after_prompt_tokens = 3\nkeep_last_messages = 3\n[debug]\nlog_path = {:?}\n",
+            "api_key = \"test-key\"\nbase_url = {:?}\n[workflow]\nenabled = false\n[context]\nstrategy = \"summary\"\ncompact_after_prompt_tokens = 3\nkeep_last_messages = 3\n[debug]\nlog_path = {:?}\n",
             server.uri(), log_path.to_str().unwrap(),
         ),
         None,
@@ -1493,7 +1493,7 @@ async fn sticky_facts_writes_separate_debug_events_without_payloads() {
     let mut file = NamedTempFile::new().unwrap();
     write!(
         file,
-        "api_key = \"test-key\"\nbase_url = \"{}\"\n[context]\nstrategy = \"sticky_facts\"\n[debug]\nlog_path = \"{}\"\nlog_payloads = false\n",
+        "api_key = \"test-key\"\nbase_url = \"{}\"\n[workflow]\nenabled = false\n[context]\nstrategy = \"sticky_facts\"\n[debug]\nlog_path = \"{}\"\nlog_payloads = false\n",
         server.uri(),
         log_path.display(),
     )
@@ -1538,7 +1538,7 @@ async fn branch_creation_and_switch_are_recorded_in_debug_log() {
     let mut file = NamedTempFile::new().unwrap();
     write!(
         file,
-        "api_key = \"test-key\"\nbase_url = \"{}\"\n[context]\nstrategy = \"branching\"\n[debug]\nlog_path = \"{}\"\n",
+        "api_key = \"test-key\"\nbase_url = \"{}\"\n[workflow]\nenabled = false\n[context]\nstrategy = \"branching\"\n[debug]\nlog_path = \"{}\"\n",
         server.uri(),
         log_path.display(),
     )

@@ -998,6 +998,8 @@ fn to_i64(value: impl TryInto<i64>) -> Result<i64, StoreError> {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("workflow in dialog {0} changed in another session")]
+    WorkflowConflict(i64),
     #[error("invalid workflow state: {0}")]
     InvalidWorkflow(String),
     #[error("invalid token statistics: {0}")]
