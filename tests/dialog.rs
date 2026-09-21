@@ -360,6 +360,94 @@ fn fork_copies_checkpoint_state_and_branches_continue_independently() {
 }
 
 #[test]
+fn fork_rolls_back_when_any_required_copy_write_is_ignored() {
+    for (table, operation, condition) in [
+        ("dialogs", "INSERT", "1"),
+        ("dialog_scopes", "INSERT", "1"),
+        ("messages", "INSERT", "1"),
+        ("message_usage", "INSERT", "1"),
+        ("dialogs", "UPDATE", "1"),
+        ("dialog_context", "INSERT", "1"),
+        ("dialog_facts", "INSERT", "1"),
+        ("dialog_branches", "INSERT", "NEW.parent_dialog_id IS NULL"),
+        (
+            "dialog_branches",
+            "INSERT",
+            "NEW.parent_dialog_id IS NOT NULL",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ignored-fork.sqlite3");
+        let mut store = DialogStore::open(&path).unwrap();
+        let id = store.start_dialog("System", "question").unwrap();
+        let usage = TokenUsage {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            total_tokens: 5,
+            completion_tokens_details: None,
+        };
+        store.append_answer(id, 1, "answer", Some(usage)).unwrap();
+        store
+            .replace_context(id, 2, ContextSummary::new("summary", 1), Some(usage))
+            .unwrap();
+        store
+            .replace_facts(
+                id,
+                2,
+                Facts::from([("goal".into(), "test".into())]),
+                Some(usage),
+            )
+            .unwrap();
+        let before = store.load(id).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(&format!("CREATE TRIGGER ignore_copy BEFORE {operation} ON {table} WHEN {condition} BEGIN SELECT RAISE(IGNORE); END;")).unwrap();
+        assert!(
+            store.fork_dialog(id, 2).is_err(),
+            "{table} {operation} {condition}"
+        );
+        assert_eq!(store.list().unwrap().len(), 1);
+        let after = store.load(id).unwrap();
+        assert_eq!(after.messages, before.messages);
+        assert_eq!(after.context, before.context);
+        assert_eq!(after.facts, before.facts);
+        assert!(after.branch.is_none());
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM message_usage", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn fork_final_validation_rejects_a_copied_message_with_wrong_ownership() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ownership.sqlite3");
+    let mut store = DialogStore::open(&path).unwrap();
+    let id = store.start_dialog("System", "question").unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch("CREATE TRIGGER redirect_copy AFTER INSERT ON messages WHEN NEW.dialog_id <> 1 BEGIN UPDATE messages SET dialog_id=1 WHERE id=NEW.id; END;").unwrap();
+    assert!(store.fork_dialog(id, 1).is_err());
+    assert_eq!(store.list().unwrap().len(), 1);
+    assert_eq!(store.load(id).unwrap().messages.len(), 1);
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM dialog_branches", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn failed_or_stale_fork_rolls_back_and_unrelated_dialog_cannot_be_selected() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("dialogs.sqlite3");

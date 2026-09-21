@@ -143,6 +143,161 @@ fn transition_closes_old_stage_and_projects_handoff_in_one_commit() {
 }
 
 #[test]
+fn human_replay_rejects_changed_semantic_source_after_later_evolution() {
+    let mut fixture = Fixture::new();
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let input = transition_input(TransitionEvent::PlanningCompleted);
+    let auth = authorize(&source, &input, None);
+    let payload = handoff();
+    let original = fixture
+        .store
+        .commit_stage_change(transition_command(&source, &input, &auth, &payload))
+        .unwrap();
+    let replan = WorkflowInput {
+        source: WorkflowInputSource::Human,
+        intent: WorkflowIntent::ReplanCurrent {
+            change_request: "Later change".into(),
+        },
+    };
+    let replan_auth = authorize(&original.target_state, &replan, None);
+    fixture
+        .store
+        .commit_stage_change(transition_command(
+            &original.target_state,
+            &replan,
+            &replan_auth,
+            &payload,
+        ))
+        .unwrap();
+    for field in 0..7 {
+        let mut altered = source.clone();
+        match field {
+            0 => altered.goal = "Fabricated goal".into(),
+            1 => altered.plan.steps[0].description = "Fabricated plan".into(),
+            2 => altered.ordinal += 1,
+            3 => altered.status = TaskStatus::Active,
+            4 => altered.current_step_id = None,
+            5 => altered.expected_action = Some("Fabricated action".into()),
+            _ => altered.checkpoint.summary = "Fabricated checkpoint".into(),
+        }
+        assert!(
+            matches!(
+                fixture
+                    .store
+                    .commit_stage_change(transition_command(&altered, &input, &auth, &payload)),
+                Err(StoreError::WorkflowConflict(1))
+            ),
+            "field {field}"
+        );
+    }
+    assert_eq!(
+        fixture
+            .store
+            .commit_stage_change(transition_command(&source, &input, &auth, &payload))
+            .unwrap(),
+        original
+    );
+    assert_eq!(count(&fixture.connection, "task_transitions"), 2);
+    assert_eq!(count(&fixture.connection, "messages"), 3);
+}
+
+#[test]
+fn transition_source_binding_migrates_old_databases_idempotently_and_rejects_legacy_replay() {
+    let mut fixture = Fixture::new();
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let input = transition_input(TransitionEvent::PlanningCompleted);
+    let auth = authorize(&source, &input, None);
+    let payload = handoff();
+    fixture
+        .store
+        .commit_stage_change(transition_command(&source, &input, &auth, &payload))
+        .unwrap();
+    let has_column: bool = fixture.connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('task_transitions') WHERE name='source_fingerprint')", [], |r| r.get(0)).unwrap();
+    if has_column {
+        fixture
+            .connection
+            .execute_batch("ALTER TABLE task_transitions DROP COLUMN source_fingerprint")
+            .unwrap();
+    }
+    let path = fixture._directory.path().join("workflow.sqlite3");
+    fixture.store = DialogStore::open(&path).unwrap();
+    fixture.store = DialogStore::open(&path).unwrap();
+    assert!(fixture.connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('task_transitions') WHERE name='source_fingerprint')", [], |r| r.get::<_, bool>(0)).unwrap(), "migration must install source binding");
+    assert!(matches!(
+        fixture
+            .store
+            .commit_stage_change(transition_command(&source, &input, &auth, &payload)),
+        Err(StoreError::WorkflowConflict(1))
+    ));
+    assert_eq!(count(&fixture.connection, "task_transitions"), 1);
+}
+
+#[test]
+fn ignored_fork_messages_roll_back_without_mapping_an_unrelated_message() {
+    for mapped in [false, true] {
+        let mut fixture = Fixture::new();
+        if !mapped {
+            fixture
+                .connection
+                .execute("DELETE FROM message_task_stages", [])
+                .unwrap();
+        }
+        let unrelated = fixture.store.start_dialog("Other", "unrelated").unwrap();
+        fixture
+            .store
+            .append_answer(unrelated, 1, "unrelated answer", None)
+            .unwrap();
+        let source = fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap();
+        let before_mappings = count(&fixture.connection, "message_task_stages");
+        fixture.connection.execute_batch("CREATE TRIGGER ignore_fork_message BEFORE INSERT ON messages WHEN NEW.dialog_id>2 BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        assert!(fixture.store.fork_dialog(1, 1).is_err(), "mapped={mapped}");
+        assert_eq!(count(&fixture.connection, "dialogs"), 2);
+        assert_eq!(count(&fixture.connection, "dialog_branches"), 0);
+        assert_eq!(count(&fixture.connection, "messages"), 3);
+        assert_eq!(
+            count(&fixture.connection, "message_task_stages"),
+            before_mappings
+        );
+        assert_eq!(
+            fixture
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM message_task_stages WHERE message_id=3",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            fixture
+                .store
+                .load_workflow(1)
+                .unwrap()
+                .current_task
+                .unwrap(),
+            source
+        );
+        assert_eq!(fixture.store.load(unrelated).unwrap().messages.len(), 2);
+    }
+}
+
+#[test]
 fn human_transition_replay_returns_original_after_later_replan() {
     let mut fixture = Fixture::new();
     let source = fixture

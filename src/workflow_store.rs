@@ -826,6 +826,7 @@ pub(crate) fn copy_workflow_branch(
             "workflow_input_id",
             "event",
             "source_version",
+            "source_fingerprint",
             "handoff_json",
             "created_at",
         ],
@@ -1011,6 +1012,22 @@ fn transition_event(authorization: &StageChangeAuthorization) -> Result<String, 
     }
 }
 
+// Bind replay to the semantic source, while allowing branch-local database IDs
+// to be remapped. Stage identity/sequence and ownership are checked separately.
+fn source_fingerprint(source: &WorkflowTaskState) -> Result<String, StoreError> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "ordinal": source.ordinal,
+        "phase": source.phase,
+        "status": source.status,
+        "goal": source.goal,
+        "plan": source.plan,
+        "current_step_id": source.current_step_id,
+        "expected_action": source.expected_action,
+        "checkpoint": source.checkpoint,
+        "version": source.version,
+    }))?)
+}
+
 fn enum_text(value: &impl Serialize) -> Result<String, StoreError> {
     Ok(serde_json::to_value(value)?
         .as_str()
@@ -1053,7 +1070,6 @@ fn commit_stage_change(
             )
         }
     };
-    let mut target = transition_projection(command, source)?;
     let processing = command
         .processing_id
         .map(|id| processing_row(connection, id))
@@ -1070,19 +1086,25 @@ fn commit_stage_change(
     } else {
         None
     };
-    let prior: Option<(i64, i64, i64)> = connection
+    let prior: Option<(i64, i64, i64, Option<String>)> = connection
         .query_row(
-            "SELECT id, workflow_input_id, to_stage_run_id FROM task_transitions
+            "SELECT id, workflow_input_id, to_stage_run_id, source_fingerprint FROM task_transitions
          WHERE workflow_task_id=?1 AND from_stage_run_id=?2 AND source_version=?3",
             params![
                 source.id.0,
                 source.current_stage_run_id.0,
                 sqlite_version(source.version)?
             ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    if let Some((transition_id, workflow_input_id, stage_id)) = prior {
+    if let Some((_, _, _, fingerprint)) = &prior {
+        if fingerprint.as_deref() != Some(source_fingerprint(source)?.as_str()) {
+            return Err(StoreError::WorkflowConflict(command.dialog_id));
+        }
+    }
+    let mut target = transition_projection(command, source)?;
+    if let Some((transition_id, workflow_input_id, stage_id, _)) = prior {
         target.current_stage_run_id = StageRunId(stage_id);
         target.incoming_handoff_id = Some(transition_id);
         let message: Option<i64> = connection
@@ -1187,8 +1209,8 @@ fn commit_stage_change(
         command.dialog_id,
     )?;
     target.current_stage_run_id = StageRunId(connection.last_insert_rowid());
-    require_one(connection.execute("INSERT INTO task_transitions (workflow_task_id,from_stage_run_id,to_stage_run_id,workflow_input_id,event,source_version,handoff_json) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-        params![source.id.0,source.current_stage_run_id.0,target.current_stage_run_id.0,workflow_input_id,transition_event(command.authorization)?,sqlite_version(source.version)?,serde_json::to_string(command.handoff)?])?, command.dialog_id)?;
+    require_one(connection.execute("INSERT INTO task_transitions (workflow_task_id,from_stage_run_id,to_stage_run_id,workflow_input_id,event,source_version,handoff_json,source_fingerprint) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![source.id.0,source.current_stage_run_id.0,target.current_stage_run_id.0,workflow_input_id,transition_event(command.authorization)?,sqlite_version(source.version)?,serde_json::to_string(command.handoff)?,source_fingerprint(source)?])?, command.dialog_id)?;
     let transition_id = connection.last_insert_rowid();
     target.incoming_handoff_id = Some(transition_id);
     target.validate().map_err(domain_error)?;
@@ -2032,12 +2054,22 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
                 'replan_requested'
             )),
             source_version INTEGER NOT NULL CHECK (source_version >= 0),
+            source_fingerprint TEXT,
             handoff_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
         );
         CREATE UNIQUE INDEX IF NOT EXISTS one_transition_per_source_stage
         ON task_transitions(workflow_task_id, from_stage_run_id, source_version);",
     )?;
+    let has_source_fingerprint: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('task_transitions') WHERE name='source_fingerprint')",
+        [], |row| row.get(0),
+    )?;
+    if !has_source_fingerprint {
+        // Historical rows cannot safely reconstruct their source: NULL is a
+        // deliberate non-replayable sentinel, never inferred from current state.
+        tx.execute_batch("ALTER TABLE task_transitions ADD COLUMN source_fingerprint TEXT")?;
+    }
     if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
         return Err(StoreError::InvalidWorkflow(
             "foreign key check failed".into(),

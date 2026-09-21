@@ -465,17 +465,25 @@ impl DialogStore {
             .optional()?;
         let branch_group_id = existing_group.unwrap_or(id);
         if existing_group.is_none() {
-            tx.execute(
-                "INSERT INTO dialog_branches (
+            require_fork_rows(
+                tx.execute(
+                    "INSERT INTO dialog_branches (
                      dialog_id, branch_group_id, parent_dialog_id, checkpoint_message_count
                  ) VALUES (?1, ?1, NULL, ?2)",
-                params![id, to_i64(expected_message_count)?],
+                    params![id, to_i64(expected_message_count)?],
+                )?,
+                1,
+                id,
             )?;
         }
 
-        tx.execute(
-            "INSERT INTO dialogs (system_prompt, title) VALUES (?1, ?2)",
-            params![source.0, format!("{} (branch)", source.1)],
+        require_fork_rows(
+            tx.execute(
+                "INSERT INTO dialogs (system_prompt, title) VALUES (?1, ?2)",
+                params![source.0, format!("{} (branch)", source.1)],
+            )?,
+            1,
+            id,
         )?;
         let new_dialog_id = tx.last_insert_rowid();
         let copied_scope = tx.execute(
@@ -512,27 +520,45 @@ impl DialogStore {
         let mut last_message_id = 0;
         let mut message_id_map = BTreeMap::new();
         for (role, content, created_at, usage_json, old_message_id) in source_messages {
-            tx.execute(
-                "INSERT INTO messages (dialog_id, role, content, created_at)
+            require_fork_rows(
+                tx.execute(
+                    "INSERT INTO messages (dialog_id, role, content, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![new_dialog_id, role, content, created_at],
+                    params![new_dialog_id, role, content, created_at],
+                )?,
+                1,
+                id,
             )?;
             last_message_id = tx.last_insert_rowid();
             message_id_map.insert(old_message_id, last_message_id);
             if let Some(usage_json) = usage_json {
-                tx.execute(
-                    "INSERT INTO message_usage (message_id, usage_json) VALUES (?1, ?2)",
-                    params![last_message_id, usage_json],
+                require_fork_rows(
+                    tx.execute(
+                        "INSERT INTO message_usage (message_id, usage_json) VALUES (?1, ?2)",
+                        params![last_message_id, usage_json],
+                    )?,
+                    1,
+                    id,
                 )?;
             }
         }
         crate::workflow_store::copy_workflow_branch(&tx, id, new_dialog_id, &message_id_map)?;
-        tx.execute(
-            "UPDATE dialogs SET last_message_id = ?1 WHERE id = ?2",
-            params![last_message_id, new_dialog_id],
+        require_fork_rows(
+            tx.execute(
+                "UPDATE dialogs SET last_message_id = ?1 WHERE id = ?2",
+                params![last_message_id, new_dialog_id],
+            )?,
+            1,
+            id,
         )?;
-        tx.execute(
-            "INSERT INTO dialog_context (
+        let expected_context: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dialog_context WHERE dialog_id=?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        require_fork_rows(
+            tx.execute(
+                "INSERT INTO dialog_context (
                  dialog_id, summary, covered_message_count, compaction_count,
                  known_prompt_tokens, known_completion_tokens,
                  known_total_tokens, missing_usage_count
@@ -541,10 +567,19 @@ impl DialogStore {
                     known_prompt_tokens, known_completion_tokens,
                     known_total_tokens, missing_usage_count
              FROM dialog_context WHERE dialog_id = ?2",
-            params![new_dialog_id, id],
+                params![new_dialog_id, id],
+            )?,
+            usize::from(expected_context),
+            id,
         )?;
-        tx.execute(
-            "INSERT INTO dialog_facts (
+        let expected_facts: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dialog_facts WHERE dialog_id=?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        require_fork_rows(
+            tx.execute(
+                "INSERT INTO dialog_facts (
                  dialog_id, facts_json, covered_message_count, update_count,
                  known_prompt_tokens, known_completion_tokens,
                  known_total_tokens, missing_usage_count
@@ -553,19 +588,61 @@ impl DialogStore {
                     known_prompt_tokens, known_completion_tokens,
                     known_total_tokens, missing_usage_count
              FROM dialog_facts WHERE dialog_id = ?2",
-            params![new_dialog_id, id],
+                params![new_dialog_id, id],
+            )?,
+            usize::from(expected_facts),
+            id,
         )?;
-        tx.execute(
-            "INSERT INTO dialog_branches (
+        require_fork_rows(
+            tx.execute(
+                "INSERT INTO dialog_branches (
                  dialog_id, branch_group_id, parent_dialog_id, checkpoint_message_count
              ) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                new_dialog_id,
-                branch_group_id,
-                id,
-                to_i64(expected_message_count)?,
-            ],
+                params![
+                    new_dialog_id,
+                    branch_group_id,
+                    id,
+                    to_i64(expected_message_count)?,
+                ],
+            )?,
+            1,
+            id,
         )?;
+        let copied_count: i64 = tx.query_row(
+            "SELECT count(*) FROM messages WHERE dialog_id=?1",
+            [new_dialog_id],
+            |row| row.get(0),
+        )?;
+        if copied_count != count {
+            return Err(StoreError::Conflict(id));
+        }
+        for (old, new) in &message_id_map {
+            let matches: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages old JOIN messages new
+                 LEFT JOIN message_usage old_usage ON old_usage.message_id=old.id
+                 LEFT JOIN message_usage new_usage ON new_usage.message_id=new.id
+                 WHERE old.id=?1 AND new.id=?2 AND old.dialog_id=?3 AND new.dialog_id=?4
+                   AND old.role=new.role AND old.content=new.content AND old.created_at=new.created_at
+                   AND old_usage.usage_json IS new_usage.usage_json)",
+                params![old,new,id,new_dialog_id], |row| row.get(0),
+            )?;
+            if !matches {
+                return Err(StoreError::Conflict(id));
+            }
+        }
+        let invalid_mapping: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_task_stages ms
+             JOIN messages m ON m.id=ms.message_id
+             JOIN workflow_tasks t ON t.id=ms.workflow_task_id
+             JOIN task_stage_runs s ON s.id=ms.stage_run_id
+             WHERE (m.dialog_id=?1 OR t.dialog_id=?1)
+               AND (m.dialog_id<>t.dialog_id OR s.workflow_task_id<>t.id))",
+            [new_dialog_id],
+            |row| row.get(0),
+        )?;
+        if invalid_mapping {
+            return Err(StoreError::Conflict(id));
+        }
         tx.commit()?;
         Ok(ForkResult {
             original_dialog_id: id,
@@ -977,6 +1054,17 @@ fn decode_facts(
             missing as u64,
         ),
     ))
+}
+
+fn require_fork_rows(
+    actual: usize,
+    expected: usize,
+    source_dialog_id: i64,
+) -> Result<(), StoreError> {
+    if actual != expected {
+        return Err(StoreError::Conflict(source_dialog_id));
+    }
+    Ok(())
 }
 
 fn decode_branch(
