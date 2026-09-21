@@ -12,3 +12,4 @@ pub mod memory;
 pub mod profile;
 pub mod system_context;
 pub mod terminal;
+pub mod workflow_model;

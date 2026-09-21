@@ -16,6 +16,12 @@ const DEFAULT_COMPACT_AFTER_PROMPT_TOKENS: u64 = 6000;
 const DEFAULT_KEEP_LAST_MESSAGES: usize = 10;
 const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 1024;
 const DEFAULT_FACTS_MAX_TOKENS: u32 = 512;
+const DEFAULT_INTERPRETER_MAX_TOKENS: u32 = 512;
+const DEFAULT_CHECKER_MAX_TOKENS: u32 = 1024;
+const DEFAULT_HANDOFF_MAX_TOKENS: u32 = 2048;
+const DEFAULT_MIN_CONFIDENCE: f32 = 0.80;
+const DEFAULT_MAX_AUTONOMOUS_TURNS: u32 = 8;
+const DEFAULT_MAX_AUTONOMOUS_TOKENS: u64 = 20_000;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +63,21 @@ struct RawDebugConfig {
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+struct RawWorkflowConfig {
+    enabled: Option<bool>,
+    interpreter_model: Option<String>,
+    checker_model: Option<String>,
+    handoff_model: Option<String>,
+    interpreter_max_tokens: Option<u32>,
+    checker_max_tokens: Option<u32>,
+    handoff_max_tokens: Option<u32>,
+    min_confidence: Option<f32>,
+    max_autonomous_turns: Option<u32>,
+    max_autonomous_tokens: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     api_key: Option<String>,
     base_url: Option<String>,
@@ -73,6 +94,8 @@ struct RawConfig {
     context: RawContextConfig,
     #[serde(default)]
     debug: RawDebugConfig,
+    #[serde(default)]
+    workflow: RawWorkflowConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +155,150 @@ impl DebugConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct WorkflowConfig {
+    enabled: bool,
+    interpreter_model: String,
+    checker_model: String,
+    handoff_model: String,
+    interpreter_max_tokens: u32,
+    checker_max_tokens: u32,
+    handoff_max_tokens: u32,
+    min_confidence: f32,
+    max_autonomous_turns: u32,
+    max_autonomous_tokens: u64,
+}
+
+impl WorkflowConfig {
+    fn from_raw(raw: RawWorkflowConfig, fallback_model: &str) -> Result<Self, ConfigError> {
+        let interpreter_model = validated_workflow_model(
+            raw.interpreter_model,
+            fallback_model,
+            "workflow.interpreter_model",
+        )?;
+        let checker_model =
+            validated_workflow_model(raw.checker_model, fallback_model, "workflow.checker_model")?;
+        let handoff_model =
+            validated_workflow_model(raw.handoff_model, fallback_model, "workflow.handoff_model")?;
+        let interpreter_max_tokens = raw
+            .interpreter_max_tokens
+            .unwrap_or(DEFAULT_INTERPRETER_MAX_TOKENS);
+        let checker_max_tokens = raw.checker_max_tokens.unwrap_or(DEFAULT_CHECKER_MAX_TOKENS);
+        let handoff_max_tokens = raw.handoff_max_tokens.unwrap_or(DEFAULT_HANDOFF_MAX_TOKENS);
+        let max_autonomous_turns = raw
+            .max_autonomous_turns
+            .unwrap_or(DEFAULT_MAX_AUTONOMOUS_TURNS);
+        let max_autonomous_tokens = raw
+            .max_autonomous_tokens
+            .unwrap_or(DEFAULT_MAX_AUTONOMOUS_TOKENS);
+        let min_confidence = raw.min_confidence.unwrap_or(DEFAULT_MIN_CONFIDENCE);
+
+        for (field, value) in [
+            ("workflow.interpreter_max_tokens", interpreter_max_tokens),
+            ("workflow.checker_max_tokens", checker_max_tokens),
+            ("workflow.handoff_max_tokens", handoff_max_tokens),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::InvalidField {
+                    field,
+                    reason: "must be greater than zero",
+                });
+            }
+        }
+        if max_autonomous_turns == 0 {
+            return Err(ConfigError::InvalidField {
+                field: "workflow.max_autonomous_turns",
+                reason: "must be greater than zero",
+            });
+        }
+        if max_autonomous_tokens == 0 {
+            return Err(ConfigError::InvalidField {
+                field: "workflow.max_autonomous_tokens",
+                reason: "must be greater than zero",
+            });
+        }
+        if !min_confidence.is_finite() || !(0.0..=1.0).contains(&min_confidence) {
+            return Err(ConfigError::InvalidField {
+                field: "workflow.min_confidence",
+                reason: "must be finite and between 0 and 1",
+            });
+        }
+
+        Ok(Self {
+            enabled: raw.enabled.unwrap_or(true),
+            interpreter_model,
+            checker_model,
+            handoff_model,
+            interpreter_max_tokens,
+            checker_max_tokens,
+            handoff_max_tokens,
+            min_confidence,
+            max_autonomous_turns,
+            max_autonomous_tokens,
+        })
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn interpreter_model(&self) -> &str {
+        &self.interpreter_model
+    }
+
+    pub fn checker_model(&self) -> &str {
+        &self.checker_model
+    }
+
+    pub fn handoff_model(&self) -> &str {
+        &self.handoff_model
+    }
+
+    pub fn interpreter_max_tokens(&self) -> u32 {
+        self.interpreter_max_tokens
+    }
+
+    pub fn checker_max_tokens(&self) -> u32 {
+        self.checker_max_tokens
+    }
+
+    pub fn handoff_max_tokens(&self) -> u32 {
+        self.handoff_max_tokens
+    }
+
+    pub fn min_confidence(&self) -> f32 {
+        self.min_confidence
+    }
+
+    pub fn max_autonomous_turns(&self) -> u32 {
+        self.max_autonomous_turns
+    }
+
+    pub fn max_autonomous_tokens(&self) -> u64 {
+        self.max_autonomous_tokens
+    }
+}
+
+fn validated_workflow_model(
+    value: Option<String>,
+    fallback_model: &str,
+    field: &'static str,
+) -> Result<String, ConfigError> {
+    match value {
+        Some(value) => {
+            let value = value.trim().to_owned();
+            if value.is_empty() {
+                return Err(ConfigError::InvalidField {
+                    field,
+                    reason: "must not be blank",
+                });
+            }
+            Ok(value)
+        }
+        None => Ok(fallback_model.to_owned()),
+    }
+}
+
 /// Validated settings used by the API client.
 #[derive(Clone)]
 pub struct Config {
@@ -148,6 +315,7 @@ pub struct Config {
     include_usage: bool,
     context: ContextConfig,
     debug: DebugConfig,
+    workflow: WorkflowConfig,
 }
 
 impl Config {
@@ -288,6 +456,7 @@ impl Config {
                 reason: "must be greater than zero",
             });
         }
+        let workflow = WorkflowConfig::from_raw(raw.workflow, &model)?;
         Ok(Self {
             top_p: raw.top_p,
             stop,
@@ -313,6 +482,7 @@ impl Config {
                 log_path: raw.debug.log_path,
                 log_payloads: raw.debug.log_payloads.unwrap_or(false),
             },
+            workflow,
         })
     }
 
@@ -335,6 +505,10 @@ impl Config {
 
     pub fn debug(&self) -> &DebugConfig {
         &self.debug
+    }
+
+    pub fn workflow(&self) -> &WorkflowConfig {
+        &self.workflow
     }
 
     pub fn api_key(&self) -> &str {
@@ -390,6 +564,7 @@ impl fmt::Debug for Config {
             .field("timeout_seconds", &self.timeout_seconds)
             .field("context", &self.context)
             .field("debug", &self.debug)
+            .field("workflow", &self.workflow)
             .finish()
     }
 }

@@ -356,3 +356,39 @@ strategy = "sticky_facts"
     assert_eq!(result.answer(), r#"{"deadline":"Monday"}"#);
     assert_eq!(result.usage().unwrap().total_tokens, 12);
 }
+
+#[tokio::test]
+async fn complete_uses_the_requested_model_and_preserves_usage() {
+    let server = MockServer::start().await;
+    let messages = vec![Message::for_request(Role::User, "Check this task.")];
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_json(json!({
+            "model": "workflow-checker",
+            "messages": [{"role": "user", "content": "Check this task."}],
+            "temperature": 0.0,
+            "max_tokens": 32,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "thinking": {"type": "disabled"}
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"checked\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n\n",
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = DeepSeekClient::new(&config_for(&server, "test-key")).unwrap();
+
+    let result = client
+        .complete("workflow-checker", &messages, 32)
+        .await
+        .unwrap();
+
+    assert_eq!(result.answer(), "checked");
+    assert_eq!(result.usage().unwrap().total_tokens, 4);
+}

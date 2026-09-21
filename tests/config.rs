@@ -261,3 +261,34 @@ fn rejects_removed_enabled_and_zero_facts_limit() {
     .unwrap_err();
     assert!(error.to_string().contains("facts_max_tokens"));
 }
+
+#[test]
+fn workflow_defaults_are_bounded_and_inherit_the_chat_model() {
+    let config = Config::from_toml(
+        "api_key = \"key\"\nmodel = \"chat-model\"\n[context]\nstrategy = \"summary\"",
+        None,
+    )
+    .unwrap();
+    let workflow = config.workflow();
+    assert!(workflow.enabled());
+    assert_eq!(workflow.interpreter_model(), "chat-model");
+    assert_eq!(workflow.checker_model(), "chat-model");
+    assert_eq!(workflow.handoff_model(), "chat-model");
+    assert_eq!(workflow.interpreter_max_tokens(), 512);
+    assert_eq!(workflow.checker_max_tokens(), 1024);
+    assert_eq!(workflow.handoff_max_tokens(), 2048);
+    assert_eq!(workflow.min_confidence(), 0.80);
+    assert_eq!(workflow.max_autonomous_turns(), 8);
+    assert_eq!(workflow.max_autonomous_tokens(), 20_000);
+}
+
+#[test]
+fn workflow_rejects_zero_limits_and_confidence_outside_zero_to_one() {
+    for source in [
+        "api_key='key'\n[context]\nstrategy='summary'\n[workflow]\nchecker_max_tokens=0",
+        "api_key='key'\n[context]\nstrategy='summary'\n[workflow]\nmax_autonomous_turns=0",
+        "api_key='key'\n[context]\nstrategy='summary'\n[workflow]\nmin_confidence=1.1",
+    ] {
+        assert!(Config::from_toml(source, None).is_err());
+    }
+}

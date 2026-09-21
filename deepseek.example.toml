@@ -18,3 +18,15 @@ facts_max_tokens = 512
 [debug]
 # log_path = "deepseek-debug.jsonl"
 log_payloads = false
+
+[workflow]
+enabled = true
+# interpreter_model = "deepseek-v4-flash"
+# checker_model = "deepseek-v4-flash"
+# handoff_model = "deepseek-v4-flash"
+interpreter_max_tokens = 512
+checker_max_tokens = 1024
+handoff_max_tokens = 2048
+min_confidence = 0.80
+max_autonomous_turns = 8
+max_autonomous_tokens = 20000

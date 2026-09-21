@@ -89,6 +89,7 @@ impl DeepSeekClient {
         self.stream_chat_events_with_options(
             messages,
             RequestOptions {
+                model: &self.model,
                 temperature: self.temperature,
                 max_tokens: self.max_tokens,
                 thinking: if self.disable_thinking {
@@ -111,7 +112,8 @@ impl DeepSeekClient {
         messages: &[Message],
         max_tokens: u32,
     ) -> Result<SummaryResult, ClientError> {
-        self.deterministic_service_call(messages, max_tokens).await
+        self.deterministic_service_call(&self.model, messages, max_tokens)
+            .await
     }
 
     pub async fn update_facts(
@@ -119,11 +121,23 @@ impl DeepSeekClient {
         messages: &[Message],
         max_tokens: u32,
     ) -> Result<SummaryResult, ClientError> {
-        self.deterministic_service_call(messages, max_tokens).await
+        self.deterministic_service_call(&self.model, messages, max_tokens)
+            .await
+    }
+
+    pub async fn complete(
+        &self,
+        model: &str,
+        messages: &[Message],
+        max_tokens: u32,
+    ) -> Result<SummaryResult, ClientError> {
+        self.deterministic_service_call(model, messages, max_tokens)
+            .await
     }
 
     async fn deterministic_service_call(
         &self,
+        model: &str,
         messages: &[Message],
         max_tokens: u32,
     ) -> Result<SummaryResult, ClientError> {
@@ -133,6 +147,7 @@ impl DeepSeekClient {
             .stream_chat_events_with_options(
                 messages,
                 RequestOptions {
+                    model,
                     temperature: 0.0,
                     max_tokens,
                     thinking: Some(Thinking { r#type: "disabled" }),
@@ -167,7 +182,7 @@ impl DeepSeekClient {
             .post(self.endpoint.clone())
             .bearer_auth(&self.api_key)
             .json(&ChatRequest {
-                model: &self.model,
+                model: options.model,
                 messages,
                 temperature: options.temperature,
                 max_tokens: options.max_tokens,
@@ -243,6 +258,7 @@ impl SummaryResult {
 }
 
 struct RequestOptions<'a> {
+    model: &'a str,
     temperature: f64,
     max_tokens: u32,
     thinking: Option<Thinking<'a>>,
