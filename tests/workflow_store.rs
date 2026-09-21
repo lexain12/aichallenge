@@ -4,7 +4,9 @@ use deepseek_cli::memory::RequestScope;
 use deepseek_cli::workflow::{PlanAppend, PlanStepStatus, StepStatusUpdate, TaskStatePatch};
 use deepseek_cli::workflow::{StageRunId, TaskPhase, TaskStatus};
 use deepseek_cli::workflow::{WorkflowInput, WorkflowInputSource, WorkflowIntent, WorkflowTaskId};
-use deepseek_cli::workflow_store::{AcceptedInputEffect, AnswerCommit, InputCommit};
+use deepseek_cli::workflow_store::{
+    AcceptedInputEffect, AnswerCommit, ExpectedCurrentTask, InputCommit,
+};
 use deepseek_cli::workflow_store::{ControllerInputCommit, ProcessingLeaseMode, ProcessingResult};
 use deepseek_cli::workflow_store::{ProcessingStatus, ProtocolSource, WorkflowRepository};
 use rusqlite::Connection;
@@ -72,9 +74,12 @@ fn sqlite_uniqueness_conflict_is_mapped_and_does_not_leave_an_input() {
         .execute("DELETE FROM dialog_workflow_state", [])
         .unwrap();
     assert!(matches!(
-        fixture
-            .store
-            .create_task_with_human_input(1, "another", "another", 0),
+        fixture.store.create_task_with_human_input(
+            1,
+            "another",
+            "another",
+            ExpectedCurrentTask::Absent
+        ),
         Err(StoreError::WorkflowConflict(1))
     ));
     assert_eq!(count(&fixture.connection, "messages"), 1);
@@ -586,13 +591,143 @@ fn human(text: &str) -> WorkflowInput {
     }
 }
 
+#[test]
+fn stale_human_input_cannot_target_replacement_task_with_the_same_version() {
+    let mut fixture = Fixture::new();
+    let observed = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let mut other = DialogStore::open(&fixture._directory.path().join("workflow.sqlite3")).unwrap();
+    fixture.connection.execute_batch("UPDATE workflow_tasks SET phase='done', status='active', version=4; UPDATE task_stage_runs SET phase='done';").unwrap();
+    let replacement = other
+        .create_task_with_human_input(
+            1,
+            "replacement",
+            "replacement",
+            ExpectedCurrentTask::Present {
+                task_id: observed.id,
+                version: 4,
+            },
+        )
+        .unwrap();
+    fixture
+        .connection
+        .execute(
+            "UPDATE workflow_tasks SET version=3 WHERE id=?1",
+            [replacement.task.id.0],
+        )
+        .unwrap();
+    let message_count = count(&fixture.connection, "messages");
+    let input_count = count(&fixture.connection, "workflow_inputs");
+    let mapping_count = count(&fixture.connection, "message_task_stages");
+    let current = other.load_workflow(1).unwrap().current_task.unwrap();
+    assert_ne!(current.id, observed.id);
+    assert_eq!(current.version, observed.version);
+    let input = human("continue");
+    let mut command = input_command(&input, Some(observed.version));
+    command.expected_current_task = ExpectedCurrentTask::Present {
+        task_id: observed.id,
+        version: observed.version,
+    };
+    assert!(matches!(
+        fixture
+            .store
+            .append_input(command, AcceptedInputEffect::ContinueSameStage),
+        Err(StoreError::WorkflowConflict(1))
+    ));
+    assert_eq!(count(&fixture.connection, "messages"), message_count);
+    assert_eq!(count(&fixture.connection, "workflow_inputs"), input_count);
+    assert_eq!(
+        count(&fixture.connection, "message_task_stages"),
+        mapping_count
+    );
+    assert_eq!(
+        other.load_workflow(1).unwrap().current_task.unwrap(),
+        current
+    );
+}
+
+#[test]
+fn stale_creation_cannot_replace_a_different_done_task_with_the_same_version() {
+    let mut fixture = Fixture::new();
+    fixture.connection.execute_batch("UPDATE workflow_tasks SET phase='done', status='active'; UPDATE task_stage_runs SET phase='done';").unwrap();
+    let observed = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let mut other = DialogStore::open(&fixture._directory.path().join("workflow.sqlite3")).unwrap();
+    let expected = ExpectedCurrentTask::Present {
+        task_id: observed.id,
+        version: observed.version,
+    };
+    let replacement = other
+        .create_task_with_human_input(1, "replacement", "replacement", expected)
+        .unwrap();
+    fixture
+        .connection
+        .execute(
+            "UPDATE workflow_tasks SET phase='done', version=3 WHERE id=?1",
+            [replacement.task.id.0],
+        )
+        .unwrap();
+    fixture
+        .connection
+        .execute(
+            "UPDATE task_stage_runs SET phase='done' WHERE id=?1",
+            [replacement.stage_run_id.0],
+        )
+        .unwrap();
+    let current = other.load_workflow(1).unwrap().current_task.unwrap();
+    assert_ne!(current.id, observed.id);
+    assert_eq!(current.version, observed.version);
+    let counts = [
+        "workflow_tasks",
+        "task_stage_runs",
+        "messages",
+        "workflow_inputs",
+        "message_task_stages",
+    ]
+    .map(|table| count(&fixture.connection, table));
+    assert!(matches!(
+        fixture
+            .store
+            .create_task_with_human_input(1, "stale", "stale", expected),
+        Err(StoreError::WorkflowConflict(1))
+    ));
+    assert_eq!(
+        [
+            "workflow_tasks",
+            "task_stage_runs",
+            "messages",
+            "workflow_inputs",
+            "message_task_stages"
+        ]
+        .map(|table| count(&fixture.connection, table)),
+        counts
+    );
+    assert_eq!(
+        other.load_workflow(1).unwrap().current_task.unwrap(),
+        current
+    );
+}
+
 fn input_command(input: &WorkflowInput, version: Option<u64>) -> InputCommit<'_> {
     InputCommit {
         dialog_id: 1,
         input,
         protocol_text: "continue",
         confidence: Some(0.9),
-        expected_version: version,
+        expected_current_task: version.map_or(ExpectedCurrentTask::Absent, |version| {
+            ExpectedCurrentTask::Present {
+                task_id: WorkflowTaskId(1),
+                version,
+            }
+        }),
     }
 }
 
@@ -1062,21 +1197,57 @@ fn existing_dialog_creation_rejects_stale_versions_and_competing_unfinished_task
     let mut first = DialogStore::open(&path).unwrap();
     let dialog = first.start_dialog("System", "legacy").unwrap();
     let mut second = DialogStore::open(&path).unwrap();
+    assert!(matches!(
+        first.create_task_with_human_input(
+            dialog,
+            "one",
+            "one",
+            ExpectedCurrentTask::Present {
+                task_id: WorkflowTaskId(1),
+                version: 0
+            }
+        ),
+        Err(StoreError::WorkflowConflict(_))
+    ));
     let created = first
-        .create_task_with_human_input(dialog, "one", "one", 0)
+        .create_task_with_human_input(dialog, "one", "one", ExpectedCurrentTask::Absent)
         .unwrap();
     assert!(matches!(
-        second.create_task_with_human_input(dialog, "two", "two", 0),
+        second.create_task_with_human_input(
+            dialog,
+            "two",
+            "two",
+            ExpectedCurrentTask::Present {
+                task_id: created.task.id,
+                version: 0
+            }
+        ),
         Err(StoreError::WorkflowConflict(_))
     ));
     let connection = Connection::open(path).unwrap();
     connection.execute_batch("UPDATE workflow_tasks SET phase='done', version=4; UPDATE task_stage_runs SET phase='done';").unwrap();
     assert!(matches!(
-        second.create_task_with_human_input(dialog, "two", "two", 0),
+        second.create_task_with_human_input(
+            dialog,
+            "two",
+            "two",
+            ExpectedCurrentTask::Present {
+                task_id: created.task.id,
+                version: 0
+            }
+        ),
         Err(StoreError::WorkflowConflict(_))
     ));
     let next = second
-        .create_task_with_human_input(dialog, "two", "two", 4)
+        .create_task_with_human_input(
+            dialog,
+            "two",
+            "two",
+            ExpectedCurrentTask::Present {
+                task_id: created.task.id,
+                version: 4,
+            },
+        )
         .unwrap();
     assert_eq!(next.task.ordinal, 2);
     assert_ne!(next.task.id, created.task.id);
@@ -1100,7 +1271,7 @@ fn blank_initial_input_or_goal_writes_nothing() {
     for (text, goal) in [(" ", "goal"), ("text", " ")] {
         assert!(
             store
-                .create_task_with_human_input(dialog, text, goal, 0)
+                .create_task_with_human_input(dialog, text, goal, ExpectedCurrentTask::Absent)
                 .is_err()
         );
     }

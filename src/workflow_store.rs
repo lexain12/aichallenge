@@ -56,7 +56,7 @@ pub trait WorkflowRepository {
         dialog_id: i64,
         protocol_text: &str,
         goal: &str,
-        expected_version: u64,
+        expected_current_task: ExpectedCurrentTask,
     ) -> Result<StartedWorkflow, StoreError>;
     fn load_workflow(&self, dialog_id: i64) -> Result<DialogWorkflowSnapshot, StoreError>;
     fn load_stage_messages(
@@ -85,7 +85,30 @@ pub struct InputCommit<'a> {
     pub input: &'a WorkflowInput,
     pub protocol_text: &'a str,
     pub confidence: Option<f32>,
-    pub expected_version: Option<u64>,
+    pub expected_current_task: ExpectedCurrentTask,
+}
+
+/// Snapshot identity used by commands that route through a dialog's selected task.
+/// Versions are local to a task, so the task ID is part of the concurrency guard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpectedCurrentTask {
+    Absent,
+    Present {
+        task_id: WorkflowTaskId,
+        version: u64,
+    },
+}
+
+impl ExpectedCurrentTask {
+    fn matches(self, current: Option<&WorkflowTaskState>) -> bool {
+        match (self, current) {
+            (Self::Absent, None) => true,
+            (Self::Present { task_id, version }, Some(task)) => {
+                task.id == task_id && task.version == version
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -376,7 +399,7 @@ impl WorkflowRepository for DialogStore {
             "INSERT INTO dialog_scopes (dialog_id, user_id, task_id) VALUES (?1, ?2, ?3)",
             params![dialog_id, scope.user_id(), scope.task_id()],
         )?;
-        let result = create_task(&tx, dialog_id, prompt, prompt, 0)
+        let result = create_task(&tx, dialog_id, prompt, prompt, ExpectedCurrentTask::Absent)
             .map_err(|error| workflow_conflict(error, dialog_id))?;
         tx.commit()?;
         Ok(result)
@@ -387,12 +410,12 @@ impl WorkflowRepository for DialogStore {
         dialog_id: i64,
         protocol_text: &str,
         goal: &str,
-        expected_version: u64,
+        expected_current_task: ExpectedCurrentTask,
     ) -> Result<StartedWorkflow, StoreError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result = create_task(&tx, dialog_id, protocol_text, goal, expected_version)
+        let result = create_task(&tx, dialog_id, protocol_text, goal, expected_current_task)
             .map_err(|error| workflow_conflict(error, dialog_id))?;
         tx.commit()?;
         Ok(result)
@@ -550,11 +573,11 @@ fn create_task(
     dialog_id: i64,
     protocol_text: &str,
     goal: &str,
-    expected_version: u64,
+    expected_current_task: ExpectedCurrentTask,
 ) -> Result<StartedWorkflow, StoreError> {
     validate_protocol_text(protocol_text)?;
     let current = load_workflow(connection, dialog_id)?.current_task;
-    if current.as_ref().map_or(0, |task| task.version) != expected_version {
+    if !expected_current_task.matches(current.as_ref()) {
         return Err(StoreError::WorkflowConflict(dialog_id));
     }
     StateMachine::validate_new_task(current.as_ref())
@@ -869,7 +892,7 @@ fn append_input(
         return invalid("controller inputs require a processing completion");
     }
     let mut task = load_workflow(connection, command.dialog_id)?.current_task;
-    if task.as_ref().map(|task| task.version) != command.expected_version {
+    if !command.expected_current_task.matches(task.as_ref()) {
         return Err(StoreError::WorkflowConflict(command.dialog_id));
     }
     let rejection_reason = match &effect {
