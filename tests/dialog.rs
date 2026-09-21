@@ -434,6 +434,62 @@ fn legacy_dialogs_are_migrated_to_default_scope() {
 }
 
 #[test]
+fn transcript_hides_only_controller_inputs_while_stage_protocol_keeps_them() {
+    use deepseek_cli::workflow::StageRunId;
+    use deepseek_cli::workflow_store::{ProtocolSource, WorkflowRepository};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let mut store = DialogStore::open(&path).unwrap();
+    let id = store.start_dialog("System", "legacy user").unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch(
+        r#"PRAGMA foreign_keys = ON;
+        BEGIN;
+        INSERT INTO messages (id, dialog_id, role, content) VALUES
+        (2, 1, 'user', 'human input'), (3, 1, 'assistant', 'first answer'),
+        (4, 1, 'user', 'hidden controller'), (5, 1, 'assistant', 'second answer');
+        INSERT INTO workflow_tasks (id, dialog_id, ordinal, phase, status, goal, plan_json, checkpoint_json, version)
+        VALUES (1, 1, 1, 'planning', 'active', 'Build it',
+        '{"revision":0,"steps":[],"acceptance_criteria":[]}', '{"summary":"","decisions":[],"open_issues":[]}', 0);
+        INSERT INTO task_stage_runs (id, workflow_task_id, phase, sequence) VALUES (1, 1, 'planning', 1);
+        UPDATE workflow_tasks SET current_stage_run_id = 1;
+        INSERT INTO dialog_workflow_state VALUES (1, 1);
+        INSERT INTO message_task_stages VALUES (1, 1, 1), (2, 1, 1), (3, 1, 1), (4, 1, 1), (5, 1, 1);
+        INSERT INTO workflow_inputs (dialog_id, message_id, source, intent_json, outcome) VALUES (1, 2, 'human', '{}', 'accepted');
+        INSERT INTO response_processing (id, assistant_message_id, checker_name, expected_version, status) VALUES (1, 3, 'continuation', 0, 'completed');
+        INSERT INTO workflow_inputs (dialog_id, message_id, source, checker_name, model_name, triggering_assistant_message_id, intent_json, outcome, processing_id)
+        VALUES (1, 4, 'controller', 'continuation', 'model', 3, '{}', 'accepted', 1);
+        COMMIT;"#
+    ).unwrap();
+    let dialog = store.load(id).unwrap();
+    assert_eq!(
+        dialog
+            .messages
+            .iter()
+            .map(|message| message.content())
+            .collect::<Vec<_>>(),
+        [
+            "legacy user",
+            "human input",
+            "first answer",
+            "second answer"
+        ]
+    );
+    let protocol = store.load_stage_messages(StageRunId(1)).unwrap();
+    assert_eq!(
+        protocol
+            .iter()
+            .map(|message| message.message_id)
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5]
+    );
+    assert_eq!(protocol[3].source, ProtocolSource::Controller);
+    assert_eq!(protocol[3].message.role(), Role::User);
+    assert_eq!(store.list().unwrap()[0].title, "legacy user");
+}
+
+#[test]
 fn durable_memory_is_isolated_by_user_and_task() {
     let directory = tempfile::tempdir().unwrap();
     let mut store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();

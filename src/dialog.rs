@@ -18,7 +18,7 @@ use crate::profile::{
 };
 
 pub struct DialogStore {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 
 pub struct StoredDialog {
@@ -57,7 +57,7 @@ pub struct DialogSummary {
 
 impl DialogStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -141,6 +141,7 @@ impl DialogStore {
              ON dialog_branches(branch_group_id, dialog_id)",
             [],
         )?;
+        crate::workflow_store::migrate(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -614,8 +615,14 @@ impl DialogStore {
             .ok_or(StoreError::InvalidDialogScope("dialog scope is missing"))?;
         let scope = RequestScope::new(stored_scope.0, stored_scope.1)?;
         let messages = {
-            let mut statement =
-                tx.prepare("SELECT m.role, m.content, u.usage_json FROM messages m LEFT JOIN message_usage u ON u.message_id = m.id WHERE m.dialog_id = ?1 ORDER BY m.id")?;
+            let mut statement = tx.prepare(
+                "SELECT m.role, m.content, u.usage_json FROM messages m
+                 LEFT JOIN message_usage u ON u.message_id = m.id
+                 LEFT JOIN workflow_inputs i ON i.message_id = m.id
+                 WHERE m.dialog_id = ?1
+                   AND (i.source IS NULL OR i.source = 'human' OR m.role = 'assistant')
+                 ORDER BY m.id",
+            )?;
             statement
                 .query_map([id], |row| {
                     let role: String = row.get(0)?;
@@ -991,6 +998,8 @@ fn to_i64(value: impl TryInto<i64>) -> Result<i64, StoreError> {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("invalid workflow state: {0}")]
+    InvalidWorkflow(String),
     #[error("invalid token statistics: {0}")]
     Usage(#[from] serde_json::Error),
     #[error("dialog database error: {0}")]
