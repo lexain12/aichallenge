@@ -5,9 +5,10 @@
 Add a durable, code-controlled task lifecycle to the existing DeepSeek CLI.
 Each workflow task moves through `planning`, `execution`, `validation`, and
 `done`; it also records the current step, expected action, structured plan,
-and a compact checkpoint. Model calls may propose routing decisions, state
-updates, and transitions, but only application code validates and applies
-them.
+and a compact checkpoint. Real user messages and controller-generated inputs
+use the same workflow-input boundary. Model calls may propose routing
+decisions, state updates, and transitions, but only application code validates
+and applies them.
 
 The design must also isolate model context by task and stage. Full dialog
 history and complete handoffs remain in SQLite for audit and replay, while an
@@ -48,18 +49,20 @@ phase is not `done`.
 
 The control flow has two model-assisted extension points:
 
-1. An input router runs before the ordinary answer. It classifies the new user
-   message as continuing the current task, replanning it, or starting a new
-   task.
+1. A human-input interpreter runs before the ordinary answer. It turns the new
+   user message into a typed workflow intent: continue, start a task, replan,
+   or propose a stage transition.
 2. A response-processing pipeline runs after a complete ordinary answer. Its
-   initial checker determines whether the current stage should remain active or
-   propose a transition. Future checkers may enforce invariants or other
-   policies and may use different models.
+   initial continuation checker either waits for a person or emits a synthetic
+   controller input that continues the current stage or proposes a transition.
+   Future checkers may enforce invariants or other policies and may use
+   different models.
 
-Checkers never mutate persistent state. They return typed proposals. A single
-effect handler validates those proposals, asks the finite-state machine to
-authorize transitions, builds a handoff when necessary, and persists the
-result.
+Human and controller inputs pass through the same workflow-input handler.
+Interpreters and checkers never mutate persistent state. They return typed
+proposals. The handler validates those proposals, asks the finite-state
+machine to authorize transitions, builds a handoff when necessary, and
+persists the result.
 
 ## Workflow State Model
 
@@ -166,8 +169,9 @@ Pause and resume do not create stage runs:
 
 ```text
 any non-done phase / active --UserInterrupted--> same phase / paused
-same phase / paused --ContinueCurrent--> same phase / active
-same phase / paused --ReplanCurrent--> planning / active
+same phase / paused --human Continue--> same phase / active
+same phase / paused --human ProposeTransition--> accepted target / active
+same phase / paused --human ReplanCurrent--> planning / active
 ```
 
 ### Dialog task machine
@@ -180,42 +184,85 @@ done task + StartNewTask -> new planning task in the same dialog
 unfinished task + StartNewTask -> rejected
 ```
 
-If a router proposes `StartNewTask` while the current task is in `planning`,
-`execution`, `validation`, or paused, the ordinary model is not called. The
-CLI reports that the current task must be completed or a new dialog opened.
+If the human-input interpreter proposes `StartNewTask` while the current task
+is in `planning`, `execution`, `validation`, or paused, the ordinary model is
+not called. The CLI reports that the current task must be completed or a new
+dialog opened.
 
 A new dialog creates its first workflow task from its first accepted user
 message. A dialog may therefore contain multiple workflow tasks over time,
 but never multiple unfinished tasks.
 
-## Input Routing
+## Unified Workflow Inputs
 
-The input router runs before the user message is assigned to a task or sent to
-the ordinary model. It receives the message and a compact view of the current
-workflow task, not the full dialog history.
+Every state-affecting input has an explicit source and a typed intent:
 
 ```rust
-pub enum InputDecision {
-    ContinueCurrent,
+pub struct WorkflowInput {
+    pub source: WorkflowInputSource,
+    pub intent: WorkflowIntent,
+}
+
+pub enum WorkflowInputSource {
+    Human,
+    Controller {
+        checker: String,
+        model: String,
+        triggering_assistant_message_id: i64,
+    },
+}
+
+pub enum WorkflowIntent {
+    Continue { instruction: String },
     StartNewTask { goal: String },
     ReplanCurrent { change_request: String },
+    ProposeTransition {
+        event: TransitionEvent,
+        evidence: Vec<String>,
+    },
 }
 ```
 
-The application validates the proposal against the dialog task machine. The
-router cannot create a task or change state directly.
+`WorkflowInputHandler` is the only state-affecting entry point. It validates
+the intent against the dialog and stage machines, applies resume/replan/new
+task initialization, invokes the handoff builder for an accepted transition,
+and prepares the resulting stage context for the next ordinary model call.
+
+### Human input interpretation
+
+The human-input interpreter runs before the human message is assigned to a
+task or sent to the ordinary model. It receives the raw message and a compact
+view of the current workflow task, not the full dialog history. It may detect a
+transition directly. For example, "implementation is done; start testing" may
+produce `ProposeTransition { event: ExecutionCompleted, ... }` before the
+ordinary answer. If the finite-state machine accepts it, the same human
+message is persisted in and answered from the new validation stage.
 
 Safe failure behavior is:
 
-- with an unfinished task, router failure falls back to `ContinueCurrent`;
+- with an unfinished task, interpreter failure falls back to `Continue` with
+  the original human message as its instruction;
 - with no task, the first message deterministically starts a planning task;
-- with a completed task, router failure leaves that task done and handles the
-  message without creating or replanning a task;
-- a low-confidence router decision must not automatically create a new task.
+- with a completed task, interpreter failure leaves that task done and handles
+  the message without creating or replanning a task;
+- a low-confidence interpretation must not automatically create a new task or
+  transition a stage.
 
-Routing must happen before the ordinary answer. Performing it afterward would
-allow the first answer of a new task to be contaminated by the previous task's
-context.
+Interpretation must happen before the ordinary answer. Performing it afterward
+would let a new task or new stage receive an answer contaminated by the
+previous context.
+
+### Controller inputs
+
+The continuation checker may emit only `Continue` or `ProposeTransition`.
+It cannot create an independent task, change the user's goal, or invoke
+`ReplanCurrent`. Those intents require a real human message.
+
+A controller input is rendered to the model as a user-role instruction so the
+ordinary conversation protocol remains well formed. It is persisted with
+`source = controller`, hidden from the human transcript, excluded from dialog
+titles and user-fact extraction, and retained in audit data. The application
+must never attribute controller text to the person.
 
 ## Response-Processing Pipeline
 
@@ -239,9 +286,9 @@ pub trait ResponseChecker {
 }
 ```
 
-The first implementation is `StageCompletionChecker`. Future implementations
-may include invariant, safety, or quality checkers without receiving write
-access to repositories.
+The first implementation is `ContinuationChecker`. Future implementations may
+include invariant, safety, or quality checkers without receiving write access
+to repositories.
 
 A checker is either:
 
@@ -249,26 +296,40 @@ A checker is either:
 - **blocking**: the response cannot be delivered when the checker fails or
   rejects it.
 
-Day 13's stage checker is advisory, so ordinary response streaming remains
-available. A future blocking output validator requires buffering the full
-candidate response before display because already streamed content cannot be
-retracted.
+Day 13's continuation checker is advisory, so ordinary response streaming
+remains available. A future blocking output validator requires buffering the
+full candidate response before display because already streamed content cannot
+be retracted.
 
-### Stage checker result
+### Continuation checker result
 
-The stage checker returns either a patch within the current stage or a typed
-transition proposal with evidence:
+The continuation checker returns a task-state patch plus one of three control
+decisions:
 
 ```rust
-pub enum StageCheckDecision {
-    Stay { patch: TaskStatePatch },
-    ProposeTransition {
+pub struct ContinuationCheckResult {
+    pub patch: TaskStatePatch,
+    pub decision: ControllerDecision,
+}
+
+pub enum ControllerDecision {
+    AwaitUser,
+    Continue {
+        instruction: String,
+        confidence: f32,
+    },
+    EmitTransition {
         event: TransitionEvent,
-        patch: TaskStatePatch,
         evidence: Vec<String>,
+        confidence: f32,
     },
 }
 ```
+
+`AwaitUser` persists the accepted patch and returns control to the terminal
+prompt. `Continue` and `EmitTransition` are converted into controller-sourced
+`WorkflowInput` values and passed through the same handler used for human
+input. The controller never applies a patch or transition directly.
 
 Saying "the work is complete" is not sufficient evidence by itself. Guards
 may require a non-empty plan, completed required steps, stored artifacts, or
@@ -279,11 +340,35 @@ Checker results are parsed from a strict structured response. Invalid JSON,
 unknown enum values, blank required fields, oversized payloads, and references
 to unknown plan steps are rejected before effect application.
 
+### Autonomous continuation loop
+
+After an ordinary assistant response:
+
+1. Run the continuation checker on the current task state, current stage
+   context, triggering input, and complete assistant response.
+2. Validate and persist its `TaskStatePatch`.
+3. On `AwaitUser`, stop and display the normal prompt.
+4. On `Continue`, persist a hidden controller input and call the ordinary
+   model again in the same stage.
+5. On `EmitTransition`, pass the synthetic transition input through the state
+   machine, build the handoff, enter the accepted stage, and call the ordinary
+   model with the new task-state context.
+6. Repeat until the controller returns `AwaitUser`, the task reaches `done`, a
+   safety limit is reached, a call fails, or the person presses `Ctrl+C`.
+
+Continuous execution has finite, validated limits. The initial configuration
+defaults are eight autonomous ordinary turns and 20,000 total API tokens after
+one human input. A repeated `(task version, phase, current step,
+expected action)` fingerprint, low-confidence controller result, malformed
+result, or exhausted budget forces `AwaitUser`. The controller cannot start a
+new task after reaching `done`; only a later human input may do that.
+
 ## Handoffs and State Projection
 
 A handoff is generated only after the state machine accepts a transition. A
-dedicated model call receives only the outgoing stage's task state and stage
-messages. It returns a strict `HandoffPayload`, for example:
+dedicated model call receives only the outgoing stage's task state, stage
+messages, and the accepted workflow input that triggered the transition. It
+returns a strict `HandoffPayload`, for example:
 
 ```json
 {
@@ -352,17 +437,33 @@ Maps each ordinary user or assistant message to one workflow task and stage
 run. A separate table avoids changing the established `messages` table and
 allows existing databases to be upgraded safely.
 
+### `workflow_inputs`
+
+Links every accepted user-role protocol message to its interpreted intent and
+origin. Human rows point to visible user messages. Controller rows point to
+hidden user-role messages and record checker name, model, triggering assistant
+message, structured intent, confidence, and accepted/rejected status. Legacy
+user messages without a row are treated as visible human input.
+
+This table is the audit boundary that prevents a synthetic continuation from
+being mistaken for something the person said. Context assembly includes an
+accepted controller message in its stage sequence, while transcript replay,
+dialog titles, user-memory extraction, and sticky user-fact extraction exclude
+it.
+
 ### `response_processing`
 
 Tracks checker work by assistant message: `pending`, `processing`, `completed`,
 or `failed`, together with attempts, structured results, and the last error.
 A completed assistant message and its pending processing row are committed in
-one transaction.
+one transaction. A controller decision and its hidden protocol message are
+also committed together before the next ordinary model call.
 
-Closing the outgoing stage run, inserting the transition and handoff, creating
-the incoming stage run, updating the task projection, moving the dialog's
-current-task pointer, and incrementing the state version occur in one SQLite
-transaction. Partial transitions are impossible.
+Accepting a transition input, closing the outgoing stage run, inserting the
+transition and handoff, creating the incoming stage run, updating the task
+projection, moving the dialog's current-task pointer, and incrementing the
+state version occur in one SQLite transaction. Partial transitions are
+impossible.
 
 ## Context Isolation
 
@@ -373,9 +474,9 @@ An ordinary request for a managed workflow task is assembled in this order:
 3. user memory;
 4. existing memory-task block;
 5. current workflow-task state;
-6. conversation messages belonging to the current task, current stage run,
-   and current dialog;
-7. the new user message.
+6. visible human, hidden controller, and assistant protocol messages belonging
+   to the current task, current stage run, and current dialog, in stable order;
+7. the new human or controller input when it has not yet been persisted.
 
 The task-state block is workflow-task-scoped and excluded from conversation
 compaction. It contains a compact rendering of phase, status, goal, structured
@@ -386,6 +487,11 @@ Messages from previous workflow tasks and stage runs remain in SQLite but are
 not included. Previous stages enter the new context only through fields
 projected from the validated handoff into the current task-state block. The
 complete handoff is never duplicated into the ordinary prompt.
+
+Controller inputs participate in the model protocol only inside their task and
+stage. They may be included in stage-local summary compaction as execution
+instructions, but they are never evidence for user profile, user memory, task
+memory, or sticky user facts.
 
 Existing conversation strategies apply inside the current stage run rather
 than across the complete dialog. On a task or stage transition, the active
@@ -400,33 +506,39 @@ task pointer so the two branches evolve independently.
 
 ## End-to-End Flow
 
-For an accepted user input:
+For one real human input and every autonomous continuation it triggers:
 
 1. On process restoration, retry pending response processing for the current
    state version before accepting another input. A repeated advisory failure
    is marked failed and leaves the last committed task state active.
 2. Load the dialog's current workflow task.
-3. Run or deterministically resolve input routing.
-4. Validate the routing decision against the dialog task machine.
-5. Apply resume, replan, or new-task initialization as required.
-6. Persist the user message and its task/stage mapping together.
-7. Build the stage-isolated ordinary request.
+3. For a human message, run or deterministically resolve human-input
+   interpretation. For an autonomous turn, load the already typed controller
+   intent.
+4. Pass the resulting `WorkflowInput` through the shared handler and validate
+   it against the dialog and stage machines.
+5. Apply resume, replan, new-task initialization, or an accepted stage
+   transition. Build and project a handoff before entering a new stage.
+6. Persist the visible human or hidden controller user-role message, its typed
+   workflow input, and its task/stage mapping together.
+7. Build the stage-isolated ordinary request from the resulting state.
 8. Stream the ordinary model response while retaining its complete buffer.
 9. On complete success, persist the assistant message, usage, task/stage
    mapping, and pending processing row.
 10. Run configured response checkers.
-11. Pass typed results to the effect handler.
-12. Apply an in-stage state patch or validate a proposed transition.
-13. For an accepted transition, build and validate the handoff, then commit the
-    full transition transaction.
+11. Validate and persist the checker-proposed in-stage state patch.
+12. On `AwaitUser`, complete processing and return to the terminal prompt.
+13. On `Continue` or `EmitTransition`, atomically persist the hidden controller
+    input, enforce the autonomy limits, and return to step 4 without waiting
+    for a person.
 
 ## Pause and Resume
 
 `Ctrl+C` is a user-interrupt event. The signal handler only requests
 cancellation; it does not write SQLite directly.
 
-When interruption occurs during input routing, an ordinary model call, a
-checker call, or handoff generation:
+When interruption occurs during human-input interpretation, an ordinary model
+call, a checker call, a controller turn, or handoff generation:
 
 - cancel the in-flight request;
 - discard every partial model response from that request;
@@ -436,17 +548,21 @@ checker call, or handoff generation:
 - exit cleanly.
 
 Loading the dialog does not itself resume the task. The next accepted
-`ContinueCurrent` message changes `paused` to `active` before ordinary context
-assembly. `ReplanCurrent` instead creates a planning stage run and activates
-the same workflow task. An invalid request to start another task leaves the
-current task paused.
+human-sourced `Continue` or `ProposeTransition` activates the task before
+ordinary context assembly. `ReplanCurrent` instead creates a planning stage
+run and activates the same workflow task. Controller input cannot resume a
+task after process restoration without a new human message. An invalid request
+to start another task leaves the current task paused.
 
 ## Failure Semantics
 
 - Ordinary model failure leaves the persisted user message in the current
   stage and does not advance task state.
-- Input-router failure uses the safe fallbacks defined in Input Routing.
+- Human-input interpreter failure uses the safe fallbacks defined in Unified
+  Workflow Inputs.
 - Advisory-checker failure keeps the ordinary answer and current state.
+- A continuation-checker failure stops the autonomous loop and waits for a
+  person; it never guesses a synthetic instruction.
 - Invalid checker or handoff output is logged without applying effects.
 - Handoff failure prevents only the transition, not storage of the ordinary
   answer.
@@ -457,18 +573,21 @@ current task paused.
   recorded and may fail open for conversation while remaining closed to state
   mutation.
 - Reprocessing the same assistant message cannot create a duplicate stage run
-  or transition.
+  or transition, nor emit a second controller input.
+- Reaching an autonomous turn/token limit or detecting a repeated state
+  fingerprint stops the loop without changing the task phase.
 - Future blocking validators fail closed and require buffered delivery; Day 13
   advisory checks fail open with respect to the answer and closed with respect
   to state mutation.
 
 ## Observability
 
-Debug events record checker name, configured model, advisory/blocking mode,
-input and resulting state versions, proposed event, accepted/rejected outcome,
+Debug events record workflow-input source, interpreter or checker name,
+configured model, advisory/blocking mode, input and resulting state versions,
+proposed event, accepted/rejected outcome, autonomous turn number and budget,
 stage-run IDs, transition ID, processing status, and token usage. Payload text,
-plan contents, checkpoints, and handoffs follow the existing
-`debug.log_payloads` policy and are hidden by default.
+plan contents, checkpoints, synthetic instructions, and handoffs follow the
+existing `debug.log_payloads` policy and are hidden by default.
 
 The CLI task status view should show the active workflow-task ordinal and ID,
 phase, pause status, plan revision, current step, expected action, stage-run
@@ -490,9 +609,17 @@ present a proposed transition as committed.
 
 ### Parsing and pipeline tests
 
-- Input routing parses all three decisions and rejects malformed output.
-- Low-confidence or failed routing uses the defined safe fallback.
-- Stage-checker JSON is strict and unknown events are rejected.
+- Human-input interpretation parses all four intents and rejects malformed
+  output.
+- A human message may trigger an accepted stage transition before the ordinary
+  answer is generated.
+- Low-confidence or failed interpretation uses the defined safe fallback.
+- Continuation-checker JSON is strict and unknown events are rejected.
+- `AwaitUser` ends the autonomous loop without changing phase.
+- `Continue` emits a hidden controller input in the same stage.
+- `EmitTransition` goes through the shared workflow-input handler and FSM.
+- A controller cannot create a new task or replan the current task.
+- Turn/token exhaustion and repeated-state detection stop autonomous work.
 - Advisory failure preserves the response and leaves state unchanged.
 - Checker implementations can use different `CompletionModel` instances.
 - Conflicting checker proposals do not mutate state.
@@ -503,9 +630,12 @@ present a proposed transition as committed.
 
 - Task creation and the first tagged user message commit atomically.
 - A completed assistant message and pending processing row commit atomically.
+- A controller decision, hidden user-role message, origin metadata, and
+  task/stage mapping commit atomically.
 - Accepted transition, handoff, stage-run closure/creation, task projection,
   and version increment commit atomically.
 - Retrying processing is idempotent.
+- Retrying processing cannot emit a duplicate controller input.
 - Two sessions cannot create two unfinished tasks in one dialog.
 - Resume restores task state, current stage run, and pending processing.
 - Branch creation produces independent workflow-task state.
@@ -518,23 +648,27 @@ present a proposed transition as committed.
 - Only the handoff-derived task-state projection represents the previous
   stage; the full handoff is absent from the request.
 - Conversation summary and facts cannot reintroduce old-stage content.
+- Hidden controller inputs remain in protocol order but are excluded from
+  transcript display and user-fact extraction.
 - User profile, user memory, and memory-task context retain their established
   ordering and scope.
 
 ### Interruption tests
 
 - `Ctrl+C` during an ordinary stream discards the partial assistant response.
-- `Ctrl+C` during routing, checking, or handoff generation leaves the last
-  complete checkpoint and persists pause.
+- `Ctrl+C` during human-input interpretation, checking, autonomous
+  continuation, or handoff generation leaves the last complete checkpoint and
+  persists pause.
 - The first accepted continuation after restore resumes the same stage.
 - An attempted new task while paused is rejected and does not resume or replace
   the current task.
 
 ## Scope Boundaries
 
-Day 13 implements the task state machine, input router, generic response
-checker boundary, stage-completion checker, handoff builder, persistence,
-context isolation, pause/resume behavior, and diagnostics described above.
+Day 13 implements the task state machine, unified workflow-input handler,
+human-input interpreter, generic response-checker boundary, continuation
+checker, bounded autonomous loop, handoff builder, persistence, context
+isolation, pause/resume behavior, and diagnostics described above.
 
 Future work may add blocking invariant checkers, transition policies beyond
 the initial guards, richer model-routing configuration, human approval modes,
