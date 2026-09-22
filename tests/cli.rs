@@ -764,6 +764,100 @@ async fn resumed_cli_recovers_pending_work_before_prompt_and_warns_on_failure() 
     }
 }
 
+// Break caught: a configured but unavailable debug path still owns one safe
+// warning. Workflow execution and recovery must surface it once without making
+// logging availability part of workflow correctness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_workflow_debug_path_warns_once_on_run_and_recovery() {
+    let server = MockServer::start().await;
+    let await_user = json!({
+        "patch":{"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+        "decision":{"type":"await_user"}
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(
+                [
+                    sse("completed answer", 2, 1, 3),
+                    sse(&await_user, 2, 1, 3),
+                    sse(&await_user, 2, 1, 3),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        })
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let missing_parent = directory.path().join("missing-debug-parent");
+
+    let normal_database = directory.path().join("normal-warning.sqlite3");
+    let normal_log = missing_parent.join("normal.jsonl");
+    let normal_config =
+        write_observed_workflow_config(&server.uri(), &normal_log, "strategy = \"summary\"");
+    let normal = run_cli_args(
+        normal_config.path(),
+        &normal_database,
+        &[],
+        "start task\n/exit\n",
+    );
+    assert!(
+        normal.status.success(),
+        "{}",
+        String::from_utf8_lossy(&normal.stderr)
+    );
+    let normal_stderr = String::from_utf8(normal.stderr).unwrap();
+    assert_eq!(
+        normal_stderr
+            .matches("debug log disabled: failed to open")
+            .count(),
+        1,
+        "{normal_stderr}"
+    );
+
+    let recovery_database = directory.path().join("recovery-warning.sqlite3");
+    let mut store = DialogStore::open(&recovery_database).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "saved goal")
+        .unwrap();
+    store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: started.dialog_id,
+            task_id: started.task.id,
+            stage_run_id: started.stage_run_id,
+            expected_version: 0,
+            content: "saved answer",
+            usage: None,
+        })
+        .unwrap();
+    drop(store);
+    let recovery_log = missing_parent.join("recovery.jsonl");
+    let recovery_config =
+        write_observed_workflow_config(&server.uri(), &recovery_log, "strategy = \"summary\"");
+    let recovery = run_cli_args(
+        recovery_config.path(),
+        &recovery_database,
+        &["--resume-last"],
+        "/exit\n",
+    );
+    assert!(
+        recovery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+    let recovery_stderr = String::from_utf8(recovery.stderr).unwrap();
+    assert_eq!(
+        recovery_stderr
+            .matches("debug log disabled: failed to open")
+            .count(),
+        1,
+        "{recovery_stderr}"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
 // Break caught: restoring a paused dialog is inert until a human continuation is accepted.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1136,6 +1230,215 @@ async fn killed_process_preserves_input_while_waiting_for_api() {
     let dialog = store.load(store.latest_id().unwrap().unwrap()).unwrap();
     assert_eq!(dialog.messages.len(), 1);
     assert_eq!(dialog.messages[0].content(), "Do not lose me");
+}
+
+// Break caught: completed diagnostic boundaries must reach the log before a
+// later checker await, so cancelling that await cannot erase the committed
+// ordinary-answer audit trail.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_during_checker_keeps_completed_workflow_diagnostics() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(
+                [
+                    sse("visible committed answer", 2, 1, 3),
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(30))
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: [DONE]\n\n"),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        })
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("checker-interrupt.sqlite3");
+    let log_path = directory.path().join("checker-interrupt.jsonl");
+    let config = write_observed_workflow_config(&server.uri(), &log_path, "strategy = \"summary\"");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_deepseek-cli"))
+        .arg("--config")
+        .arg(config.path())
+        .arg("--db")
+        .arg(&database)
+        .env_remove("DEEPSEEK_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (answer_seen, stdout_reader) =
+        observe_stdout(child.stdout.take().unwrap(), "visible committed answer");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"start task\n")
+        .unwrap();
+    answer_seen
+        .recv_timeout(Duration::from_secs(5))
+        .expect("ordinary answer should render before checker blocks");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.received_requests().await.unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("checker request should start");
+
+    send_sigint(&child);
+    let status = child.wait().unwrap();
+    let stdout = String::from_utf8(stdout_reader.join().unwrap()).unwrap();
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    assert!(stdout.contains("visible committed answer"), "{stdout}");
+
+    let store = DialogStore::open(&database).unwrap();
+    let dialog_id = store.latest_id().unwrap().unwrap();
+    let dialog = store.load(dialog_id).unwrap();
+    assert_eq!(dialog.messages.len(), 2);
+    assert_eq!(dialog.messages[1].content(), "visible committed answer");
+    assert_eq!(
+        store
+            .load_workflow(dialog_id)
+            .unwrap()
+            .current_task
+            .unwrap()
+            .status,
+        TaskStatus::Paused
+    );
+    let events: Vec<Value> = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|value: &Value| value["event"] == "workflow")
+        .collect();
+    assert_eq!(events.len(), 2, "{events:#?}");
+    assert_eq!(events[0]["details"]["component"], "input_router");
+    assert_eq!(events[1]["details"]["component"], "ordinary");
+    assert_eq!(events[1]["details"]["processing_status"], "pending");
+}
+
+// Break caught: a checker decision completes before the handoff call starts.
+// Cancelling the handoff must not erase that checker record or fabricate a
+// committed transition.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_during_handoff_keeps_completed_checker_diagnostic() {
+    let server = MockServer::start().await;
+    let checker = json!({
+        "patch": {
+            "expected_version":0,
+            "plan_append": {
+                "steps":[{"id":"s1","description":"implement it","status":"pending"}],
+                "acceptance_criteria":["it works"]
+            },
+            "step_updates":[],
+            "current_step_id":"s1",
+            "expected_action":"implement s1",
+            "checkpoint":null
+        },
+        "decision":{"type":"emit_transition","event":"planning_completed","evidence":[],"confidence":0.95}
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(
+                [
+                    sse("visible planning answer", 2, 1, 3),
+                    sse(&checker, 3, 2, 5),
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(30))
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: [DONE]\n\n"),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        })
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("handoff-interrupt.sqlite3");
+    let log_path = directory.path().join("handoff-interrupt.jsonl");
+    let config = write_observed_workflow_config(&server.uri(), &log_path, "strategy = \"summary\"");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_deepseek-cli"))
+        .arg("--config")
+        .arg(config.path())
+        .arg("--db")
+        .arg(&database)
+        .env_remove("DEEPSEEK_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (answer_seen, stdout_reader) =
+        observe_stdout(child.stdout.take().unwrap(), "visible planning answer");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"start task\n")
+        .unwrap();
+    answer_seen
+        .recv_timeout(Duration::from_secs(5))
+        .expect("ordinary answer should render before handoff blocks");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.received_requests().await.unwrap().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("handoff request should start");
+
+    send_sigint(&child);
+    let status = child.wait().unwrap();
+    let _ = stdout_reader.join().unwrap();
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    let store = DialogStore::open(&database).unwrap();
+    let task = store
+        .load_workflow(store.latest_id().unwrap().unwrap())
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(task.phase, TaskPhase::Planning);
+    assert_eq!(task.current_stage_sequence, 1);
+    assert_eq!(task.status, TaskStatus::Paused);
+
+    let events: Vec<Value> = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|value: &Value| value["event"] == "workflow")
+        .collect();
+    let components: Vec<&str> = events
+        .iter()
+        .map(|event| event["details"]["component"].as_str().unwrap())
+        .collect();
+    assert_eq!(components, ["input_router", "ordinary", "continuation"]);
+    let checker_event = &events[2]["details"];
+    assert_eq!(checker_event["accepted"], true);
+    assert_eq!(checker_event["processing_status"], "processing");
+    assert_eq!(checker_event["transition_id"], Value::Null);
 }
 
 // Break caught: SIGINT must drop the stream before pausing, and pre-task SIGINT must stay taskless.

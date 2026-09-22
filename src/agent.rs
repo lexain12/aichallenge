@@ -254,6 +254,16 @@ impl Agent {
     pub async fn recover_workflow_processing(
         &mut self,
     ) -> Result<Vec<RecoveredProcessing>, AgentError> {
+        self.recover_workflow_processing_streaming(|_| Ok(())).await
+    }
+
+    pub async fn recover_workflow_processing_streaming<F>(
+        &mut self,
+        mut on_event: F,
+    ) -> Result<Vec<RecoveredProcessing>, AgentError>
+    where
+        F: FnMut(AgentEvent<'_>) -> io::Result<()>,
+    {
         let Some(config) = self
             .workflow_config
             .as_ref()
@@ -272,32 +282,42 @@ impl Agent {
             .clone();
         let diagnostics_enabled = self.debug_log.is_active();
         let capture_payloads = self.debug_log.payloads_enabled();
-        let mut diagnostics = Vec::<WorkflowDebugEvent>::new();
-        let mut engine = WorkflowEngine::new(
-            &self.client,
-            &self.context_config,
-            &config,
-            &models,
-            WorkflowSession {
-                store,
-                dialog_id: &mut self.dialog_id,
-                scope: &mut self.scope,
-                history: &mut self.history,
-                last_usage: &mut self.last_usage,
-            },
-        );
-        let result = if diagnostics_enabled {
-            engine
-                .with_diagnostics(&mut diagnostics, capture_payloads)
-                .recover_pending_processing(dialog_id)
-                .await
-        } else {
-            engine.recover_pending_processing(dialog_id).await
+        let mut debug_warnings = Vec::new();
+        let result = {
+            let mut engine = WorkflowEngine::new(
+                &self.client,
+                &self.context_config,
+                &config,
+                &models,
+                WorkflowSession {
+                    store,
+                    dialog_id: &mut self.dialog_id,
+                    scope: &mut self.scope,
+                    history: &mut self.history,
+                    last_usage: &mut self.last_usage,
+                },
+            );
+            if diagnostics_enabled {
+                let debug_log = &mut self.debug_log;
+                let warnings = &mut debug_warnings;
+                let mut log_diagnostic = move |event: WorkflowDebugEvent| {
+                    if let Some(error) =
+                        debug_log.log_workflow(&event.metadata, event.payload.as_ref())
+                    {
+                        warnings.push(error);
+                    }
+                };
+                engine
+                    .with_diagnostics(&mut log_diagnostic, capture_payloads)
+                    .recover_pending_processing(dialog_id)
+                    .await
+            } else {
+                engine.recover_pending_processing(dialog_id).await
+            }
         };
-        for event in diagnostics {
-            let _ = self
-                .debug_log
-                .log_workflow(&event.metadata, event.payload.as_ref());
+        for error in debug_warnings {
+            // Diagnostics are best-effort and must not change recovery state.
+            let _ = emit_event(&mut on_event, AgentEvent::DebugLogFailed { error });
         }
         Ok(result?)
     }
@@ -363,7 +383,7 @@ impl Agent {
             .clone();
         let diagnostics_enabled = self.debug_log.is_active();
         let capture_payloads = self.debug_log.payloads_enabled();
-        let mut diagnostics = Vec::<WorkflowDebugEvent>::new();
+        let mut debug_warnings = Vec::new();
         let result = {
             let store = self.store.as_mut().ok_or(AgentError::WorkflowUnavailable)?;
             let mut engine = WorkflowEngine::new(
@@ -380,21 +400,26 @@ impl Agent {
                 },
             );
             if diagnostics_enabled {
+                let debug_log = &mut self.debug_log;
+                let warnings = &mut debug_warnings;
+                let mut log_diagnostic = move |event: WorkflowDebugEvent| {
+                    if let Some(error) =
+                        debug_log.log_workflow(&event.metadata, event.payload.as_ref())
+                    {
+                        warnings.push(error);
+                    }
+                };
                 engine
-                    .with_diagnostics(&mut diagnostics, capture_payloads)
+                    .with_diagnostics(&mut log_diagnostic, capture_payloads)
                     .run_human_input(prompt, &mut on_event)
                     .await
             } else {
                 engine.run_human_input(prompt, &mut on_event).await
             }
         };
-        for event in diagnostics {
-            if let Some(error) = self
-                .debug_log
-                .log_workflow(&event.metadata, event.payload.as_ref())
-            {
-                emit_event(&mut on_event, AgentEvent::DebugLogFailed { error })?;
-            }
+        for error in debug_warnings {
+            // Logging and warning rendering are best-effort after state effects.
+            let _ = emit_event(&mut on_event, AgentEvent::DebugLogFailed { error });
         }
         let result = result?;
         Ok(result.answer.unwrap_or_default())

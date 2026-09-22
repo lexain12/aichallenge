@@ -92,11 +92,11 @@ pub struct DebugLog {
 
 impl DebugLog {
     pub fn is_active(&self) -> bool {
-        self.writer.is_some()
+        self.writer.is_some() || self.pending_warning.is_some()
     }
 
     pub fn payloads_enabled(&self) -> bool {
-        self.is_active() && self.log_payloads
+        self.writer.is_some() && self.log_payloads
     }
 
     pub fn new(path: Option<PathBuf>, log_payloads: bool, api_key: &str) -> Self {

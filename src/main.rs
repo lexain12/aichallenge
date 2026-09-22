@@ -148,13 +148,22 @@ async fn run() -> Result<(), AppError> {
         )?,
     };
     if resume.is_some() {
+        let recovery_ui = TerminalUi::stderr();
+        let mut recovery_stderr = io::stderr();
         let recovery = tokio::select! {
             biased;
             signal = tokio::signal::ctrl_c() => {
                 signal?;
                 None
             }
-            result = agent.recover_workflow_processing() => Some(result),
+            result = agent.recover_workflow_processing_streaming(|event| match event {
+                AgentEvent::DebugLogFailed { error } => recovery_ui.write_block(
+                    &mut recovery_stderr,
+                    BlockStyle::Error,
+                    &error,
+                ),
+                _ => Ok(()),
+            }) => Some(result),
         };
         let Some(recovery) = recovery else {
             finish_interruption(

@@ -8,7 +8,9 @@ use deepseek_cli::config::Config;
 use deepseek_cli::dialog::DialogStore;
 use deepseek_cli::memory::{DurableMemoryScope, RequestScope};
 use deepseek_cli::workflow::{TaskPhase, TaskStatus};
-use deepseek_cli::workflow_engine::{AutonomyStopReason, WorkflowModels, WorkflowTurnEvent};
+use deepseek_cli::workflow_engine::{
+    AutonomyStopReason, WorkflowEngineError, WorkflowModels, WorkflowTurnEvent,
+};
 use deepseek_cli::workflow_model::{CompletionModel, ModelFuture, ModelRequest, ModelResponse};
 use deepseek_cli::workflow_store::{AnswerCommit, ProcessingStatus, WorkflowRepository};
 use serde_json::{Value, json};
@@ -407,10 +409,10 @@ async fn accepted_transition_logs_matching_checker_and_handoff_invocations() {
         .find(|event| event["details"]["component"] == "handoff_builder")
         .expect("handoff event");
     assert_eq!(transition_checker["details"]["accepted"], true);
-    assert_eq!(transition_checker["details"]["output_version"], 1);
+    assert_eq!(transition_checker["details"]["output_version"], 0);
     assert_eq!(
         transition_checker["details"]["processing_status"],
-        "completed"
+        "processing"
     );
     assert_eq!(
         transition_checker["details"]["payload"]["checker_output"],
@@ -420,10 +422,7 @@ async fn accepted_transition_logs_matching_checker_and_handoff_invocations() {
     assert_eq!(handoff_event["details"]["model"], "handoff-model");
     assert_eq!(handoff_event["details"]["accepted"], true);
     assert_eq!(handoff_event["details"]["payload"]["handoff"], handoff);
-    assert_eq!(
-        handoff_event["details"]["transition_id"],
-        transition_checker["details"]["transition_id"]
-    );
+    assert_eq!(transition_checker["details"]["transition_id"], Value::Null);
     assert!(handoff_event["details"]["transition_id"].as_i64().unwrap() > 0);
     let interpreter = events
         .iter()
@@ -431,6 +430,86 @@ async fn accepted_transition_logs_matching_checker_and_handoff_invocations() {
         .expect("follow-up interpreter event");
     assert_eq!(interpreter["details"]["proposed_event"], Value::Null);
     assert_eq!(interpreter["details"]["transition_id"], Value::Null);
+}
+
+// Break caught: a valid handoff response is a completed provider invocation
+// even when its usage exhausts the autonomy budget before the transition can
+// commit. Its exact opt-in response and usage must remain observable.
+#[tokio::test]
+async fn handoff_completed_before_token_rejection_is_logged_without_transition() {
+    let server = MockServer::start().await;
+    let checker = json!({
+        "patch": {
+            "expected_version":0,
+            "plan_append": {
+                "steps":[{"id":"s1","description":"implement it","status":"pending"}],
+                "acceptance_criteria":["it works"]
+            },
+            "step_updates":[],
+            "current_step_id":"s1",
+            "expected_action":"implement s1",
+            "checkpoint":null
+        },
+        "decision": {"type":"emit_transition","event":"planning_completed","evidence":[],"confidence":0.95}
+    })
+    .to_string();
+    let handoff = json!({
+        "summary":"valid but over budget",
+        "completed_step_ids":[],
+        "next_step_id":"s1",
+        "expected_action":"implement s1",
+        "plan_changes":[],
+        "decisions":[],
+        "open_issues":[]
+    })
+    .to_string();
+    mount_sequence(
+        &server,
+        [
+            sse("planning answer", 1, 0, 1),
+            sse(&checker, 1, 0, 1),
+            sse(&handoff, 1, 1, 2),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("handoff-budget.sqlite3");
+    let log_path = directory.path().join("handoff-budget.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\nchecker_model='checker-model'\nhandoff_model='handoff-model'\nmax_autonomous_tokens=3\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=true",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+
+    assert_eq!(
+        agent.run_with_prompt("start task").await.unwrap(),
+        "planning answer"
+    );
+    let status = agent.workflow_status().unwrap().unwrap();
+    assert_eq!(status.phase, TaskPhase::Planning);
+    assert_eq!(status.stage_sequence, 1);
+
+    let events: Vec<Value> = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| event["event"] == "workflow")
+        .collect();
+    let handoff_event = events
+        .iter()
+        .find(|event| event["details"]["component"] == "handoff_builder")
+        .expect("completed handoff invocation diagnostic");
+    assert_eq!(handoff_event["details"]["model"], "handoff-model");
+    assert_eq!(handoff_event["details"]["usage"]["total_tokens"], 2);
+    assert_eq!(handoff_event["details"]["accepted"], false);
+    assert_eq!(handoff_event["details"]["outcome"], "rejected");
+    assert_eq!(handoff_event["details"]["transition_id"], Value::Null);
+    assert_eq!(handoff_event["details"]["payload"]["handoff"], handoff);
 }
 
 // Break caught: when payload logging is explicitly enabled, a failed checker
@@ -474,6 +553,60 @@ async fn failed_checker_payload_is_bound_to_its_own_invocation() {
     assert_eq!(checker["details"]["outcome"], "failed");
     assert_eq!(checker["details"]["payload"]["checker_output"], raw_checker);
     assert!(checker["details"]["payload"]["interpreter_output"].is_null());
+}
+
+// Break caught: checker output validation completes before its failed-status
+// transaction. A later persistence failure must not erase the checker response.
+#[tokio::test]
+async fn checker_diagnostic_precedes_failure_persistence_error() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("visible answer", 2, 1, 3),
+            sse("CHECKER_INVALID_RAW", 3, 2, 5),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("checker-persistence.sqlite3");
+    let log_path = directory.path().join("checker-persistence.jsonl");
+    let store = DialogStore::open(&database).unwrap();
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_checker_failure BEFORE UPDATE ON response_processing
+             WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        )
+        .unwrap();
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\nchecker_model='checker-model'\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=true",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(&config, store).unwrap();
+
+    assert!(matches!(
+        agent.run_with_prompt("start task").await,
+        Err(AgentError::Workflow(WorkflowEngineError::Store(_)))
+    ));
+    let checker = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["details"]["component"] == "continuation")
+        .expect("completed checker invocation diagnostic");
+    assert_eq!(checker["details"]["accepted"], false);
+    assert_eq!(checker["details"]["outcome"], "failed");
+    assert_eq!(checker["details"]["usage"]["total_tokens"], 5);
+    assert_eq!(
+        checker["details"]["payload"]["checker_output"],
+        "CHECKER_INVALID_RAW"
+    );
 }
 
 // Break caught: raw provider diagnostics are available only inside the opt-in
@@ -528,6 +661,59 @@ async fn provider_error_body_is_opt_in_payload_only() {
         .unwrap()
         .remove("payload");
     assert!(!metadata_only.to_string().contains(marker));
+}
+
+// Break caught: a facts provider call has completed even when its body fails
+// JSON validation. The failure metadata is always logged, while the exact raw
+// response is present only under the explicit payload opt-in.
+#[tokio::test]
+async fn malformed_facts_output_is_logged_at_the_provider_boundary() {
+    for log_payloads in [false, true] {
+        let server = MockServer::start().await;
+        let marker = format!("MALFORMED_FACTS_RAW_SECRET_{log_payloads}");
+        mount_sequence(&server, [sse(&marker, 3, 2, 5)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("malformed-facts.sqlite3");
+        let log_path = directory.path().join("malformed-facts.jsonl");
+        let config = Config::from_toml(
+            &format!(
+                "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\n[context]\nstrategy='sticky_facts'\nfacts_max_tokens=64\n[debug]\nlog_path={:?}\nlog_payloads={log_payloads}",
+                server.uri(),
+                log_path
+            ),
+            None,
+        )
+        .unwrap();
+        let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+
+        let error = agent.run_with_prompt("remember this").await.unwrap_err();
+        assert!(!error.operator_message().contains(&marker));
+
+        let events: Vec<Value> = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &Value| event["event"] == "workflow")
+            .collect();
+        let facts = events
+            .iter()
+            .find(|event| event["details"]["component"] == "facts")
+            .expect("malformed facts diagnostic");
+        assert_eq!(facts["details"]["accepted"], false);
+        assert_eq!(facts["details"]["outcome"], "failed");
+        assert_eq!(facts["details"]["error_kind"], "invalid_output");
+        assert_eq!(facts["details"]["usage"]["total_tokens"], 5);
+        if log_payloads {
+            assert_eq!(facts["details"]["payload"]["model_output"], marker);
+        } else {
+            assert!(facts["details"].get("payload").is_none(), "{facts:#?}");
+            assert!(
+                !std::fs::read_to_string(&log_path)
+                    .unwrap()
+                    .contains(&marker)
+            );
+        }
+    }
 }
 
 // Break caught: opting into payload logging must expose persisted workflow
@@ -685,6 +871,170 @@ async fn workflow_payload_logging_captures_matching_interpreter_response() {
     assert_eq!(
         interpreters[0]["details"]["payload"]["interpreter_output"],
         raw_interpreter
+    );
+}
+
+// Break caught: interpretation completes before the accepted human input is
+// persisted. A later SQLite failure must not erase that completed invocation.
+#[tokio::test]
+async fn interpreter_diagnostic_precedes_routing_persistence_failure() {
+    let server = MockServer::start().await;
+    let raw_interpreter = json!({
+        "confidence":0.95,
+        "intent":{"type":"continue","instruction":"continue safely"}
+    })
+    .to_string();
+    mount_sequence(&server, [sse(&raw_interpreter, 3, 2, 5)]).await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("interpreter-persistence.sqlite3");
+    let log_path = directory.path().join("interpreter-persistence.jsonl");
+    let mut store = DialogStore::open(&database).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "saved goal")
+        .unwrap();
+    drop(store);
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_followup BEFORE INSERT ON messages
+             WHEN NEW.role='user' BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        )
+        .unwrap();
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\ninterpreter_model='interpreter-model'\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=true",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::from_dialog(
+        &config,
+        DialogStore::open(&database).unwrap(),
+        started.dialog_id,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        agent.run_with_prompt("follow up").await,
+        Err(AgentError::Workflow(WorkflowEngineError::Store(_)))
+    ));
+    let interpreter = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["details"]["component"] == "human_input_interpreter")
+        .expect("completed interpreter diagnostic");
+    assert_eq!(interpreter["details"]["accepted"], true);
+    assert_eq!(interpreter["details"]["usage"]["total_tokens"], 5);
+    assert_eq!(
+        interpreter["details"]["payload"]["interpreter_output"],
+        raw_interpreter
+    );
+}
+
+// Break caught: an ordinary response is a completed provider invocation even
+// if the subsequent assistant-message transaction fails.
+#[tokio::test]
+async fn ordinary_diagnostic_precedes_answer_persistence_failure() {
+    let server = MockServer::start().await;
+    mount_sequence(&server, [sse("ORDINARY_PERSISTENCE_RAW", 3, 2, 5)]).await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("ordinary-persistence.sqlite3");
+    let log_path = directory.path().join("ordinary-persistence.jsonl");
+    let store = DialogStore::open(&database).unwrap();
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_answer BEFORE INSERT ON messages
+             WHEN NEW.role='assistant' BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        )
+        .unwrap();
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=true",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(&config, store).unwrap();
+
+    assert!(matches!(
+        agent.run_with_prompt("start task").await,
+        Err(AgentError::Workflow(WorkflowEngineError::Store(_)))
+    ));
+    let ordinary = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["details"]["component"] == "ordinary")
+        .expect("completed ordinary invocation diagnostic");
+    assert_eq!(ordinary["details"]["accepted"], false);
+    assert_eq!(ordinary["details"]["outcome"], "failed");
+    assert_eq!(ordinary["details"]["error_kind"], "persistence");
+    assert_eq!(ordinary["details"]["usage"]["total_tokens"], 5);
+    assert_eq!(
+        ordinary["details"]["payload"]["model_output"],
+        "ORDINARY_PERSISTENCE_RAW"
+    );
+}
+
+// Break caught: a completed summary response must remain observable when the
+// later stage-context update fails; compaction still fails open for the answer.
+#[tokio::test]
+async fn compaction_diagnostic_precedes_summary_persistence_failure() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("visible answer", 8, 1, 9),
+            sse("SUMMARY_PERSISTENCE_RAW", 3, 2, 5),
+            sse(&await_check(0), 2, 1, 3),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("summary-persistence.sqlite3");
+    let log_path = directory.path().join("summary-persistence.jsonl");
+    let store = DialogStore::open(&database).unwrap();
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_summary BEFORE UPDATE ON task_stage_context
+             BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        )
+        .unwrap();
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\nchecker_model='checker-model'\n[context]\nstrategy='summary'\ncompact_after_prompt_tokens=1\nkeep_last_messages=1\nsummary_max_tokens=64\n[debug]\nlog_path={:?}\nlog_payloads=true",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(&config, store).unwrap();
+
+    assert_eq!(
+        agent.run_with_prompt("start task").await.unwrap(),
+        "visible answer"
+    );
+    let compaction = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["details"]["component"] == "compaction")
+        .expect("completed compaction invocation diagnostic");
+    assert_eq!(compaction["details"]["accepted"], false);
+    assert_eq!(compaction["details"]["outcome"], "failed");
+    assert_eq!(compaction["details"]["error_kind"], "persistence");
+    assert_eq!(compaction["details"]["usage"]["total_tokens"], 5);
+    assert_eq!(
+        compaction["details"]["payload"]["model_output"],
+        "SUMMARY_PERSISTENCE_RAW"
     );
 }
 
