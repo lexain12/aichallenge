@@ -69,6 +69,324 @@ fn await_check(version: u64) -> String {
     json!({"patch":{"expected_version":version,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},"decision":{"type":"await_user"}}).to_string()
 }
 
+fn hidden_controller_dialog(store: &mut DialogStore) -> i64 {
+    use deepseek_cli::workflow::{TaskStatePatch, WorkflowIntent};
+    use deepseek_cli::workflow_store::{ControllerInputCommit, ProcessingLeaseMode};
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "human goal")
+        .unwrap();
+    let answer = store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: started.dialog_id,
+            task_id: started.task.id,
+            stage_run_id: started.stage_run_id,
+            expected_version: 0,
+            content: "saved answer",
+            usage: None,
+        })
+        .unwrap();
+    store
+        .lease_processing(answer.processing_id, 0, ProcessingLeaseMode::Normal)
+        .unwrap();
+    let intent = WorkflowIntent::human_continue("HIDDEN_CONTROLLER_BOUNDARY").unwrap();
+    store
+        .commit_controller_decision(ControllerInputCommit {
+            processing_id: answer.processing_id,
+            task_id: started.task.id,
+            stage_run_id: started.stage_run_id,
+            expected_version: 0,
+            expected_attempt: 1,
+            checker: "continuation",
+            model: "checker",
+            triggering_assistant_message_id: answer.message_id,
+            instruction: "HIDDEN_CONTROLLER_BOUNDARY",
+            intent: &intent,
+            confidence: 0.95,
+            accepted_patch: &TaskStatePatch {
+                expected_version: 0,
+                plan_append: Default::default(),
+                step_updates: vec![],
+                current_step_id: None,
+                expected_action: None,
+                checkpoint: None,
+            },
+        })
+        .unwrap();
+    started.dialog_id
+}
+
+// Break caught: hidden protocol rows must not turn a valid restored legacy
+// session into a stale writer, or weaken real stale-writer detection.
+#[tokio::test]
+async fn final_disabled_workflow_uses_raw_checkpoint_for_turns_reductions_and_branches() {
+    for strategy in ["summary", "sticky_facts", "branching"] {
+        let server = MockServer::start().await;
+        let mut responses = Vec::new();
+        if strategy == "sticky_facts" {
+            responses.push(sse(r#"{"language":"Rust"}"#, 2, 1, 3));
+        }
+        responses.push(sse("legacy answer", 10, 2, 12));
+        if strategy == "summary" {
+            responses.push(sse("visible summary", 2, 1, 3));
+        }
+        mount_sequence(&server, responses).await;
+        let config = Config::from_toml(&format!(
+            "api_key='test-key'\nbase_url='{}'\n[workflow]\nenabled=false\n[context]\nstrategy='{strategy}'\ncompact_after_prompt_tokens=1\nkeep_last_messages=1", server.uri()), None).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("raw-checkpoint.sqlite3");
+        let mut store = DialogStore::open(&database).unwrap();
+        let id = hidden_controller_dialog(&mut store);
+        let mut agent = Agent::from_dialog(&config, store, id).unwrap();
+        if strategy == "branching" {
+            let fork = agent.branch_dialog().unwrap();
+            assert_eq!(fork.checkpoint_message_count, 3);
+            agent.switch_branch(fork.new_dialog_id).unwrap();
+        }
+        let id = agent.dialog_id().unwrap();
+        let mut stale =
+            Agent::from_dialog(&config, DialogStore::open(&database).unwrap(), id).unwrap();
+        assert_eq!(
+            agent.run_with_prompt("continue legacy").await.unwrap(),
+            "legacy answer"
+        );
+        assert_eq!(agent.history().messages().len(), 4);
+        let store = DialogStore::open(&database).unwrap();
+        assert_eq!(store.raw_message_count(id).unwrap(), 5);
+        let loaded = store.load(id).unwrap();
+        assert_eq!(loaded.messages.len(), 4);
+        if strategy == "sticky_facts" {
+            assert_eq!(loaded.facts.covered_message_count(), 3);
+            assert_eq!(loaded.facts.facts()["language"], "Rust");
+        }
+        if strategy == "summary" {
+            assert_eq!(loaded.context.summary().unwrap().covered_message_count(), 3);
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            !String::from_utf8_lossy(&request.body).contains("HIDDEN_CONTROLLER_BOUNDARY")
+        }));
+        assert!(matches!(
+            stale.run_with_prompt("stale input").await,
+            Err(AgentError::Store(
+                deepseek_cli::dialog::StoreError::Conflict(_)
+            ))
+        ));
+        if strategy == "branching" {
+            assert!(matches!(
+                stale.branch_dialog(),
+                Err(AgentError::Store(
+                    deepseek_cli::dialog::StoreError::Conflict(_)
+                ))
+            ));
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            requests.len()
+        );
+        assert_eq!(store.raw_message_count(id).unwrap(), 5);
+    }
+}
+
+// Break caught: managed stats must read current-stage reductions and usage,
+// even with obsolete dialog reductions and earlier-stage messages present.
+#[tokio::test]
+async fn final_managed_context_stats_use_only_current_stage_reductions() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("stage-stats.sqlite3");
+    let mut store = DialogStore::open(&database).unwrap();
+    let id = hidden_controller_dialog(&mut store);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "UPDATE task_stage_runs SET finished_at=started_at;
+        INSERT INTO task_stage_runs(workflow_task_id,phase,sequence) VALUES(1,'planning',2);
+        UPDATE workflow_tasks SET current_stage_run_id=2;",
+        )
+        .unwrap();
+    let task = store.load_workflow(id).unwrap().current_task.unwrap();
+    let input = deepseek_cli::workflow::WorkflowInput {
+        source: deepseek_cli::workflow::WorkflowInputSource::Human,
+        intent: deepseek_cli::workflow::WorkflowIntent::human_continue("current input").unwrap(),
+    };
+    let persisted = store
+        .append_input(
+            deepseek_cli::workflow_store::InputCommit {
+                dialog_id: id,
+                input: &input,
+                protocol_text: "current input",
+                confidence: None,
+                expected_current_task: deepseek_cli::workflow_store::ExpectedCurrentTask::Present {
+                    task_id: task.id,
+                    version: task.version,
+                },
+            },
+            deepseek_cli::workflow_store::AcceptedInputEffect::ContinueSameStage,
+        )
+        .unwrap();
+    let task = persisted.task.unwrap();
+    let usage = deepseek_cli::client::TokenUsage {
+        prompt_tokens: 7,
+        completion_tokens: 3,
+        total_tokens: 10,
+        completion_tokens_details: None,
+    };
+    store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: id,
+            task_id: task.id,
+            stage_run_id: task.current_stage_run_id,
+            expected_version: task.version,
+            content: "current answer",
+            usage: Some(usage),
+        })
+        .unwrap();
+    store
+        .replace_stage_facts(
+            task.current_stage_run_id,
+            task.version,
+            2,
+            [("language".into(), "Rust".into())].into(),
+            Some(usage),
+        )
+        .unwrap();
+    store
+        .replace_context(
+            id,
+            5,
+            deepseek_cli::context::ContextSummary::new("OBSOLETE", 1),
+            None,
+        )
+        .unwrap();
+    let config = Config::from_toml(&format!("api_key='key'\nbase_url='{}'\n[context]\nstrategy='sticky_facts'\nkeep_last_messages=8",server.uri()),None).unwrap();
+    let before: i64 = connection
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap();
+    let agent = Agent::from_dialog(&config, store, id).unwrap();
+    let stats = agent.context_stats().unwrap();
+    assert_eq!(stats.facts_count, 1);
+    assert_eq!(stats.facts_covered_message_count, 2);
+    assert_eq!(stats.facts_usage.call_count(), 1);
+    assert_eq!(stats.facts_usage.total_tokens(), 10);
+    assert_eq!(stats.full_message_count, 4);
+    assert_eq!(stats.selected_message_count, 2);
+    assert_eq!(stats.raw_message_count, 2);
+    assert_eq!(stats.ordinary_usage.call_count(), 1);
+    assert_eq!(stats.ordinary_usage.total_tokens(), 10);
+    assert_eq!(stats.compaction_usage.call_count(), 0);
+    assert_eq!(stats.stage_message_count, Some(2));
+    assert_eq!(agent.context_stats().unwrap(), stats);
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap(),
+        before
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+// Break caught: a second crash cannot strand current-version processing forever.
+#[tokio::test]
+async fn final_exhausted_crash_processing_terminalizes_without_model_work() {
+    use deepseek_cli::workflow_store::ProcessingLeaseMode;
+    for paused in [false, true] {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("exhausted.sqlite3");
+        let mut store = DialogStore::open(&database).unwrap();
+        let started = store
+            .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "goal")
+            .unwrap();
+        if paused {
+            store.pause_current_task(started.dialog_id).unwrap();
+        }
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        if paused {
+            connection
+                .execute("UPDATE workflow_tasks SET status='active'", [])
+                .unwrap();
+        }
+        let task = store
+            .load_workflow(started.dialog_id)
+            .unwrap()
+            .current_task
+            .unwrap();
+        let answer = store
+            .append_answer_for_processing(AnswerCommit {
+                dialog_id: started.dialog_id,
+                task_id: task.id,
+                stage_run_id: task.current_stage_run_id,
+                expected_version: task.version,
+                content: "saved answer",
+                usage: None,
+            })
+            .unwrap();
+        store
+            .lease_processing(
+                answer.processing_id,
+                task.version,
+                ProcessingLeaseMode::Normal,
+            )
+            .unwrap();
+        store
+            .lease_processing(
+                answer.processing_id,
+                task.version,
+                ProcessingLeaseMode::Recovery,
+            )
+            .unwrap();
+        if paused {
+            connection
+                .execute("UPDATE workflow_tasks SET status='paused'", [])
+                .unwrap();
+        }
+        let before = store
+            .load_workflow(started.dialog_id)
+            .unwrap()
+            .current_task
+            .unwrap();
+        let models = Arc::new(AgentWorkflowModel::default());
+        let mut agent = Agent::from_dialog(&managed_config(&server), store, started.dialog_id)
+            .unwrap()
+            .with_workflow_models(injected_models(&models));
+        agent.recover_workflow_processing().await.unwrap();
+        assert_eq!(
+            agent.workflow_status().unwrap().unwrap().processing,
+            Some(ProcessingStatus::Failed)
+        );
+        let row: (String, u32, String) = connection
+            .query_row(
+                "SELECT status,attempts,last_error FROM response_processing",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("failed".into(), 2, "recovery attempts exhausted".into())
+        );
+        assert!(
+            agent
+                .recover_workflow_processing()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            DialogStore::open(&database)
+                .unwrap()
+                .load_workflow(started.dialog_id)
+                .unwrap()
+                .current_task
+                .unwrap(),
+            before
+        );
+        assert_eq!(agent.history().messages().len(), 2);
+        assert!(models.requests.lock().unwrap().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+}
+
 // Break caught: the workflow diagnostic sink is held across awaits, so its
 // trait-object bounds must not make otherwise Send public Agent futures local.
 #[test]
@@ -2641,7 +2959,7 @@ async fn crossing_request_is_saved_then_compacted_and_next_request_uses_summary_
     assert!(events.contains(&Seen::CompactionStarted));
     assert!(events.contains(&Seen::CompactionCompleted));
     assert_eq!(agent.history().messages().len(), 6);
-    let stats = agent.context_stats();
+    let stats = agent.context_stats().unwrap();
     assert_eq!(stats.covered_message_count, 2);
     assert_eq!(stats.raw_message_count, 4);
     assert_eq!(stats.ordinary_usage.total_tokens(), 13);
@@ -2700,8 +3018,11 @@ async fn repeated_compaction_sends_previous_summary_with_only_new_prefix() {
     assert!(input.contains("New messages:\nuser: u2\nassistant: a2"));
     assert!(!input.contains("user: u1"));
     assert!(!input.contains("user: u3"));
-    assert_eq!(agent.context_stats().covered_message_count, 4);
-    assert_eq!(agent.context_stats().compaction_usage.call_count(), 2);
+    assert_eq!(agent.context_stats().unwrap().covered_message_count, 4);
+    assert_eq!(
+        agent.context_stats().unwrap().compaction_usage.call_count(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -2736,7 +3057,7 @@ async fn resumed_retention_increase_keeps_the_previous_summary_in_compaction() {
     agent.run_with_prompt("u2").await.unwrap();
     let id = agent.dialog_id().unwrap();
     assert_eq!(agent.history().messages().len(), 4);
-    assert_eq!(agent.context_stats().covered_message_count, 2);
+    assert_eq!(agent.context_stats().unwrap().covered_message_count, 2);
     drop(agent);
 
     let log_path = directory.path().join("resumed.jsonl");
@@ -2816,7 +3137,7 @@ async fn failed_compaction_keeps_full_history_and_does_not_fail_user_answer() {
         .unwrap();
 
     assert_eq!(answer, "answer");
-    assert_eq!(agent.context_stats().covered_message_count, 0);
+    assert_eq!(agent.context_stats().unwrap().covered_message_count, 0);
     assert_eq!(agent.history().messages().len(), 2);
     assert!(events.contains(&Seen::CompactionFailed));
     agent.run_with_prompt("second").await.unwrap();
@@ -2884,7 +3205,7 @@ async fn sticky_facts_are_updated_persisted_and_sent_before_the_answer() {
     assert_eq!(stored.facts.facts()["goal"], "prepare specification");
     assert_eq!(stored.facts.covered_message_count(), 1);
     assert_eq!(stored.facts.update_usage().total_tokens(), 7);
-    let stats = agent.context_stats();
+    let stats = agent.context_stats().unwrap();
     assert_eq!(
         stats.strategy,
         deepseek_cli::config::ContextStrategy::StickyFacts

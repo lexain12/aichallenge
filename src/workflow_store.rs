@@ -20,6 +20,10 @@ use crate::workflow_context::{StageReductionState, facts_candidates};
 use crate::workflow_model::{CheckContext, HandoffPayload, project_handoff};
 
 pub trait WorkflowRepository {
+    fn load_workflow_context(
+        &self,
+        dialog_id: i64,
+    ) -> Result<Option<WorkflowContextSnapshot>, StoreError>;
     fn load_workflow_status(&self, dialog_id: i64) -> Result<WorkflowStatusSnapshot, StoreError>;
     fn pause_current_task(&mut self, dialog_id: i64) -> Result<PauseOutcome, StoreError>;
     fn load_processing_context(
@@ -150,6 +154,8 @@ pub trait WorkflowRepository {
         dialog_id: i64,
         current_version: u64,
     ) -> Result<usize, StoreError>;
+    fn close_exhausted_processing(&mut self, task: &WorkflowTaskState)
+    -> Result<usize, StoreError>;
 }
 
 pub struct TransitionCommit<'a> {
@@ -288,6 +294,9 @@ pub enum ProcessingResult {
         message_id: i64,
         workflow_input_id: i64,
         task_version: u64,
+        // Missing bindings identify legacy audit rows, never replay authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        patch_fingerprint: Option<String>,
     },
 }
 
@@ -328,6 +337,12 @@ pub struct DialogWorkflowSnapshot {
 pub struct WorkflowStatusSnapshot {
     pub current_task: Option<WorkflowTaskState>,
     pub processing: Option<ProcessingStatus>,
+}
+
+pub struct WorkflowContextSnapshot {
+    pub stage_messages: Vec<StageProtocolMessage>,
+    pub reductions: StageReductionState,
+    pub transcript_message_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -373,6 +388,21 @@ pub struct ProcessingContext {
 }
 
 impl WorkflowRepository for DialogStore {
+    fn load_workflow_context(
+        &self,
+        dialog_id: i64,
+    ) -> Result<Option<WorkflowContextSnapshot>, StoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        let Some(task) = load_workflow(&tx, dialog_id)?.current_task else {
+            return Ok(None);
+        };
+        Ok(Some(WorkflowContextSnapshot {
+            stage_messages: load_stage_messages(&tx, task.current_stage_run_id)?,
+            reductions: load_stage_reductions(&tx, task.current_stage_run_id)?,
+            transcript_message_count: crate::dialog::visible_message_count(&tx, dialog_id)?,
+        }))
+    }
+
     fn load_workflow_status(&self, dialog_id: i64) -> Result<WorkflowStatusSnapshot, StoreError> {
         let tx = self.connection.unchecked_transaction()?;
         let current_task = load_workflow(&tx, dialog_id)?.current_task;
@@ -963,6 +993,58 @@ impl WorkflowRepository for DialogStore {
             }
         }
         Ok(pending)
+    }
+
+    fn close_exhausted_processing(
+        &mut self,
+        task: &WorkflowTaskState,
+    ) -> Result<usize, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = current_task(
+            &tx,
+            task.dialog_id,
+            task.id,
+            task.current_stage_run_id,
+            task.version,
+        )?;
+        if current.status != task.status || current.phase != task.phase {
+            return Err(StoreError::WorkflowConflict(task.dialog_id));
+        }
+        if current.phase == TaskPhase::Done {
+            return Ok(0);
+        }
+        let exhausted = {
+            let mut statement = tx.prepare(
+                "SELECT p.id,p.attempts FROM response_processing p
+                 JOIN message_task_stages ms ON ms.message_id=p.assistant_message_id
+                 JOIN messages m ON m.id=ms.message_id
+                 WHERE ms.workflow_task_id=?1 AND ms.stage_run_id=?2 AND m.dialog_id=?3
+                   AND m.role='assistant' AND p.expected_version=?4
+                   AND p.status='processing' AND p.attempts>=2",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        task.id.0,
+                        task.current_stage_run_id.0,
+                        task.dialog_id,
+                        sqlite_version(task.version)?
+                    ],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, attempts) in &exhausted {
+            require_one(tx.execute(
+                "UPDATE response_processing SET status='failed', last_error='recovery attempts exhausted',
+                    updated_at=strftime('%Y-%m-%d %H:%M:%f','now')
+                 WHERE id=?1 AND status='processing' AND attempts=?2 AND expected_version=?3",
+                params![id, attempts, sqlite_version(task.version)?])?, task.dialog_id)?;
+        }
+        tx.commit()?;
+        Ok(exhausted.len())
     }
 
     fn close_stale_processing(
@@ -1924,11 +2006,23 @@ impl ProcessingRow {
                 message_id,
                 workflow_input_id,
                 task_version,
+                patch_fingerprint,
             } => {
                 positive(*message_id, "controller message id")?;
                 positive(*workflow_input_id, "controller input id")?;
                 if *task_version != next_version(self.expected_version)? {
                     return invalid("invalid controller completion version");
+                }
+                let binding = patch_fingerprint.as_deref().ok_or_else(|| {
+                    StoreError::InvalidWorkflow(
+                        "missing controller completion patch binding".into(),
+                    )
+                })?;
+                let patch: TaskStatePatch = json(binding)?;
+                if patch.expected_version != self.expected_version
+                    || serde_json::to_string(&patch)? != binding
+                {
+                    return invalid("invalid completion patch binding");
                 }
             }
         }
@@ -2027,15 +2121,20 @@ fn commit_controller(
     if command.accepted_patch.expected_version != command.expected_version {
         return Err(StoreError::WorkflowConflict(processing.dialog_id));
     }
+    let patch_fingerprint = serde_json::to_string(command.accepted_patch)?;
     if let Some(result) = processing.completed_result()? {
         let ProcessingResult::ControllerInput {
             message_id,
             workflow_input_id,
+            patch_fingerprint: ref stored_patch,
             ..
         } = result
         else {
             return Err(StoreError::WorkflowConflict(processing.dialog_id));
         };
+        if stored_patch.as_deref() != Some(patch_fingerprint.as_str()) {
+            return Err(StoreError::WorkflowConflict(processing.dialog_id));
+        }
         let matches: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_inputs i
              JOIN messages m ON m.id = i.message_id
@@ -2096,6 +2195,7 @@ fn commit_controller(
         message_id,
         workflow_input_id,
         task_version: projected.version,
+        patch_fingerprint: Some(patch_fingerprint),
     };
     complete_processing(connection, processing, command.expected_attempt, &result)?;
     touch_dialog(connection, task.dialog_id, message_id)?;

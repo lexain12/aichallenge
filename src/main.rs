@@ -12,7 +12,7 @@ use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::memory::{DEFAULT_TASK_ID, DEFAULT_USER_ID, DurableMemoryScope, RequestScope};
 use deepseek_cli::terminal::{BlockStyle, TerminalUi};
 use deepseek_cli::workflow::TaskPhase;
-use deepseek_cli::workflow_engine::WorkflowTurnEvent;
+use deepseek_cli::workflow_engine::{WorkflowEngineError, WorkflowTurnEvent};
 use deepseek_cli::workflow_store::PauseOutcome;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -180,6 +180,10 @@ async fn run() -> Result<(), AppError> {
                 job.stop_reason
                     != deepseek_cli::workflow_engine::AutonomyStopReason::AwaitUserAfterRestart
             }),
+            Err(
+                error
+                @ (AgentError::Store(_) | AgentError::Workflow(WorkflowEngineError::Store(_))),
+            ) => return Err(error.into()),
             Err(_) => true,
         };
         if failed {
@@ -270,7 +274,7 @@ async fn run() -> Result<(), AppError> {
                 stdout_ui.write_block(&mut stdout, BlockStyle::System, "Conversation cleared.")?;
             }
             InputAction::Stats => {
-                stdout_ui.write_context_stats(&mut stdout, agent.context_stats())?;
+                stdout_ui.write_context_stats(&mut stdout, agent.context_stats()?)?;
             }
             InputAction::TaskStatus => {
                 let status = agent.workflow_status()?;
@@ -303,7 +307,7 @@ async fn run() -> Result<(), AppError> {
                 stdout_ui.write_memory(
                     &mut stdout,
                     agent.scope(),
-                    agent.context_stats(),
+                    agent.context_stats()?,
                     &snapshot,
                     filter,
                 )?;
@@ -648,7 +652,9 @@ async fn run_prompt<W: io::Write, E: io::Write>(
     match result {
         Ok(_) => Ok(()),
         // Stop on persistence errors: never continue an unsaved session silently.
-        Err(error @ AgentError::Store(_)) => Err(error.into()),
+        Err(
+            error @ (AgentError::Store(_) | AgentError::Workflow(WorkflowEngineError::Store(_))),
+        ) => Err(error.into()),
         Err(error) => {
             stderr_ui.write_block(
                 stderr,

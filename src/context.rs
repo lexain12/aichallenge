@@ -166,6 +166,8 @@ impl CompactionPlan {
 pub struct ContextStats {
     pub strategy: ContextStrategy,
     pub full_message_count: usize,
+    /// Present for a managed task; other context counts and usage are stage-local.
+    pub stage_message_count: Option<usize>,
     pub covered_message_count: usize,
     pub raw_message_count: usize,
     pub selected_message_count: usize,
@@ -439,6 +441,7 @@ pub fn stats(
     ContextStats {
         strategy: config.strategy(),
         full_message_count: history.messages().len(),
+        stage_message_count: None,
         covered_message_count,
         raw_message_count,
         selected_message_count,

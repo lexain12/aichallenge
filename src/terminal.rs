@@ -103,8 +103,11 @@ impl TerminalUi {
             let dialog = scope
                 .dialog_id()
                 .map_or_else(|| "new".to_owned(), |id| format!("#{id}"));
+            let active_stage = stats.stage_message_count.map_or_else(String::new, |count| {
+                format!(" · current stage messages: {count}")
+            });
             self.write_block(writer, BlockStyle::System, &format!(
-                "Conversation · dialog: {dialog} · strategy: {} · messages: {} · summary boundary: {} · sticky facts: {}",
+                "Conversation · dialog: {dialog} · strategy: {} · messages: {}{active_stage} · summary boundary: {} · sticky facts: {}",
                 stats.strategy.as_str(), stats.full_message_count, stats.covered_message_count, stats.facts_count,
             ))?;
         }
@@ -218,59 +221,72 @@ impl TerminalUi {
             BlockStyle::System,
             &format!("Стратегия · {}", stats.strategy.as_str()),
         )?;
+        let history_label = match stats.stage_message_count {
+            Some(count) => format!(
+                "транскрипт: {} · текущий этап: {count}",
+                stats.full_message_count
+            ),
+            None => format!("полная история: {}", stats.full_message_count),
+        };
         let context = match stats.strategy {
             crate::config::ContextStrategy::Summary => format!(
-                "Контекст · полная история: {} · покрыто summary: {} · дословно: {}",
-                stats.full_message_count, stats.covered_message_count, stats.raw_message_count
+                "Контекст · {history_label} · покрыто summary: {} · дословно: {}",
+                stats.covered_message_count, stats.raw_message_count
             ),
             crate::config::ContextStrategy::SlidingWindow => format!(
-                "Контекст · полная история: {} · в запросе: {}",
-                stats.full_message_count, stats.selected_message_count
+                "Контекст · {history_label} · в запросе: {}",
+                stats.selected_message_count
             ),
             crate::config::ContextStrategy::StickyFacts => format!(
-                "Контекст · полная история: {} · в запросе: {} · facts: {} · facts до: {}",
-                stats.full_message_count,
-                stats.selected_message_count,
-                stats.facts_count,
-                stats.facts_covered_message_count
+                "Контекст · {history_label} · в запросе: {} · facts: {} · facts до: {}",
+                stats.selected_message_count, stats.facts_count, stats.facts_covered_message_count
             ),
             crate::config::ContextStrategy::Branching => match stats.branch_group_id {
                 Some(group) => format!(
-                    "Контекст · полная история: {} · в запросе: {} · диалог: #{} · группа: #{}",
-                    stats.full_message_count,
+                    "Контекст · {history_label} · в запросе: {} · диалог: #{} · группа: #{}",
                     stats.selected_message_count,
                     stats.dialog_id.unwrap_or_default(),
                     group
                 ),
                 None => format!(
-                    "Контекст · полная история: {} · в запросе: {} · диалог: #{} · группа не создана",
-                    stats.full_message_count,
+                    "Контекст · {history_label} · в запросе: {} · диалог: #{} · группа не создана",
                     stats.selected_message_count,
                     stats.dialog_id.unwrap_or_default()
                 ),
             },
         };
         self.write_block(writer, BlockStyle::System, &context)?;
+        let (answer_label, summary_label, facts_label, api_label) =
+            if stats.stage_message_count.is_some() {
+                (
+                    "Ответы этапа",
+                    "Summary этапа",
+                    "Facts этапа",
+                    "API этапа всего",
+                )
+            } else {
+                ("Ответы", "Summary", "Facts", "API всего")
+            };
         self.write_block(
             writer,
             BlockStyle::System,
-            &format_usage_totals("Ответы", stats.ordinary_usage),
+            &format_usage_totals(answer_label, stats.ordinary_usage),
         )?;
         self.write_block(
             writer,
             BlockStyle::System,
-            &format_usage_totals("Summary", stats.compaction_usage),
+            &format_usage_totals(summary_label, stats.compaction_usage),
         )?;
         self.write_block(
             writer,
             BlockStyle::System,
-            &format_usage_totals("Facts", stats.facts_usage),
+            &format_usage_totals(facts_label, stats.facts_usage),
         )?;
         self.write_block(
             writer,
             BlockStyle::System,
             &format!(
-                "API всего · {}",
+                "{api_label} · {}",
                 stats
                     .ordinary_usage
                     .total_tokens()

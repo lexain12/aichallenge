@@ -340,6 +340,279 @@ fn workflow_patch(version: u64) -> Value {
         "step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null})
 }
 
+// Break caught: a nested durable-answer write error must stop the CLI, without
+// processing the next command or exposing SQLite diagnostic payloads.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_workflow_answer_storage_failure_is_fatal_and_sanitized() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse("unsaved answer", 2, 1, 3))
+        .mount(&server)
+        .await;
+    let config = write_workflow_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("fatal-answer.sqlite3");
+    drop(DialogStore::open(&database).unwrap());
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_answer BEFORE INSERT ON messages WHEN NEW.role='assistant'
+        BEGIN SELECT RAISE(ABORT, 'SECRET_SQLITE_DIAGNOSTIC'); END;",
+        )
+        .unwrap();
+    let output = run_cli_args(config.path(), &database, &[], "goal\n/task\nexit\n");
+    assert!(
+        !output.status.success(),
+        "durable write failure must be fatal"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("unsaved answer"));
+    assert!(
+        !stdout.contains("Workflow task"),
+        "later /task was processed: {stdout}"
+    );
+    assert!(!stderr.contains("SECRET_SQLITE_DIAGNOSTIC"), "{stderr}");
+    assert!(stderr.contains("persistence"), "{stderr}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(
+        DialogStore::open(&database)
+            .unwrap()
+            .load(1)
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+}
+
+// Break caught: disabling workflow on restore must support both legacy turns
+// and forks after hidden controller protocol has already been persisted.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_disabled_workflow_cli_continues_and_branches_without_controller_leakage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/chat/completions"))
+        .respond_with(SequenceResponder { responses: Arc::new(Mutex::new([
+            sse("first answer", 2, 1, 3),
+            workflow_check(workflow_patch(0), json!({"type":"continue","instruction":"HIDDEN_DISABLED_CONTROLLER","confidence":0.95})),
+            sse("second answer", 2, 1, 3),
+            workflow_check(workflow_patch(1), json!({"type":"await_user"})),
+            sse("legacy answer", 2, 1, 3),
+        ].into_iter().collect())) }).mount(&server).await;
+    let disabled = write_branching_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("disabled.sqlite3");
+    let config = write_observed_workflow_config(
+        &server.uri(),
+        &directory.path().join("debug.jsonl"),
+        "strategy='branching'",
+    );
+    assert!(
+        run_cli_args(config.path(), &database, &[], "goal\n/branch\n/exit\n")
+            .status
+            .success()
+    );
+    assert_eq!(
+        DialogStore::open(&database).unwrap().list().unwrap().len(),
+        2
+    );
+    let output = run_cli_args(
+        disabled.path(),
+        &database,
+        &["--resume", "2"],
+        "/branch\n/switch 3\nlegacy continuation\n/exit\n",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("legacy answer"), "{stdout}");
+    assert!(!stdout.contains("HIDDEN_DISABLED_CONTROLLER"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("HIDDEN_DISABLED_CONTROLLER"));
+    let store = DialogStore::open(&database).unwrap();
+    assert_eq!(store.list().unwrap().len(), 3);
+    assert_eq!(store.raw_message_count(1).unwrap(), 4);
+    assert_eq!(store.raw_message_count(2).unwrap(), 4);
+    assert_eq!(store.raw_message_count(3).unwrap(), 6);
+    assert_eq!(store.load(3).unwrap().messages.len(), 5);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(!String::from_utf8_lossy(&requests[4].body).contains("HIDDEN_DISABLED_CONTROLLER"));
+}
+
+// Break caught: /stats and conversation-memory output must report managed
+// stage facts and costs separately from the visible transcript total.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_managed_stats_and_memory_report_current_stage_costs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(
+                [
+                    sse(r#"{"language":"Rust"}"#, 2, 1, 3),
+                    sse("saved answer", 7, 3, 10),
+                    workflow_check(workflow_patch(0), json!({"type":"await_user"})),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        })
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("stats.sqlite3");
+    let config = write_observed_workflow_config(
+        &server.uri(),
+        &directory.path().join("debug.jsonl"),
+        "strategy='sticky_facts'\nkeep_last_messages=8",
+    );
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &[],
+        "goal\n/stats\n/memory\n/exit\n",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("транскрипт: 2 · текущий этап: 2 · в запросе: 2 · facts: 1 · facts до: 1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "messages: 2 · current stage messages: 2 · summary boundary: 0 · sticky facts: 1"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("API этапа всего · 13"), "{stdout}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+// Break caught: /task after restart must not report Processing forever when
+// both durable leases crashed, nor retry a provider or mutate the task.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_exhausted_processing_cli_reports_failed_without_provider_calls() {
+    use deepseek_cli::workflow_store::ProcessingLeaseMode;
+    let server = MockServer::start().await;
+    let config = write_workflow_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("exhausted-cli.sqlite3");
+    let mut store = DialogStore::open(&database).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "goal")
+        .unwrap();
+    let answer = store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: started.dialog_id,
+            task_id: started.task.id,
+            stage_run_id: started.stage_run_id,
+            expected_version: 0,
+            content: "saved answer",
+            usage: None,
+        })
+        .unwrap();
+    store
+        .lease_processing(answer.processing_id, 0, ProcessingLeaseMode::Normal)
+        .unwrap();
+    store
+        .lease_processing(answer.processing_id, 0, ProcessingLeaseMode::Recovery)
+        .unwrap();
+    for _ in 0..2 {
+        let output = run_cli_args(
+            config.path(),
+            &database,
+            &["--resume-last"],
+            "/task\n/exit\n",
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("processing: failed"));
+        assert_eq!(
+            store
+                .load_workflow(started.dialog_id)
+                .unwrap()
+                .current_task
+                .unwrap(),
+            started.task
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+// Break caught: startup recovery may warn on advisory model failure, but a
+// failed durable completion write must stop before replay and later commands.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_workflow_recovery_storage_failure_is_fatal_and_sanitized() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(workflow_check(
+            workflow_patch(0),
+            json!({"type":"await_user"}),
+        ))
+        .mount(&server)
+        .await;
+    let config = write_workflow_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("fatal-recovery.sqlite3");
+    let mut store = DialogStore::open(&database).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "goal")
+        .unwrap();
+    store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: started.dialog_id,
+            task_id: started.task.id,
+            stage_run_id: started.stage_run_id,
+            expected_version: 0,
+            content: "saved answer",
+            usage: None,
+        })
+        .unwrap();
+    let connection = Connection::open(&database).unwrap();
+    connection.execute_batch("CREATE TRIGGER reject_completion BEFORE UPDATE ON response_processing WHEN NEW.status='completed'
+        BEGIN SELECT RAISE(ABORT, 'SECRET_RECOVERY_DIAGNOSTIC'); END;").unwrap();
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &["--resume-last"],
+        "/task\n/exit\n",
+    );
+    assert!(
+        !output.status.success(),
+        "durable recovery write failure must be fatal"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Scope ·"));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("persistence"), "{stderr}");
+    assert!(!stderr.contains("SECRET_RECOVERY_DIAGNOSTIC"), "{stderr}");
+    assert_eq!(
+        store
+            .load_workflow(started.dialog_id)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        started.task
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
 #[cfg(unix)]
 fn workflow_check(patch: Value, decision: Value) -> ResponseTemplate {
     sse(

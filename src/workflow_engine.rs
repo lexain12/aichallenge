@@ -886,6 +886,7 @@ pub struct WorkflowSession<'a> {
     pub dialog_id: &'a mut Option<i64>,
     pub scope: &'a mut RequestScope,
     pub history: &'a mut ChatHistory,
+    pub persisted_message_count: &'a mut usize,
     pub last_usage: &'a mut Option<TokenUsage>,
 }
 
@@ -1429,6 +1430,7 @@ impl<'a> WorkflowEngine<'a> {
         } else if input_observation.component != "human_input_interpreter" {
             self.record_input_observation(input_observation, &routing, prompt, &budget, None);
         }
+        *self.session.persisted_message_count += 1;
         self.session.history.push(Role::User, prompt.to_owned());
         match &routing {
             RoutingOutcome::Rejected { reason, .. } => {
@@ -1983,6 +1985,7 @@ impl<'a> WorkflowEngine<'a> {
                 ))
             }
             Ok(route) => {
+                *self.session.persisted_message_count += 1;
                 let output_state = match &route {
                     RoutingOutcome::Managed { state, .. } => Some(state),
                     RoutingOutcome::Unmanaged { .. } => Some(&task),
@@ -2129,6 +2132,7 @@ impl<'a> WorkflowEngine<'a> {
         self.session
             .store
             .close_stale_processing(dialog_id, task.version)?;
+        self.session.store.close_exhausted_processing(&task)?;
         let pending = self.session.store.load_pending_processing(dialog_id)?;
         let mut recovered = Vec::new();
         let mut budget = AutonomyBudget::new(&self.workflow_config);
@@ -2364,6 +2368,7 @@ impl<'a> WorkflowEngine<'a> {
             }
             RoutingOutcome::Rejected { .. } => unreachable!(),
         };
+        *self.session.persisted_message_count += 1;
         self.session.history.push_answer(answer.clone(), usage);
         self.record_service_diagnostic(
             "ordinary",
@@ -2958,6 +2963,7 @@ impl WorkflowEngineError {
         match self {
             Self::Provider { component, source } => source.operator_message(component),
             Self::Client(source) => source.operator_message("workflow"),
+            Self::Store(_) => "workflow persistence failed".into(),
             _ => self.to_string(),
         }
     }
@@ -3080,6 +3086,7 @@ mod tests {
         let mut dialog_id = None;
         let mut scope = RequestScope::default();
         let mut history = ChatHistory::new("BASE".into());
+        let mut persisted_message_count = 0;
         let mut last_usage = None;
         let write_attempts = Arc::new(AtomicUsize::new(0));
         let mut debug_log = DebugLog::from_writer_for_test(
@@ -3113,6 +3120,7 @@ mod tests {
                 dialog_id: &mut dialog_id,
                 scope: &mut scope,
                 history: &mut history,
+                persisted_message_count: &mut persisted_message_count,
                 last_usage: &mut last_usage,
             },
         )
@@ -3194,6 +3202,8 @@ mod tests {
                     .unwrap();
                 let original_facts = reductions.facts.clone();
                 let mut history = ChatHistory::new("BASE".into());
+                let mut persisted_message_count =
+                    store.raw_message_count(started.dialog_id).unwrap();
                 let mut last_usage = None;
                 let mut budget = AutonomyBudget::new(config.workflow());
                 let mut engine = WorkflowEngine::new(
@@ -3206,6 +3216,7 @@ mod tests {
                         dialog_id: &mut dialog_id,
                         scope: &mut scope,
                         history: &mut history,
+                        persisted_message_count: &mut persisted_message_count,
                         last_usage: &mut last_usage,
                     },
                 );

@@ -51,6 +51,15 @@ fn transition_processing_result_preserves_existing_json_shape() {
     assert_eq!(target_state.current_stage_run_id, StageRunId(4));
     assert_eq!(target_state.version, 3);
     assert_eq!(serde_json::to_value(result).unwrap(), stored);
+    // Old controller completions remain readable as audit, while new ones
+    // carry an explicit semantic binding without changing the existing keys.
+    for raw in [
+        r#"{"decision":"controller_input","message_id":8,"workflow_input_id":9,"task_version":4}"#,
+        r#"{"decision":"controller_input","message_id":8,"workflow_input_id":9,"task_version":4,"patch_fingerprint":"{\"expected_version\":3,\"plan_append\":{\"steps\":[],\"acceptance_criteria\":[]},\"step_updates\":[],\"current_step_id\":null,\"expected_action\":\"Next action\",\"checkpoint\":null}"}"#,
+    ] {
+        let result: ProcessingResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(serde_json::to_string(&result).unwrap(), raw);
+    }
 }
 
 // Break caught: recovery must reconstruct the accepted typed input and truncate stage history at its answer.
@@ -2111,6 +2120,221 @@ fn controller_command<'a>(
     }
 }
 
+// Break caught: exact controller replay must bind every accepted patch field,
+// including across branch ID remapping, and old unbound rows fail closed.
+fn assert_controller_replay_patch_binding(legacy: bool) {
+    let (mut fixture, processing, assistant) = pending_fixture();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    let intent = WorkflowIntent::human_continue("Do next").unwrap();
+    let accepted = patch(3);
+    let result = fixture
+        .store
+        .commit_controller_decision(controller_command(
+            processing, assistant, &intent, &accepted,
+        ))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .commit_controller_decision(controller_command(
+                processing, assistant, &intent, &accepted
+            ))
+            .unwrap(),
+        result
+    );
+    if legacy {
+        let mut raw = serde_json::to_value(&result).unwrap();
+        raw.as_object_mut().unwrap().remove("patch_fingerprint");
+        fixture
+            .connection
+            .execute(
+                "UPDATE response_processing SET result_json=?1 WHERE id=?2",
+                rusqlite::params![raw.to_string(), processing],
+            )
+            .unwrap();
+    }
+    let branch = fixture.store.fork_dialog(1, 3).unwrap().new_dialog_id;
+    let copied_task = fixture
+        .store
+        .load_workflow(branch)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let (copied_processing, copied_assistant): (i64, i64) = fixture.connection.query_row(
+            "SELECT p.id,p.assistant_message_id FROM response_processing p JOIN messages m ON m.id=p.assistant_message_id WHERE m.dialog_id=?1", [branch], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    let before_task = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    for (pid, aid, task) in [
+        (processing, assistant, &before_task),
+        (copied_processing, copied_assistant, &copied_task),
+    ] {
+        let before = processing_record(&fixture.connection, pid);
+        let mut same = controller_command(pid, aid, &intent, &accepted);
+        same.task_id = task.id;
+        same.stage_run_id = task.current_stage_run_id;
+        let replay = fixture.store.commit_controller_decision(same);
+        if legacy {
+            assert!(replay.is_err(), "unbound legacy replay must fail closed");
+        } else {
+            assert!(replay.is_ok());
+        }
+        let mut changed = accepted.clone();
+        changed.expected_action = Some("DIFFERENT proposed effect".into());
+        let mut command = controller_command(pid, aid, &intent, &changed);
+        command.task_id = task.id;
+        command.stage_run_id = task.current_stage_run_id;
+        assert!(
+            fixture.store.commit_controller_decision(command).is_err(),
+            "different patch must not replay successfully"
+        );
+        assert_eq!(processing_record(&fixture.connection, pid), before);
+        assert_eq!(
+            fixture
+                .store
+                .load_workflow(task.dialog_id)
+                .unwrap()
+                .current_task
+                .unwrap(),
+            *task
+        );
+        assert_eq!(
+            fixture.store.load(task.dialog_id).unwrap().messages.len(),
+            2
+        );
+    }
+    assert_eq!(count(&fixture.connection, "messages"), 6);
+}
+
+#[test]
+fn final_controller_replay_binds_patch_in_original_and_branch() {
+    assert_controller_replay_patch_binding(false);
+}
+
+#[test]
+fn final_legacy_controller_replay_fails_closed_and_preserves_branch_audit() {
+    assert_controller_replay_patch_binding(true);
+}
+
+// Break caught: cleanup must fence the selected task/stage/version/status and
+// exact attempt, preserve other terminal states, and roll back a failed batch.
+#[test]
+fn final_exhausted_processing_closure_is_scoped_atomic_and_fenced() {
+    let (mut fixture, processing, assistant) = pending_fixture();
+    let task = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    assert_eq!(fixture.store.close_exhausted_processing(&task).unwrap(), 0);
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Recovery)
+        .unwrap();
+    let before = processing_record(&fixture.connection, processing);
+    for field in ["task", "stage", "version", "status"] {
+        let mut stale = task.clone();
+        match field {
+            "task" => stale.id = WorkflowTaskId(99),
+            "stage" => stale.current_stage_run_id = StageRunId(99),
+            "version" => stale.version += 1,
+            "status" => stale.status = TaskStatus::Paused,
+            _ => unreachable!(),
+        }
+        assert!(
+            fixture.store.close_exhausted_processing(&stale).is_err(),
+            "{field}"
+        );
+        assert_eq!(processing_record(&fixture.connection, processing), before);
+    }
+    let answer = fixture
+        .store
+        .append_answer_for_processing(answer_command(3))
+        .unwrap();
+    fixture
+        .store
+        .lease_processing(answer.processing_id, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    fixture
+        .store
+        .lease_processing(answer.processing_id, 3, ProcessingLeaseMode::Recovery)
+        .unwrap();
+    fixture
+        .connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_exhausted BEFORE UPDATE ON response_processing
+        WHEN NEW.id={} AND NEW.status='failed' BEGIN SELECT RAISE(ABORT,'injected'); END;",
+            answer.processing_id
+        ))
+        .unwrap();
+    assert!(fixture.store.close_exhausted_processing(&task).is_err());
+    assert_eq!(processing_record(&fixture.connection, processing), before);
+    assert_eq!(
+        processing_record(&fixture.connection, answer.processing_id).0,
+        "processing"
+    );
+    fixture
+        .connection
+        .execute_batch("DROP TRIGGER fail_exhausted")
+        .unwrap();
+    fixture
+        .connection
+        .execute(
+            "UPDATE response_processing SET attempts=3 WHERE id=?1",
+            [processing],
+        )
+        .unwrap();
+    assert_eq!(fixture.store.close_exhausted_processing(&task).unwrap(), 2);
+    assert_eq!(
+        processing_record(&fixture.connection, processing),
+        (
+            "failed".into(),
+            3,
+            Some("recovery attempts exhausted".into()),
+            None
+        )
+    );
+    assert_eq!(fixture.store.close_exhausted_processing(&task).unwrap(), 0);
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        task
+    );
+    assert!(
+        fixture
+            .store
+            .fail_processing(failure_command(processing, assistant, 2, "late worker"))
+            .is_err()
+    );
+    for status in ["completed", "failed"] {
+        fixture
+            .connection
+            .execute(
+                "UPDATE response_processing SET status=?1,last_error='keep diagnostic' WHERE id=?2",
+                rusqlite::params![status, processing],
+            )
+            .unwrap();
+        let before = processing_record(&fixture.connection, processing);
+        assert_eq!(fixture.store.close_exhausted_processing(&task).unwrap(), 0);
+        assert_eq!(processing_record(&fixture.connection, processing), before);
+    }
+}
+
 fn failure_command(
     processing: i64,
     assistant: i64,
@@ -3086,6 +3310,7 @@ fn controller_completion_is_hidden_atomic_idempotent_and_single_version_incremen
             message_id,
             workflow_input_id,
             task_version,
+            ..
         } = result
         else {
             panic!("wrong result")

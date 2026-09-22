@@ -42,6 +42,7 @@ pub struct WorkflowStatus {
 pub struct Agent {
     client: DeepSeekClient,
     history: ChatHistory,
+    persisted_message_count: usize,
     prompt: Option<String>,
     store: Option<DialogStore>,
     dialog_id: Option<i64>,
@@ -80,6 +81,7 @@ impl Agent {
         let dialog = store.load(id)?;
         let mut agent = Self::with_store(config, store)?;
         agent.last_usage = dialog.messages.last().and_then(|message| message.usage());
+        agent.persisted_message_count = dialog.raw_message_count;
         agent.context_state = dialog.context;
         agent.facts_state = dialog.facts;
         agent.branch_info = dialog.branch;
@@ -171,6 +173,7 @@ impl Agent {
         Ok(Self {
             client,
             history: ChatHistory::new(config.system_prompt().to_owned()),
+            persisted_message_count: 0,
             prompt: None,
             store: None,
             dialog_id: None,
@@ -191,6 +194,7 @@ impl Agent {
         Self {
             client,
             history: ChatHistory::new(system_prompt.to_owned()),
+            persisted_message_count: 0,
             prompt: None,
             store: None,
             dialog_id: None,
@@ -294,6 +298,7 @@ impl Agent {
                     dialog_id: &mut self.dialog_id,
                     scope: &mut self.scope,
                     history: &mut self.history,
+                    persisted_message_count: &mut self.persisted_message_count,
                     last_usage: &mut self.last_usage,
                 },
             );
@@ -397,6 +402,7 @@ impl Agent {
                     dialog_id: &mut self.dialog_id,
                     scope: &mut self.scope,
                     history: &mut self.history,
+                    persisted_message_count: &mut self.persisted_message_count,
                     last_usage: &mut self.last_usage,
                 },
             );
@@ -443,7 +449,7 @@ impl Agent {
         if let Some(store) = &mut self.store {
             match self.dialog_id {
                 Some(id) => {
-                    store.append_message(id, self.history.messages().len(), Role::User, prompt)?
+                    store.append_message(id, self.persisted_message_count, Role::User, prompt)?
                 }
                 None => {
                     let id = store.start_dialog_in_scope(
@@ -455,6 +461,7 @@ impl Agent {
                     self.scope = self.scope.with_dialog_id(Some(id));
                 }
             }
+            self.persisted_message_count += 1;
         }
         let mut additional_blocks = if persistent {
             let context = (|| {
@@ -541,7 +548,8 @@ impl Agent {
         }
         if let Some(store) = &mut self.store {
             let id = self.dialog_id.expect("persistent input created a dialog");
-            store.append_answer(id, self.history.messages().len(), &answer, usage)?;
+            store.append_answer(id, self.persisted_message_count, &answer, usage)?;
+            self.persisted_message_count += 1;
         } else {
             self.history.push(Role::User, prompt.to_owned());
             self.facts_state = candidate_facts;
@@ -576,16 +584,7 @@ impl Agent {
         }
         let id = self.dialog_id.ok_or(AgentError::NoPersistentDialog)?;
         let store = self.store.as_mut().ok_or(AgentError::NoPersistentDialog)?;
-        let expected_count = if self
-            .workflow_config
-            .as_ref()
-            .is_some_and(WorkflowConfig::enabled)
-        {
-            store.raw_message_count(id)?
-        } else {
-            self.history.messages().len()
-        };
-        let fork = store.fork_dialog(id, expected_count)?;
+        let fork = store.fork_dialog(id, self.persisted_message_count)?;
         self.branch_info = Some(BranchInfo {
             dialog_id: id,
             branch_group_id: fork.branch_group_id,
@@ -620,6 +619,7 @@ impl Agent {
         let store = self.store.as_ref().ok_or(AgentError::NoPersistentDialog)?;
         let dialog = store.load_branch_member(current_id, target_id)?;
         let last_usage = dialog.messages.last().and_then(|message| message.usage());
+        self.persisted_message_count = dialog.raw_message_count;
         self.history = ChatHistory::from_messages(dialog.system_prompt, dialog.messages);
         self.context_state = dialog.context;
         self.facts_state = dialog.facts;
@@ -640,22 +640,45 @@ impl Agent {
         Ok(())
     }
 
-    pub fn context_stats(&self) -> ContextStats {
-        stats(
+    pub fn context_stats(&self) -> Result<ContextStats, AgentError> {
+        let branch_group_id = self
+            .branch_info
+            .as_ref()
+            .map(|branch| branch.branch_group_id);
+        if self
+            .workflow_config
+            .as_ref()
+            .is_some_and(WorkflowConfig::enabled)
+            && let (Some(store), Some(dialog_id)) = (self.store.as_ref(), self.dialog_id)
+            && let Some(snapshot) = store.load_workflow_context(dialog_id)?
+        {
+            let history = crate::workflow_context::stage_history(&snapshot.stage_messages);
+            let mut result = stats(
+                &history,
+                &snapshot.reductions.context,
+                &snapshot.reductions.facts,
+                &self.context_config,
+                self.dialog_id,
+                branch_group_id,
+            );
+            result.stage_message_count = Some(history.messages().len());
+            result.full_message_count = snapshot.transcript_message_count;
+            return Ok(result);
+        }
+        Ok(stats(
             &self.history,
             &self.context_state,
             &self.facts_state,
             &self.context_config,
             self.dialog_id,
-            self.branch_info
-                .as_ref()
-                .map(|branch| branch.branch_group_id),
-        )
+            branch_group_id,
+        ))
     }
 
     /// Start a fresh conversation, retaining prompts and keeping old dialogs on disk.
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.persisted_message_count = 0;
         self.dialog_id = None;
         self.scope = self.scope.with_dialog_id(None);
         self.last_usage = None;
@@ -763,7 +786,7 @@ impl Agent {
             let id = self
                 .dialog_id
                 .expect("persistent input created a dialog before facts update");
-            store.replace_facts(id, candidate_messages.len(), facts, result.usage())?
+            store.replace_facts(id, self.persisted_message_count, facts, result.usage())?
         } else {
             self.facts_state
                 .clone()
@@ -893,7 +916,7 @@ impl Agent {
             let id = self
                 .dialog_id
                 .expect("completed persistent turn has a dialog");
-            store.replace_context(id, self.history.messages().len(), summary, result.usage())?
+            store.replace_context(id, self.persisted_message_count, summary, result.usage())?
         } else {
             let mut state = self.context_state.clone();
             state.replace_summary(summary, result.usage());

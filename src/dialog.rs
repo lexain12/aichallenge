@@ -26,6 +26,8 @@ pub struct StoredDialog {
     pub scope: RequestScope,
     pub system_prompt: String,
     pub messages: Vec<Message>,
+    /// CAS checkpoint from the same snapshot, including hidden protocol rows.
+    pub raw_message_count: usize,
     pub context: ContextState,
     pub facts: FactsState,
     pub branch: Option<BranchInfo>,
@@ -410,9 +412,10 @@ impl DialogStore {
                 },
             )
             .optional()?;
-        let state = decode_facts(stored, expected_message_count)?.updated(
+        let visible_message_count = visible_message_count(&tx, id)?;
+        let state = decode_facts(stored, visible_message_count)?.updated(
             facts,
-            expected_message_count,
+            visible_message_count,
             usage,
         );
         let facts_json = serde_json::to_string(state.facts())?;
@@ -804,18 +807,16 @@ impl DialogStore {
             [id],
             |row| row.get(0),
         )?;
-        let branch = decode_branch(
-            id,
-            stored_branch,
-            usize::try_from(protocol_count)
-                .map_err(|_| StoreError::InvalidBranch("invalid protocol count"))?,
-        )?;
+        let raw_message_count = usize::try_from(protocol_count)
+            .map_err(|_| StoreError::InvalidBranch("invalid protocol count"))?;
+        let branch = decode_branch(id, stored_branch, raw_message_count)?;
         tx.commit()?;
         Ok(StoredDialog {
             id,
             scope,
             system_prompt,
             messages,
+            raw_message_count,
             context,
             facts,
             branch,
@@ -864,6 +865,16 @@ impl DialogStore {
         }
         Ok(dialogs)
     }
+}
+
+pub(crate) fn visible_message_count(connection: &Connection, id: i64) -> Result<usize, StoreError> {
+    let count: i64 = connection.query_row(
+        "SELECT count(*) FROM messages m LEFT JOIN workflow_inputs i ON i.message_id=m.id
+         WHERE m.dialog_id=?1 AND (i.source IS NULL OR i.source='human' OR m.role='assistant')",
+        [id],
+        |row| row.get(0),
+    )?;
+    usize::try_from(count).map_err(|_| StoreError::InvalidContext("invalid visible message count"))
 }
 
 impl MemoryRepository for DialogStore {

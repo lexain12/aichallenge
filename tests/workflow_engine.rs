@@ -171,6 +171,7 @@ struct Fixture {
     dialog_id: Option<i64>,
     scope: RequestScope,
     history: ChatHistory,
+    persisted_message_count: usize,
     last_usage: Option<TokenUsage>,
 }
 
@@ -207,6 +208,7 @@ impl Fixture {
                 dialog_id: &mut self.dialog_id,
                 scope: &mut self.scope,
                 history: &mut self.history,
+                persisted_message_count: &mut self.persisted_message_count,
                 last_usage: &mut self.last_usage,
             },
         );
@@ -234,6 +236,7 @@ impl Fixture {
                 dialog_id: &mut self.dialog_id,
                 scope: &mut self.scope,
                 history: &mut self.history,
+                persisted_message_count: &mut self.persisted_message_count,
                 last_usage: &mut self.last_usage,
             },
         )
@@ -290,6 +293,7 @@ impl Fixture {
             dialog_id,
             scope,
             history,
+            persisted_message_count: usize::from(dialog_id.is_some()),
             last_usage: None,
         }
     }
@@ -357,6 +361,7 @@ impl Fixture {
                 dialog_id: &mut self.dialog_id,
                 scope: &mut self.scope,
                 history: &mut self.history,
+                persisted_message_count: &mut self.persisted_message_count,
                 last_usage: &mut self.last_usage,
             },
         )
@@ -520,6 +525,7 @@ async fn cancellation_at_interpreter_handoff_ordinary_and_recovery_boundaries_is
                 dialog_id: &mut f.dialog_id,
                 scope: &mut f.scope,
                 history: &mut f.history,
+                persisted_message_count: &mut f.persisted_message_count,
                 last_usage: &mut f.last_usage,
             },
         );
