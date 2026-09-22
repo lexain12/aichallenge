@@ -980,10 +980,10 @@ pub(crate) fn copy_workflow_branch(
         }
     }
     for (old, new) in &processing {
-        let (raw, status): (Option<String>, String) = tx.query_row(
-            "SELECT result_json,status FROM response_processing WHERE id=?1",
+        let (raw, status, expected_version): (Option<String>, String, i64) = tx.query_row(
+            "SELECT result_json,status,expected_version FROM response_processing WHERE id=?1",
             [old],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let copied = if let Some(raw) = raw {
             match serde_json::from_str::<ProcessingResult>(&raw) {
@@ -1024,6 +1024,11 @@ pub(crate) fn copy_workflow_branch(
                     }
                     Some(serde_json::to_string(&result)?)
                 }
+                Err(_)
+                    if status == "completed" && legacy_await_user_audit(&raw, expected_version) =>
+                {
+                    Some(raw)
+                }
                 Err(_) if status != "completed" => {
                     json::<serde_json::Value>(&raw)?;
                     Some(raw)
@@ -1059,6 +1064,22 @@ pub(crate) fn copy_workflow_branch(
         load_workflow(tx, target_dialog_id)?;
     }
     Ok(())
+}
+
+// Legacy AwaitUser has no database IDs to remap, but must never authorize patch replay.
+fn legacy_await_user_audit(raw: &str, expected_version: i64) -> bool {
+    #[derive(Deserialize)]
+    #[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+    enum LegacyResult {
+        AwaitUser { task_version: u64 },
+    }
+    let Ok(LegacyResult::AwaitUser { task_version }) = serde_json::from_str(raw) else {
+        return false;
+    };
+    i64::try_from(task_version).is_ok_and(|version| {
+        expected_version >= 0
+            && (version == expected_version || expected_version.checked_add(1) == Some(version))
+    })
 }
 
 fn initialize_stage_context(connection: &Connection, stage: StageRunId) -> Result<(), StoreError> {

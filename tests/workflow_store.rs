@@ -2351,6 +2351,145 @@ fn await_user_branch_preserves_exact_patch_replay_identity() {
     );
 }
 
+// Break caught: branching must preserve pre-fingerprint AwaitUser audit without enabling its replay.
+#[test]
+fn legacy_await_user_branch_preserves_raw_audit_but_replay_stays_rejected() {
+    for (raw, nonempty_patch) in [
+        (
+            " {\"task_version\":3, \"decision\":\"await_user\"}\n",
+            false,
+        ),
+        ("\n{\"decision\":\"await_user\", \"task_version\":4} ", true),
+    ] {
+        let (mut fixture, processing, _) = pending_fixture();
+        fixture
+            .store
+            .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+            .unwrap();
+        let mut accepted = patch(3);
+        if !nonempty_patch {
+            accepted.expected_action = None;
+        }
+        fixture
+            .store
+            .commit_await_user(
+                processing,
+                WorkflowTaskId(1),
+                StageRunId(1),
+                3,
+                1,
+                &accepted,
+            )
+            .unwrap();
+        fixture
+            .connection
+            .execute(
+                "UPDATE response_processing SET result_json=?1 WHERE id=?2",
+                rusqlite::params![raw, processing],
+            )
+            .unwrap();
+        let original_record = processing_record(&fixture.connection, processing);
+        let branch = fixture.store.fork_dialog(1, 2).unwrap().new_dialog_id;
+        let task = fixture
+            .store
+            .load_workflow(branch)
+            .unwrap()
+            .current_task
+            .unwrap();
+        let copied_processing: i64 = fixture.connection.query_row("SELECT p.id FROM response_processing p JOIN messages m ON m.id=p.assistant_message_id WHERE m.dialog_id=?1", [branch], |row| row.get(0)).unwrap();
+        assert_ne!(copied_processing, processing);
+        assert_eq!(
+            processing_record(&fixture.connection, copied_processing),
+            original_record
+        );
+        assert_eq!(original_record.3.as_deref(), Some(raw));
+        assert_eq!(
+            fixture.store.load(branch).unwrap().messages,
+            fixture.store.load(1).unwrap().messages
+        );
+        for (id, task_id, stage_id) in [
+            (processing, WorkflowTaskId(1), StageRunId(1)),
+            (copied_processing, task.id, task.current_stage_run_id),
+        ] {
+            assert!(matches!(
+                fixture
+                    .store
+                    .commit_await_user(id, task_id, stage_id, 3, 1, &accepted),
+                Err(StoreError::InvalidWorkflow(_) | StoreError::WorkflowConflict(_))
+            ));
+            assert_eq!(processing_record(&fixture.connection, id), original_record);
+        }
+        assert_eq!(
+            fixture
+                .store
+                .load_workflow(branch)
+                .unwrap()
+                .current_task
+                .unwrap(),
+            task
+        );
+        assert_eq!(count(&fixture.connection, "dialogs"), 2);
+        assert_eq!(count(&fixture.connection, "messages"), 4);
+    }
+}
+
+// Break caught: the branch-only legacy exception must not admit malformed or unknown result shapes.
+#[test]
+fn legacy_await_user_branch_rejects_malformed_unknown_or_invalid_results() {
+    for raw in [
+        r#"{"decision":"await_user","task_version":4,"unknown":true}"#,
+        r#"{"decision":"await_user","task_version":4,"patch_fingerprint":null}"#,
+        r#"{"decision":"await_user"}"#,
+        r#"{"decision":"await_user","task_version":-1}"#,
+        r#"{"decision":"await_user","task_version":4.0}"#,
+        r#"{"decision":"await_user","task_version":"4"}"#,
+        r#"{"decision":"await_user","task_version":2}"#,
+        r#"{"decision":"await_user","task_version":5}"#,
+        r#"{"decision":"await_user","task_version":18446744073709551615}"#,
+        r#"{"decision":"await_user","task_version":4,"task_version":4}"#,
+        r#"{"decision":"unknown","task_version":4}"#,
+        r#"{"decision":"controller_input","task_version":4}"#,
+        r#"{"decision":"transition","task_version":4}"#,
+        "not JSON",
+    ] {
+        let (mut fixture, processing, _) = pending_fixture();
+        fixture
+            .store
+            .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+            .unwrap();
+        fixture
+            .store
+            .commit_await_user(
+                processing,
+                WorkflowTaskId(1),
+                StageRunId(1),
+                3,
+                1,
+                &patch(3),
+            )
+            .unwrap();
+        fixture
+            .connection
+            .execute(
+                "UPDATE response_processing SET result_json=?1 WHERE id=?2",
+                rusqlite::params![raw, processing],
+            )
+            .unwrap();
+        let before = processing_record(&fixture.connection, processing);
+        assert!(
+            matches!(
+                fixture.store.fork_dialog(1, 2),
+                Err(StoreError::InvalidWorkflow(_))
+            ),
+            "{raw}"
+        );
+        assert_eq!(processing_record(&fixture.connection, processing), before);
+        assert_eq!(count(&fixture.connection, "dialogs"), 1);
+        assert_eq!(count(&fixture.connection, "messages"), 2);
+        assert_eq!(count(&fixture.connection, "response_processing"), 1);
+    }
+}
+
 // Break caught: legacy or corrupt completion JSON must never authorize unbound patch replay.
 #[test]
 fn await_user_replay_rejects_missing_or_invalid_patch_binding() {
