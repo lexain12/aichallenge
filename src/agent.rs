@@ -19,7 +19,7 @@ use crate::memory::{
 use crate::profile::{ProfileRepository, UserProfile};
 use crate::system_context::{CompactionPolicy, ContextScope, SystemBlock, SystemBlockMetadata};
 use crate::workflow_engine::{
-    WorkflowEngine, WorkflowEngineError, WorkflowModels, WorkflowSession,
+    RecoveredProcessing, WorkflowEngine, WorkflowEngineError, WorkflowModels, WorkflowSession,
 };
 use crate::workflow_model::DeepSeekCompletionModel;
 
@@ -234,6 +234,40 @@ impl Agent {
         } else {
             self.run_legacy_streaming(prompt, on_event).await
         }
+    }
+
+    pub async fn recover_workflow_processing(
+        &mut self,
+    ) -> Result<Vec<RecoveredProcessing>, AgentError> {
+        let Some(config) = self
+            .workflow_config
+            .as_ref()
+            .filter(|config| config.enabled())
+        else {
+            return Ok(vec![]);
+        };
+        let (Some(dialog_id), Some(store)) = (self.dialog_id, self.store.as_mut()) else {
+            return Ok(vec![]);
+        };
+        let models = self
+            .workflow_models
+            .as_ref()
+            .ok_or(AgentError::WorkflowUnavailable)?;
+        Ok(WorkflowEngine::new(
+            &self.client,
+            &self.context_config,
+            config,
+            models,
+            WorkflowSession {
+                store,
+                dialog_id: &mut self.dialog_id,
+                scope: &mut self.scope,
+                history: &mut self.history,
+                last_usage: &mut self.last_usage,
+            },
+        )
+        .recover_pending_processing(dialog_id)
+        .await?)
     }
 
     pub async fn run_workflow_streaming<F>(

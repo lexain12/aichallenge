@@ -501,6 +501,15 @@ pub enum CheckError {
     },
 }
 
+impl CheckError {
+    pub fn usage(&self) -> Option<TokenUsage> {
+        match self {
+            Self::Model(_) => None,
+            Self::Policy { usage, .. } => *usage,
+        }
+    }
+}
+
 impl From<ModelPolicyError> for CheckError {
     fn from(error: ModelPolicyError) -> Self {
         Self::Policy { error, usage: None }

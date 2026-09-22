@@ -21,6 +21,179 @@ use deepseek_cli::workflow_store::{
 use deepseek_cli::workflow_store::{ProcessingStatus, ProtocolSource, WorkflowRepository};
 use rusqlite::Connection;
 
+// Break caught: recovery must reconstruct the accepted typed input and truncate stage history at its answer.
+#[test]
+fn processing_context_is_bound_to_dialog_and_original_answer() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("context.sqlite3")).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "original goal")
+        .unwrap();
+    let answer = store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: started.dialog_id,
+            task_id: started.task.id,
+            stage_run_id: started.stage_run_id,
+            expected_version: 0,
+            content: "saved answer",
+            usage: None,
+        })
+        .unwrap();
+    let work = store
+        .load_processing_context(started.dialog_id, answer.processing_id)
+        .unwrap();
+    assert_eq!(work.response, "saved answer");
+    assert_eq!(
+        work.context.triggering_input.intent,
+        WorkflowIntent::StartNewTask {
+            goal: "original goal".into()
+        }
+    );
+    assert_eq!(work.context.stage_messages.len(), 2);
+    assert_eq!(work.checker_name, "continuation");
+    assert!(
+        store
+            .load_processing_context(started.dialog_id + 1, answer.processing_id)
+            .is_err()
+    );
+    assert!(
+        store
+            .load_processing_result(started.dialog_id + 1, answer.processing_id)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load_processing_result(started.dialog_id, answer.processing_id)
+            .unwrap(),
+        None
+    );
+    store
+        .lease_processing(answer.processing_id, 0, ProcessingLeaseMode::Normal)
+        .unwrap();
+    let result = store
+        .commit_await_user(
+            answer.processing_id,
+            started.task.id,
+            started.stage_run_id,
+            0,
+            1,
+            &TaskStatePatch {
+                expected_version: 0,
+                plan_append: Default::default(),
+                step_updates: vec![],
+                current_step_id: None,
+                expected_action: Some("review".into()),
+                checkpoint: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .load_processing_result(started.dialog_id, answer.processing_id)
+            .unwrap(),
+        Some(result)
+    );
+    assert!(
+        store
+            .load_processing_context(started.dialog_id, answer.processing_id)
+            .is_err(),
+        "old-version job cannot be checked against the new version"
+    );
+}
+
+// Break caught: restart can finish advisory work on Paused without enabling normal controller effects.
+#[test]
+fn recovery_only_completion_and_failure_preserve_paused_status_and_exact_attempt() {
+    for fail in [false, true] {
+        let (mut fixture, processing, assistant) = pending_fixture();
+        fixture
+            .connection
+            .execute("UPDATE workflow_tasks SET status='paused' WHERE id=1", [])
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+                .is_err()
+        );
+        let lease = fixture
+            .store
+            .lease_processing(processing, 3, ProcessingLeaseMode::Recovery)
+            .unwrap()
+            .unwrap();
+        let accepted = patch(3);
+        assert!(
+            fixture
+                .store
+                .commit_await_user(
+                    processing,
+                    WorkflowTaskId(1),
+                    StageRunId(1),
+                    3,
+                    lease.attempts,
+                    &accepted
+                )
+                .is_err()
+        );
+        if fail {
+            assert!(
+                fixture
+                    .store
+                    .fail_processing(failure_command(
+                        processing,
+                        assistant,
+                        lease.attempts,
+                        "checker failed"
+                    ))
+                    .is_err()
+            );
+            fixture
+                .store
+                .fail_processing_with_mode(
+                    failure_command(processing, assistant, lease.attempts, "checker failed"),
+                    ProcessingLeaseMode::Recovery,
+                )
+                .unwrap();
+        } else {
+            assert!(
+                fixture
+                    .store
+                    .commit_await_user_with_mode(
+                        processing,
+                        WorkflowTaskId(1),
+                        StageRunId(1),
+                        3,
+                        2,
+                        &accepted,
+                        ProcessingLeaseMode::Recovery
+                    )
+                    .is_err()
+            );
+            fixture
+                .store
+                .commit_await_user_with_mode(
+                    processing,
+                    WorkflowTaskId(1),
+                    StageRunId(1),
+                    3,
+                    lease.attempts,
+                    &accepted,
+                    ProcessingLeaseMode::Recovery,
+                )
+                .unwrap();
+        }
+        let state = fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap();
+        assert_eq!(state.status, TaskStatus::Paused);
+        assert_eq!(state.current_stage_run_id, StageRunId(1));
+        assert_eq!(state.version, if fail { 3 } else { 4 });
+    }
+}
+
 fn unmanaged_answer_fixture() -> (Fixture, i64) {
     let (mut fixture, processing, assistant) = pending_fixture();
     fixture
@@ -2847,12 +3020,15 @@ fn stale_processing_and_closed_or_paused_stages_cannot_apply_effects() {
                 )
                 .is_err()
         );
-        assert!(
+        let recovered =
             fixture
                 .store
-                .lease_processing(processing, 3, ProcessingLeaseMode::Recovery)
-                .is_err()
-        );
+                .lease_processing(processing, 3, ProcessingLeaseMode::Recovery);
+        if corruption.contains("status='paused'") {
+            assert_eq!(recovered.unwrap().unwrap().attempts, 2);
+        } else {
+            assert!(recovered.is_err());
+        }
         assert_eq!(count(&fixture.connection, "messages"), 2);
     }
 }

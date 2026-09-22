@@ -48,7 +48,7 @@ impl CompletionModel for AgentWorkflowModel {
             .lock()
             .unwrap()
             .pop_front()
-            .expect("unexpected workflow service call");
+            .unwrap_or_else(|| "unavailable checker".into());
         Box::pin(async move {
             Ok(ModelResponse {
                 content,
@@ -66,6 +66,50 @@ fn injected_models(service: &Arc<AgentWorkflowModel>) -> WorkflowModels {
     }
 }
 
+fn await_check(version: u64) -> String {
+    json!({"patch":{"expected_version":version,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},"decision":{"type":"await_user"}}).to_string()
+}
+
+// Break caught: restoring an Agent must expose advisory recovery without running the ordinary model.
+#[tokio::test]
+async fn resumed_agent_recovers_advisory_work_without_autonomous_resume() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("recovery.sqlite3")).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&Default::default(), "BASE", "saved goal")
+        .unwrap();
+    store
+        .append_answer_for_processing(deepseek_cli::workflow_store::AnswerCommit {
+            dialog_id: started.dialog_id,
+            task_id: started.task.id,
+            stage_run_id: started.stage_run_id,
+            expected_version: 0,
+            content: "saved answer",
+            usage: None,
+        })
+        .unwrap();
+    let service = Arc::new(AgentWorkflowModel::default());
+    service.responses.lock().unwrap().push_back(await_check(0));
+    let mut agent = Agent::from_dialog(&managed_config(&server), store, started.dialog_id)
+        .unwrap()
+        .with_workflow_models(injected_models(&service));
+    let recovered = agent.recover_workflow_processing().await.unwrap();
+    assert_eq!(
+        recovered[0].stop_reason,
+        deepseek_cli::workflow_engine::AutonomyStopReason::AwaitUserAfterRestart
+    );
+    assert!(
+        agent
+            .recover_workflow_processing()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(agent.history().messages().len(), 2);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
 // Break caught: workflow-enabled persistent agents must create a tagged task/input and pending answer job.
 #[tokio::test]
 async fn managed_agent_persists_task_and_uses_injected_interpreter_before_the_next_answer() {
@@ -78,10 +122,12 @@ async fn managed_agent_persists_task_and_uses_injected_interpreter_before_the_ne
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("dialogs.sqlite3");
     let service = Arc::new(AgentWorkflowModel::default());
+    service.responses.lock().unwrap().push_back(await_check(0));
     service.responses.lock().unwrap().push_back(
         json!({"confidence":0.95,"intent":{"type":"continue","instruction":"continue plan"}})
             .to_string(),
     );
+    service.responses.lock().unwrap().push_back(await_check(1));
     let mut agent = Agent::with_store(
         &managed_config(&server),
         DialogStore::open(&database).unwrap(),
@@ -89,9 +135,10 @@ async fn managed_agent_persists_task_and_uses_injected_interpreter_before_the_ne
     .unwrap()
     .with_workflow_models(injected_models(&service));
     agent.run_with_prompt("create a parser").await.unwrap();
-    assert!(
-        service.requests.lock().unwrap().is_empty(),
-        "first task is deterministic"
+    assert_eq!(
+        service.requests.lock().unwrap().len(),
+        1,
+        "first task only calls its checker"
     );
     let observer = DialogStore::open(&database).unwrap();
     let first = observer
@@ -105,14 +152,18 @@ async fn managed_agent_persists_task_and_uses_injected_interpreter_before_the_ne
             .load_pending_processing(first.dialog_id)
             .unwrap()
             .len(),
-        1
+        0
     );
     agent.run_with_prompt("continue plan").await.unwrap();
     let requests = service.requests.lock().unwrap();
-    assert_eq!(requests.len(), 1, "checker is deferred to Task 9");
-    let interpreted: Value = serde_json::from_str(requests[0].messages[1].content()).unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "checker, next human interpreter, checker"
+    );
+    let interpreted: Value = serde_json::from_str(requests[1].messages[1].content()).unwrap();
     assert_eq!(interpreted["human_text"], "continue plan");
-    assert!(!requests[0].messages[1].content().contains("first answer"));
+    assert!(!requests[1].messages[1].content().contains("first answer"));
     let task = observer
         .load_workflow(first.dialog_id)
         .unwrap()
@@ -150,9 +201,11 @@ async fn managed_agent_uses_configured_service_models_and_restored_stage_context
         &server,
         [
             sse("old execution answer", 2, 1, 3),
+            sse(&await_check(0), 2, 1, 3),
             sse(&interpretation, 2, 1, 3),
             sse(&handoff, 2, 1, 3),
             sse("validation answer", 2, 1, 3),
+            sse(&await_check(1), 2, 1, 3),
         ],
     )
     .await;
@@ -182,12 +235,14 @@ async fn managed_agent_uses_configured_service_models_and_restored_stage_context
             .collect::<Vec<_>>(),
         [
             "ordinary-model",
+            "checker-model",
             "interpreter-model",
             "handoff-model",
-            "ordinary-model"
+            "ordinary-model",
+            "checker-model"
         ]
     );
-    let ordinary = bodies[3]["messages"].to_string();
+    let ordinary = bodies[4]["messages"].to_string();
     assert!(ordinary.contains("validation"));
     assert!(ordinary.contains("CURRENT CHECKPOINT"));
     assert!(!ordinary.contains("execution-only input"));
@@ -279,14 +334,15 @@ async fn restored_managed_dialog_with_hidden_controller_input_can_branch() {
     let mut store = DialogStore::open(&database).unwrap();
     let task = store.load_workflow(id).unwrap().current_task.unwrap();
     let processing = store.load_pending_processing(id).unwrap().remove(0);
-    store
+    let lease = store
         .lease_processing(processing.id, task.version, ProcessingLeaseMode::Normal)
+        .unwrap()
         .unwrap();
     let intent = WorkflowIntent::human_continue("HIDDEN CONTROLLER").unwrap();
     store
         .commit_controller_decision(ControllerInputCommit {
             processing_id: processing.id,
-            expected_attempt: 1,
+            expected_attempt: lease.attempts,
             task_id: task.id,
             stage_run_id: task.current_stage_run_id,
             expected_version: task.version,
@@ -333,7 +389,7 @@ async fn restored_managed_dialog_with_hidden_controller_input_can_branch() {
             .iter()
             .all(|m| m.content() != "HIDDEN CONTROLLER")
     );
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 fn agent(server: &MockServer) -> Agent {

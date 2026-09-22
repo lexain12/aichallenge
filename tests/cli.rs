@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use deepseek_cli::dialog::DialogStore;
 use deepseek_cli::memory::{MemoryRepository, RequestScope};
 use deepseek_cli::profile::ProfileRepository;
+use deepseek_cli::workflow_store::{AnswerCommit, WorkflowRepository};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
@@ -132,6 +133,77 @@ fn run_cli_args(config_path: &Path, database: &Path, args: &[&str], input: &str)
         .write_all(input.as_bytes())
         .expect("write scripted input");
     child.wait_with_output().expect("wait for deepseek-cli")
+}
+
+// Break caught: the CLI must recover before reading the first restored prompt, even when that prompt exits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_cli_recovers_pending_work_before_prompt_and_warns_on_failure() {
+    for valid in [false, true] {
+        let server = MockServer::start().await;
+        let response = if valid {
+            json!({"patch":{"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":"review recovered result","checkpoint":null},"decision":{"type":"continue","instruction":"HIDDEN MUST NOT RUN","confidence":0.95}}).to_string()
+        } else {
+            "invalid checker payload".into()
+        };
+        Mock::given(method("POST"))
+            .respond_with(sse(&response, 2, 1, 3))
+            .mount(&server)
+            .await;
+        let mut config = NamedTempFile::new().unwrap();
+        write!(config, "api_key='test-key'\nbase_url='{}'\n[workflow]\nchecker_model='checker-only'\n[context]\nstrategy='summary'\n", server.uri()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("recovery.sqlite3");
+        let mut store = DialogStore::open(&database).unwrap();
+        let started = store
+            .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "saved goal")
+            .unwrap();
+        store
+            .append_answer_for_processing(AnswerCommit {
+                dialog_id: started.dialog_id,
+                task_id: started.task.id,
+                stage_run_id: started.stage_run_id,
+                expected_version: 0,
+                content: "saved answer",
+                usage: None,
+            })
+            .unwrap();
+        let output = run_cli_args(config.path(), &database, &["--resume-last"], "/exit\n");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].body_json::<Value>().unwrap()["model"],
+            "checker-only"
+        );
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("HIDDEN MUST NOT RUN")
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        if !valid {
+            assert!(stderr.contains("workflow recovery"), "{stderr}");
+        }
+        assert_eq!(store.load(started.dialog_id).unwrap().messages.len(), 2);
+        assert_eq!(
+            store
+                .load_workflow(started.dialog_id)
+                .unwrap()
+                .current_task
+                .unwrap()
+                .expected_action
+                .as_deref(),
+            if valid {
+                Some("review recovered result")
+            } else {
+                None
+            }
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

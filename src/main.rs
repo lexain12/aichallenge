@@ -143,6 +143,23 @@ async fn run() -> Result<(), AppError> {
             .expect("CLI identifiers and default scope are nonblank"),
         )?,
     };
+    if resume.is_some() {
+        let recovery = agent.recover_workflow_processing().await;
+        let failed = match recovery {
+            Ok(recovered) => recovered.iter().any(|job| {
+                job.stop_reason
+                    != deepseek_cli::workflow_engine::AutonomyStopReason::AwaitUserAfterRestart
+            }),
+            Err(_) => true,
+        };
+        if failed {
+            TerminalUi::stderr().write_block(
+                &mut io::stderr(),
+                BlockStyle::Error,
+                "workflow recovery could not finish advisory processing; waiting for human input.",
+            )?;
+        }
+    }
     stdout_ui.write_block(
         &mut stdout,
         BlockStyle::System,

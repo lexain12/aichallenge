@@ -17,9 +17,19 @@ use crate::workflow::{
     WorkflowTaskId, WorkflowTaskState,
 };
 use crate::workflow_context::{StageReductionState, facts_candidates};
-use crate::workflow_model::{HandoffPayload, project_handoff};
+use crate::workflow_model::{CheckContext, HandoffPayload, project_handoff};
 
 pub trait WorkflowRepository {
+    fn load_processing_context(
+        &self,
+        dialog_id: i64,
+        processing_id: i64,
+    ) -> Result<ProcessingContext, StoreError>;
+    fn load_processing_result(
+        &self,
+        dialog_id: i64,
+        processing_id: i64,
+    ) -> Result<Option<ProcessingResult>, StoreError>;
     fn load_stage_reductions(
         &self,
         stage_run_id: StageRunId,
@@ -64,12 +74,41 @@ pub trait WorkflowRepository {
         expected_version: u64,
         expected_attempt: u32,
         patch: &TaskStatePatch,
+    ) -> Result<ProcessingResult, StoreError> {
+        self.commit_await_user_with_mode(
+            processing_id,
+            task_id,
+            stage_run_id,
+            expected_version,
+            expected_attempt,
+            patch,
+            ProcessingLeaseMode::Normal,
+        )
+    }
+    // Preserve the existing explicit origin/attempt API and add only the recovery policy.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_await_user_with_mode(
+        &mut self,
+        processing_id: i64,
+        task_id: WorkflowTaskId,
+        stage_run_id: StageRunId,
+        expected_version: u64,
+        expected_attempt: u32,
+        patch: &TaskStatePatch,
+        mode: ProcessingLeaseMode,
     ) -> Result<ProcessingResult, StoreError>;
     fn commit_controller_decision(
         &mut self,
         command: ControllerInputCommit<'_>,
     ) -> Result<ProcessingResult, StoreError>;
-    fn fail_processing(&mut self, command: FailProcessingCommit<'_>) -> Result<(), StoreError>;
+    fn fail_processing(&mut self, command: FailProcessingCommit<'_>) -> Result<(), StoreError> {
+        self.fail_processing_with_mode(command, ProcessingLeaseMode::Normal)
+    }
+    fn fail_processing_with_mode(
+        &mut self,
+        command: FailProcessingCommit<'_>,
+        mode: ProcessingLeaseMode,
+    ) -> Result<(), StoreError>;
     fn append_input(
         &mut self,
         command: InputCommit<'_>,
@@ -309,7 +348,87 @@ pub struct PendingProcessing {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ProcessingContext {
+    pub context: CheckContext,
+    pub response: String,
+    pub checker_name: String,
+}
+
 impl WorkflowRepository for DialogStore {
+    fn load_processing_result(
+        &self,
+        dialog_id: i64,
+        processing_id: i64,
+    ) -> Result<Option<ProcessingResult>, StoreError> {
+        let processing = processing_row(&self.connection, processing_id)?;
+        if processing.dialog_id != dialog_id {
+            return Err(StoreError::WorkflowConflict(dialog_id));
+        }
+        processing.completed_result()
+    }
+
+    fn load_processing_context(
+        &self,
+        dialog_id: i64,
+        processing_id: i64,
+    ) -> Result<ProcessingContext, StoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        let processing = processing_row(&tx, processing_id)?;
+        if processing.dialog_id != dialog_id {
+            return Err(StoreError::WorkflowConflict(dialog_id));
+        }
+        let task = processing.current_task_for_mode(&tx, ProcessingLeaseMode::Recovery)?;
+        let mut messages = load_stage_messages(&tx, processing.stage_run_id)?;
+        let position = messages
+            .iter()
+            .position(|row| row.message_id == processing.assistant_message_id)
+            .ok_or_else(|| {
+                StoreError::InvalidWorkflow("processing answer missing from stage".into())
+            })?;
+        messages.truncate(position + 1);
+        let response = messages[position].message.content().to_owned();
+        let input = messages[..position]
+            .iter()
+            .rev()
+            .find(|row| row.message.role() == Role::User)
+            .ok_or_else(|| StoreError::InvalidWorkflow("processing input missing".into()))?;
+        let mut query = tx.prepare(
+            "SELECT source,checker_name,model_name,triggering_assistant_message_id,intent_json
+            FROM workflow_inputs WHERE message_id=?1 AND dialog_id=?2 AND outcome='accepted'",
+        )?;
+        let mut rows = query.query(params![input.message_id, dialog_id])?;
+        let row = rows.next()?.ok_or_else(|| {
+            StoreError::InvalidWorkflow("processing input provenance missing".into())
+        })?;
+        let source = match field::<String>(row, 0)?.as_str() {
+            "human" => WorkflowInputSource::Human,
+            "controller" => WorkflowInputSource::Controller {
+                checker: field(row, 1)?,
+                model: field(row, 2)?,
+                triggering_assistant_message_id: positive(
+                    integer(row, 3)?,
+                    "triggering assistant",
+                )?,
+            },
+            _ => return invalid("invalid processing input source"),
+        };
+        let triggering_input = WorkflowInput {
+            source,
+            intent: json(&field::<String>(row, 4)?)?,
+        };
+        triggering_input.validate().map_err(domain_error)?;
+        Ok(ProcessingContext {
+            context: CheckContext {
+                task,
+                triggering_input,
+                stage_messages: messages.into_iter().map(|row| row.message).collect(),
+            },
+            response,
+            checker_name: processing.checker,
+        })
+    }
+
     fn load_stage_reductions(
         &self,
         stage_run_id: StageRunId,
@@ -421,7 +540,7 @@ impl WorkflowRepository for DialogStore {
         if processing.status == ProcessingStatus::Completed || processing.attempts >= 2 {
             return Ok(None);
         }
-        processing.current_task(&tx)?;
+        processing.current_task_for_mode(&tx, mode)?;
         if processing.status == ProcessingStatus::Processing && mode == ProcessingLeaseMode::Normal
         {
             return Ok(None);
@@ -449,7 +568,7 @@ impl WorkflowRepository for DialogStore {
         }))
     }
 
-    fn commit_await_user(
+    fn commit_await_user_with_mode(
         &mut self,
         processing_id: i64,
         task_id: WorkflowTaskId,
@@ -457,6 +576,7 @@ impl WorkflowRepository for DialogStore {
         expected_version: u64,
         expected_attempt: u32,
         patch: &TaskStatePatch,
+        mode: ProcessingLeaseMode,
     ) -> Result<ProcessingResult, StoreError> {
         let tx = self
             .connection
@@ -475,7 +595,7 @@ impl WorkflowRepository for DialogStore {
             return Ok(result);
         }
         processing.require_leased(expected_attempt)?;
-        let task = processing.current_task(&tx)?;
+        let task = processing.current_task_for_mode(&tx, mode)?;
         let projected = task
             .apply_patch(patch, PatchContext::Normal)
             .map_err(domain_error)?;
@@ -504,7 +624,11 @@ impl WorkflowRepository for DialogStore {
         Ok(result)
     }
 
-    fn fail_processing(&mut self, command: FailProcessingCommit<'_>) -> Result<(), StoreError> {
+    fn fail_processing_with_mode(
+        &mut self,
+        command: FailProcessingCommit<'_>,
+        mode: ProcessingLeaseMode,
+    ) -> Result<(), StoreError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -522,7 +646,7 @@ impl WorkflowRepository for DialogStore {
             return Err(StoreError::WorkflowConflict(command.dialog_id));
         }
         processing.require_leased(command.expected_attempt)?;
-        processing.current_task(&tx)?;
+        processing.current_task_for_mode(&tx, mode)?;
         let changed = tx.execute(
             "UPDATE response_processing SET status = 'failed', last_error = ?1,
                     updated_at = strftime('%Y-%m-%d %H:%M:%f','now')
@@ -1598,6 +1722,14 @@ impl ProcessingRow {
     }
 
     fn current_task(&self, connection: &Connection) -> Result<WorkflowTaskState, StoreError> {
+        self.current_task_for_mode(connection, ProcessingLeaseMode::Normal)
+    }
+
+    fn current_task_for_mode(
+        &self,
+        connection: &Connection,
+        mode: ProcessingLeaseMode,
+    ) -> Result<WorkflowTaskState, StoreError> {
         let task = current_task(
             connection,
             self.dialog_id,
@@ -1605,7 +1737,11 @@ impl ProcessingRow {
             self.stage_run_id,
             self.expected_version,
         )?;
-        active_task(&task)?;
+        if mode == ProcessingLeaseMode::Normal {
+            active_task(&task)?;
+        } else if task.phase == TaskPhase::Done {
+            return invalid("processing requires an unfinished task");
+        }
         Ok(task)
     }
 

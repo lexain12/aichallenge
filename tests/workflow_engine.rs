@@ -14,11 +14,14 @@ use deepseek_cli::workflow::{
     WorkflowInput, WorkflowInputSource, WorkflowIntent, WorkflowTaskState,
 };
 use deepseek_cli::workflow_engine::{
-    InputHandlingContext, RoutingOutcome, WorkflowEngine, WorkflowEngineError,
-    WorkflowInputHandler, WorkflowModels, WorkflowSession, WorkflowTurnEvent,
+    AutonomyBudget, AutonomyStopReason, InputHandlingContext, PipelineOutcome, ResponsePipeline,
+    RoutingOutcome, StateFingerprint, WorkflowEngine, WorkflowEngineError, WorkflowInputHandler,
+    WorkflowModels, WorkflowSession, WorkflowTurnEvent,
 };
 use deepseek_cli::workflow_model::{
-    CompletionModel, HandoffBuilder, ModelError, ModelFuture, ModelRequest, ModelResponse,
+    CheckContext, CheckFuture, CheckerMode, CompletionModel, ContinuationCheckResult,
+    ControllerDecision, HandoffBuilder, ModelError, ModelFuture, ModelRequest, ModelResponse,
+    ResponseChecker,
 };
 use deepseek_cli::workflow_store::{
     AcceptedInputEffect, AnswerCommit, ControllerInputCommit, ExpectedCurrentTask, InputCommit,
@@ -34,6 +37,7 @@ struct FakeModel {
     responses: Mutex<VecDeque<Result<String, ModelError>>>,
     requests: Mutex<Vec<ModelRequest>>,
     before_reply: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    missing_usage: bool,
 }
 
 impl FakeModel {
@@ -61,14 +65,14 @@ impl CompletionModel for FakeModel {
             .lock()
             .unwrap()
             .pop_front()
-            .expect("unexpected service call");
+            .unwrap_or_else(|| Err(ClientError::EmptyAnswer.into()));
         if let Some(action) = self.before_reply.lock().unwrap().take() {
             action();
         }
         Box::pin(async move {
             Ok(ModelResponse {
                 content: content?,
-                usage: Some(usage()),
+                usage: (!self.missing_usage).then(usage),
             })
         })
     }
@@ -103,6 +107,13 @@ fn ordinary_response(answer: &str, done: bool) -> ResponseTemplate {
         ))
 }
 
+fn response_without_usage(answer: &str) -> ResponseTemplate {
+    let chunk = json!({"choices":[{"delta":{"content":answer},"finish_reason":"stop"}]});
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n"))
+}
+
 struct Fixture {
     _directory: tempfile::TempDir,
     connection: Connection,
@@ -120,6 +131,72 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn pending_answer(&mut self) -> deepseek_cli::workflow_store::PersistedAnswer {
+        let task = self.current().unwrap();
+        self.store
+            .append_answer_for_processing(AnswerCommit {
+                dialog_id: task.dialog_id,
+                task_id: task.id,
+                stage_run_id: task.current_stage_run_id,
+                expected_version: task.version,
+                content: "saved answer",
+                usage: Some(usage()),
+            })
+            .unwrap()
+    }
+
+    async fn process(
+        &mut self,
+        id: i64,
+        budget: &mut AutonomyBudget,
+        mode: ProcessingLeaseMode,
+        pipeline: Option<ResponsePipeline>,
+    ) -> deepseek_cli::workflow_engine::ProcessingOutcome {
+        let models = self.models();
+        let engine = WorkflowEngine::new(
+            &self.client,
+            self.config.context(),
+            self.config.workflow(),
+            &models,
+            WorkflowSession {
+                store: &mut self.store,
+                dialog_id: &mut self.dialog_id,
+                scope: &mut self.scope,
+                history: &mut self.history,
+                last_usage: &mut self.last_usage,
+            },
+        );
+        let mut engine = if let Some(pipeline) = pipeline {
+            engine.with_pipeline(pipeline)
+        } else {
+            engine
+        };
+        engine.process_answer(id, budget, mode).await.unwrap()
+    }
+    fn limits(&mut self, turns: u32, tokens: u64) {
+        self.config = Config::from_toml(&format!("api_key='test-key'\nbase_url='{}'\nsystem_prompt='BASE'\n[workflow]\nmax_autonomous_turns={turns}\nmax_autonomous_tokens={tokens}\n[context]\nstrategy='summary'", self.server.uri()), None).unwrap();
+    }
+
+    async fn recover(&mut self) -> Vec<deepseek_cli::workflow_engine::RecoveredProcessing> {
+        let models = self.models();
+        let id = self.dialog_id.unwrap();
+        WorkflowEngine::new(
+            &self.client,
+            self.config.context(),
+            self.config.workflow(),
+            &models,
+            WorkflowSession {
+                store: &mut self.store,
+                dialog_id: &mut self.dialog_id,
+                scope: &mut self.scope,
+                history: &mut self.history,
+                last_usage: &mut self.last_usage,
+            },
+        )
+        .recover_pending_processing(id)
+        .await
+        .unwrap()
+    }
     fn strategy(&mut self, strategy: &str, threshold: u64, keep: usize) {
         self.config=Config::from_toml(&format!("api_key='test-key'\nbase_url='{}'\nsystem_prompt='BASE'\n[context]\nstrategy='{strategy}'\ncompact_after_prompt_tokens={threshold}\nkeep_last_messages={keep}",self.server.uri()),None).unwrap();
     }
@@ -229,6 +306,800 @@ impl Fixture {
         )
         .run_human_input(prompt, callback)
         .await
+    }
+}
+
+fn checked(version: u64, action: Option<&str>, decision: Value) -> Value {
+    let mut patch = empty_patch(version);
+    patch.expected_action = action.map(str::to_owned);
+    json!({"patch":patch,"decision":decision})
+}
+
+fn continue_decision() -> Value {
+    json!({"type":"continue","instruction":"HIDDEN next instruction","confidence":0.95})
+}
+
+// Break caught: ordinary answers must be durable before checker work, and await_user applies one patch.
+#[tokio::test]
+async fn await_user_applies_one_patch_and_ends_the_loop() {
+    let mut f = Fixture::new(None, TaskStatus::Active).await;
+    f.ordinary(ordinary_response("plan drafted", true)).await;
+    f.checker.reply(checked(
+        0,
+        Some("ask for approval"),
+        json!({"type":"await_user"}),
+    ));
+    let database = f._directory.path().join("workflow.sqlite3");
+    *f.checker.before_reply.lock().unwrap() = Some(Box::new(move || {
+        let db = Connection::open(database).unwrap();
+        let row: (String, String, i64) = db.query_row("SELECT m.content,p.status,p.attempts FROM response_processing p JOIN messages m ON m.id=p.assistant_message_id", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(row, ("plan drafted".into(), "processing".into(), 1));
+    }));
+    let result = f.run("draft a plan", |_| Ok(())).await.unwrap();
+    assert_eq!(result.stop_reason, AutonomyStopReason::AwaitUser);
+    assert_eq!(result.autonomous_turns, 0);
+    assert_eq!(result.tokens, 6);
+    assert_eq!(
+        result.final_state.unwrap().expected_action.as_deref(),
+        Some("ask for approval")
+    );
+    assert_eq!(f.current().unwrap().version, 1);
+    assert!(
+        f.store
+            .load_pending_processing(f.dialog_id.unwrap())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// Break caught: controller continuation must be persisted, hidden from transcript, and used by the next call.
+#[tokio::test]
+async fn continue_persists_hidden_input_then_runs_another_ordinary_turn() {
+    let mut f = Fixture::new(None, TaskStatus::Active).await;
+    f.ordinary(ordinary_response("ordinary answer", true)).await;
+    f.checker
+        .reply(checked(0, Some("part two"), continue_decision()));
+    f.checker
+        .reply(checked(1, None, json!({"type":"await_user"})));
+    let mut events = vec![];
+    let result = f
+        .run("implement", |event| {
+            if let AgentEvent::Workflow(WorkflowTurnEvent::AutonomousTurnStarted {
+                number,
+                phase,
+            }) = event
+            {
+                events.push((number, phase));
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.autonomous_turns, 1);
+    assert_eq!(result.tokens, 12);
+    assert_eq!(events, [(1, TaskPhase::Planning)]);
+    let requests = f.server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].body_json::<Value>().unwrap()["messages"]
+            .to_string()
+            .contains("HIDDEN next instruction")
+    );
+    assert_eq!(f.count("workflow_inputs"), 2);
+    assert_eq!(f.history.messages().len(), 3);
+    assert!(
+        !f.store
+            .load(f.dialog_id.unwrap())
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.content().contains("HIDDEN"))
+    );
+}
+
+// Break caught: the prospective boundary must reject turn three before its hidden input is saved.
+#[tokio::test]
+async fn turn_limit_allows_exactly_two_autonomous_ordinary_turns() {
+    let mut f = Fixture::new(None, TaskStatus::Active).await;
+    f.limits(2, 1000);
+    f.ordinary(ordinary_response("answer", true)).await;
+    for version in 0..3 {
+        f.checker.reply(checked(version, None, continue_decision()));
+    }
+    let result = f.run("implement", |_| Ok(())).await.unwrap();
+    assert_eq!(result.stop_reason, AutonomyStopReason::TurnLimit);
+    assert_eq!(result.autonomous_turns, 2);
+    assert_eq!(result.tokens, 18);
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 3);
+    assert_eq!(f.count("workflow_inputs"), 3);
+}
+
+// Break caught: usage gaps and exhausted tokens must never create hidden controller work.
+#[tokio::test]
+async fn missing_usage_and_exact_token_limit_preserve_answer_without_controller_input() {
+    for missing in [false, true] {
+        let mut f = Fixture::new(None, TaskStatus::Active).await;
+        f.limits(8, 6);
+        f.checker = Arc::new(FakeModel {
+            missing_usage: missing,
+            ..Default::default()
+        });
+        f.checker
+            .reply(checked(0, Some("unsafe to schedule"), continue_decision()));
+        f.ordinary(ordinary_response("complete answer", true)).await;
+        let result = f.run("implement", |_| Ok(())).await.unwrap();
+        assert_eq!(
+            result.stop_reason,
+            if missing {
+                AutonomyStopReason::MissingUsage
+            } else {
+                AutonomyStopReason::TokenLimit
+            }
+        );
+        assert_eq!(result.tokens, if missing { 3 } else { 6 });
+        assert_eq!(f.count("workflow_inputs"), 1);
+        assert_eq!(result.answer.as_deref(), Some("complete answer"));
+        assert_eq!(f.current().unwrap().version, 1);
+        assert_eq!(
+            f.current().unwrap().expected_action.as_deref(),
+            Some("unsafe to schedule")
+        );
+    }
+}
+
+// Break caught: auxiliary providers must not silently bypass missing-usage protection.
+#[tokio::test]
+async fn absent_facts_or_summary_usage_stops_continuation_after_the_completed_answer() {
+    for strategy in ["sticky_facts", "summary"] {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        f.strategy(strategy, 1, 2);
+        f.interpreter.reply(interpretation(
+            json!({"type":"continue","instruction":"continue"}),
+        ));
+        f.checker
+            .reply(checked(1, Some("review"), continue_decision()));
+        Mock::given(body_string_contains("BASE"))
+            .respond_with(ordinary_response("saved answer", true))
+            .mount(&f.server)
+            .await;
+        let (marker, response) = if strategy == "summary" {
+            ("Create a faithful cumulative summary", "summary")
+        } else {
+            ("Update the key-value memory", "{\"language\":\"Rust\"}")
+        };
+        Mock::given(body_string_contains(marker))
+            .respond_with(response_without_usage(response))
+            .mount(&f.server)
+            .await;
+        let result = f.run("continue", |_| Ok(())).await.unwrap();
+        assert_eq!(result.stop_reason, AutonomyStopReason::MissingUsage);
+        assert_eq!(result.tokens, 9);
+        assert!(!result.usage_complete);
+        assert_eq!(result.answer.as_deref(), Some("saved answer"));
+        assert_eq!(f.count("workflow_inputs"), 2);
+        assert_eq!(f.server.received_requests().await.unwrap().len(), 2);
+    }
+}
+
+// Break caught: advisory policy failures must leave both the streamed answer and state intact.
+#[tokio::test]
+async fn unsafe_checker_outcomes_preserve_answer_and_state() {
+    for outcome in ["malformed", "api", "confidence", "invalid-patch"] {
+        let mut f = Fixture::new(None, TaskStatus::Active).await;
+        f.ordinary(ordinary_response("ordinary answer", true)).await;
+        match outcome {
+            "malformed" => f.checker.reply(json!({"bad":"JSON shape"})),
+            "api" => {}
+            "confidence" => f.checker.reply(checked(
+                0,
+                Some("do not apply"),
+                json!({"type":"continue","instruction":"next","confidence":0.1}),
+            )),
+            _ => {
+                let mut value = checked(0, None, continue_decision());
+                value["patch"]["current_step_id"] = json!("unknown");
+                f.checker.reply(value);
+            }
+        }
+        let result = f.run("implement", |_| Ok(())).await.unwrap();
+        assert_eq!(
+            result.stop_reason,
+            if outcome == "confidence" {
+                AutonomyStopReason::LowConfidence
+            } else {
+                AutonomyStopReason::CheckerFailed
+            }
+        );
+        assert_eq!(f.current().unwrap().version, 0);
+        assert_eq!(f.count("workflow_inputs"), 1);
+        assert_eq!(result.answer.as_deref(), Some("ordinary answer"));
+        let job = &f
+            .store
+            .load_pending_processing(f.dialog_id.unwrap())
+            .unwrap()[0];
+        assert_eq!((job.status, job.attempts), (ProcessingStatus::Failed, 1));
+    }
+}
+
+struct ProposedChecker {
+    name: &'static str,
+    mode: CheckerMode,
+    patch: TaskStatePatch,
+    decision: ControllerDecision,
+    seen: Arc<Mutex<Vec<WorkflowTaskState>>>,
+}
+impl ResponseChecker for ProposedChecker {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn mode(&self) -> CheckerMode {
+        self.mode
+    }
+    fn check<'a>(&'a self, context: &'a CheckContext, _: &'a str) -> CheckFuture<'a> {
+        self.seen.lock().unwrap().push(context.task.clone());
+        Box::pin(async move {
+            Ok(ContinuationCheckResult {
+                patch: self.patch.clone(),
+                decision: self.decision.clone(),
+                usage: Some(usage()),
+            })
+        })
+    }
+}
+
+// Break caught: applying a checker patch early would leak it to later checkers and accept incompatible effects.
+#[tokio::test]
+async fn pipeline_collects_all_proposals_on_one_snapshot_and_rejects_conflicts() {
+    let mut f = Fixture::new(Some(TaskPhase::Planning), TaskStatus::Active).await;
+    let state = f.current().unwrap();
+    for decision_conflict in [false, true] {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let checkers: Vec<Arc<dyn ResponseChecker>> = (0..2)
+            .map(|i| {
+                let mut patch = empty_patch(state.version);
+                patch.expected_action = Some(
+                    if i == 0 || decision_conflict {
+                        "first"
+                    } else {
+                        "second"
+                    }
+                    .into(),
+                );
+                Arc::new(ProposedChecker {
+                    name: if i == 0 { "a" } else { "b" },
+                    mode: CheckerMode::Advisory,
+                    patch,
+                    decision: if i == 1 && decision_conflict {
+                        ControllerDecision::Continue {
+                            instruction: "next".into(),
+                            confidence: 0.95,
+                        }
+                    } else {
+                        ControllerDecision::AwaitUser
+                    },
+                    seen: seen.clone(),
+                }) as Arc<dyn ResponseChecker>
+            })
+            .collect();
+        let pipeline = ResponsePipeline::new(checkers).unwrap();
+        let mut budget = AutonomyBudget::new(f.config.workflow());
+        let outcome = pipeline
+            .collect(
+                &CheckContext {
+                    task: state.clone(),
+                    stage_messages: vec![],
+                    triggering_input: WorkflowInput {
+                        source: WorkflowInputSource::Human,
+                        intent: WorkflowIntent::human_continue("human").unwrap(),
+                    },
+                },
+                "answer",
+                &mut budget,
+                0.8,
+            )
+            .await;
+        assert!(matches!(outcome, PipelineOutcome::Conflict { .. }));
+        assert_eq!(*seen.lock().unwrap(), [state.clone(), state.clone()]);
+        assert_eq!(budget.tokens(), 6);
+        assert_eq!(f.current().unwrap(), state);
+        let job = f.pending_answer();
+        let outcome = f
+            .process(
+                job.processing_id,
+                &mut budget,
+                ProcessingLeaseMode::Normal,
+                Some(pipeline),
+            )
+            .await;
+        assert!(matches!(
+            outcome,
+            deepseek_cli::workflow_engine::ProcessingOutcome::Stop(
+                AutonomyStopReason::CheckerFailed
+            )
+        ));
+        assert_eq!(f.current().unwrap(), state);
+        assert_eq!(f.count("workflow_inputs"), 1);
+        assert!(
+            f.store
+                .load(f.dialog_id.unwrap())
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| message.content() == "saved answer")
+        );
+    }
+}
+
+#[tokio::test]
+async fn blocking_checker_is_rejected_before_streaming_can_start() {
+    let checker = ProposedChecker {
+        name: "blocking",
+        mode: CheckerMode::Blocking,
+        patch: empty_patch(0),
+        decision: ControllerDecision::AwaitUser,
+        seen: Arc::default(),
+    };
+    assert!(matches!(
+        ResponsePipeline::new(vec![Arc::new(checker)]),
+        Err(WorkflowEngineError::BlockingCheckerRequiresBufferedDelivery)
+    ));
+}
+
+#[tokio::test]
+async fn budget_rejects_the_same_fingerprint_before_a_second_reservation() {
+    let f = Fixture::new(Some(TaskPhase::Planning), TaskStatus::Active).await;
+    let mut budget = AutonomyBudget::new(f.config.workflow());
+    let fingerprint = StateFingerprint::from(&f.current().unwrap());
+    budget.reserve_turn(fingerprint.clone()).unwrap();
+    assert_eq!(
+        budget.reserve_turn(fingerprint),
+        Err(AutonomyStopReason::RepeatedState)
+    );
+    assert_eq!(budget.turns(), 1);
+}
+
+#[tokio::test]
+async fn repeated_next_fingerprint_stops_before_hidden_input_commit() {
+    let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+    let job = f.pending_answer();
+    f.checker.reply(checked(0, None, continue_decision()));
+    let mut budget = AutonomyBudget::new(f.config.workflow());
+    let mut already_scheduled = f.current().unwrap();
+    already_scheduled.version = 1;
+    budget
+        .reserve_turn(StateFingerprint::from(&already_scheduled))
+        .unwrap();
+    let outcome = f
+        .process(
+            job.processing_id,
+            &mut budget,
+            ProcessingLeaseMode::Normal,
+            None,
+        )
+        .await;
+    assert!(matches!(
+        outcome,
+        deepseek_cli::workflow_engine::ProcessingOutcome::Stop(AutonomyStopReason::RepeatedState)
+    ));
+    assert_eq!(f.count("workflow_inputs"), 1);
+    assert_eq!(f.current().unwrap().version, 0);
+}
+
+#[tokio::test]
+async fn a_new_human_input_gets_a_fresh_autonomy_budget() {
+    let mut f = Fixture::new(None, TaskStatus::Active).await;
+    f.limits(1, 1000);
+    f.ordinary(ordinary_response("answer", true)).await;
+    for version in 0..4 {
+        f.checker.reply(checked(version, None, continue_decision()));
+    }
+    let first = f.run("first human", |_| Ok(())).await.unwrap();
+    assert_eq!(first.stop_reason, AutonomyStopReason::TurnLimit);
+    assert_eq!(first.autonomous_turns, 1);
+    f.interpreter.reply(interpretation(
+        json!({"type":"continue","instruction":"second human"}),
+    ));
+    let second = f.run("second human", |_| Ok(())).await.unwrap();
+    assert_eq!(second.stop_reason, AutonomyStopReason::TurnLimit);
+    assert_eq!(second.autonomous_turns, 1);
+    assert_eq!(second.tokens, 15);
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 4);
+}
+
+// Break caught: a controller stage change must use the shared handoff/commit boundary, accounting every call.
+#[tokio::test]
+async fn emitted_transition_uses_handoff_model_and_shared_handler() {
+    for done in [false, true] {
+        let phase = if done {
+            TaskPhase::Validation
+        } else {
+            TaskPhase::Execution
+        };
+        let mut f = Fixture::new(Some(phase), TaskStatus::Active).await;
+        f.interpreter.reply(interpretation(
+            json!({"type":"continue","instruction":"continue"}),
+        ));
+        f.ordinary(ordinary_response("ordinary answer", true)).await;
+        let event = if done {
+            "validation_passed"
+        } else {
+            "execution_completed"
+        };
+        f.checker.reply(checked(1, None, json!({"type":"emit_transition","event":event,"evidence":["tests pass => 12 tests passed"],"confidence":0.95})));
+        f.checker
+            .reply(checked(2, None, json!({"type":"await_user"})));
+        f.handoff.reply(handoff());
+        let result = f.run("continue", |_| Ok(())).await.unwrap();
+        assert_eq!(
+            result.stop_reason,
+            if done {
+                AutonomyStopReason::Done
+            } else {
+                AutonomyStopReason::AwaitUser
+            }
+        );
+        assert_eq!(result.tokens, if done { 12 } else { 18 });
+        assert_eq!(result.autonomous_turns, if done { 0 } else { 1 });
+        assert_eq!(
+            f.current().unwrap().phase,
+            if done {
+                TaskPhase::Done
+            } else {
+                TaskPhase::Validation
+            }
+        );
+        assert_eq!(f.count("task_transitions"), 1);
+        assert_eq!(f.count("workflow_tasks"), 1);
+        assert_eq!(f.handoff.calls(), 1);
+        let requests = f.server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), if done { 1 } else { 2 });
+        if !done {
+            assert!(
+                !requests[1].body_json::<Value>().unwrap()["messages"]
+                    .to_string()
+                    .contains("old-stage-only-marker")
+            );
+        }
+    }
+}
+
+// Break caught: handoff spending/failure must be checked before any transition or hidden controller input.
+#[tokio::test]
+async fn handoff_failure_or_budget_exhaustion_keeps_the_outgoing_stage() {
+    for mode in ["failure", "tokens", "missing"] {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        f.limits(8, if mode == "tokens" { 12 } else { 1000 });
+        f.interpreter.reply(interpretation(
+            json!({"type":"continue","instruction":"continue"}),
+        ));
+        f.ordinary(ordinary_response("saved answer", true)).await;
+        f.checker.reply(checked(1, Some("review"), json!({"type":"emit_transition","event":"execution_completed","evidence":["build passed"],"confidence":0.95})));
+        if mode == "missing" {
+            f.handoff = Arc::new(FakeModel {
+                missing_usage: true,
+                ..Default::default()
+            });
+        }
+        if mode != "failure" {
+            f.handoff.reply(handoff());
+        }
+        let result = f.run("continue", |_| Ok(())).await.unwrap();
+        assert_eq!(
+            result.stop_reason,
+            match mode {
+                "failure" => AutonomyStopReason::TransitionFailed,
+                "tokens" => AutonomyStopReason::TokenLimit,
+                _ => AutonomyStopReason::MissingUsage,
+            }
+        );
+        assert_eq!(f.current().unwrap().phase, TaskPhase::Execution);
+        assert_eq!(f.count("task_transitions"), 0);
+        assert_eq!(f.count("workflow_inputs"), 2);
+        assert_eq!(result.answer.as_deref(), Some("saved answer"));
+        assert_eq!(result.tokens, if mode == "tokens" { 12 } else { 9 });
+    }
+}
+
+// Break caught: restoration must run advisory work without handoff, transition, hidden input, or ordinary work.
+#[tokio::test]
+async fn recovery_retries_once_then_stops_and_success_never_resumes_autonomously() {
+    for decision in [
+        continue_decision(),
+        json!({"type":"emit_transition","event":"execution_completed","evidence":["observed build"],"confidence":0.95}),
+    ] {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        let task = f.current().unwrap();
+        f.store
+            .append_answer_for_processing(AnswerCommit {
+                dialog_id: task.dialog_id,
+                task_id: task.id,
+                stage_run_id: task.current_stage_run_id,
+                expected_version: task.version,
+                content: "saved answer",
+                usage: Some(usage()),
+            })
+            .unwrap();
+        f.checker
+            .reply(checked(0, Some("review saved work"), decision));
+        let recovered = f.recover().await;
+        assert_eq!(
+            recovered[0].stop_reason,
+            AutonomyStopReason::AwaitUserAfterRestart
+        );
+        assert_eq!(
+            f.current().unwrap().expected_action.as_deref(),
+            Some("review saved work")
+        );
+        assert_eq!(f.current().unwrap().phase, TaskPhase::Execution);
+        assert_eq!(f.handoff.calls(), 0);
+        assert_eq!(f.count("workflow_inputs"), 1);
+        assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
+        assert!(f.recover().await.is_empty());
+    }
+    let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+    let task = f.current().unwrap();
+    f.store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: task.dialog_id,
+            task_id: task.id,
+            stage_run_id: task.current_stage_run_id,
+            expected_version: task.version,
+            content: "saved",
+            usage: Some(usage()),
+        })
+        .unwrap();
+    assert_eq!(
+        f.recover().await[0].stop_reason,
+        AutonomyStopReason::CheckerFailed
+    );
+    assert_eq!(
+        f.store.load_pending_processing(task.dialog_id).unwrap()[0].attempts,
+        1
+    );
+    assert_eq!(
+        f.recover().await[0].stop_reason,
+        AutonomyStopReason::CheckerFailed
+    );
+    assert!(f.recover().await.is_empty());
+    let row: (String, u32) = f
+        .connection
+        .query_row("SELECT status,attempts FROM response_processing", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(row, ("failed".into(), 2));
+}
+
+// Break caught: completed processing replay must return durable outcomes without rechecking or scheduling work.
+#[tokio::test]
+async fn completed_processing_replay_never_duplicates_patch_controller_or_transition() {
+    use deepseek_cli::workflow_engine::ProcessingOutcome;
+    for kind in ["await", "continue", "transition"] {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        let job = f.pending_answer();
+        let decision = match kind {
+            "await" => json!({"type":"await_user"}),
+            "continue" => continue_decision(),
+            _ => {
+                json!({"type":"emit_transition","event":"execution_completed","evidence":["build passed"],"confidence":0.95})
+            }
+        };
+        f.checker.reply(checked(0, Some("review"), decision));
+        f.handoff.reply(handoff());
+        let mut budget = AutonomyBudget::new(f.config.workflow());
+        f.process(
+            job.processing_id,
+            &mut budget,
+            ProcessingLeaseMode::Normal,
+            None,
+        )
+        .await;
+        let state = f.current();
+        let rows = (f.count("messages"), f.count("task_transitions"));
+        let stored = f
+            .store
+            .load_processing_result(f.dialog_id.unwrap(), job.processing_id)
+            .unwrap()
+            .unwrap();
+        let replay = f
+            .process(
+                job.processing_id,
+                &mut budget,
+                ProcessingLeaseMode::Normal,
+                None,
+            )
+            .await;
+        assert!(matches!(replay, ProcessingOutcome::Completed(result) if result == stored));
+        assert_eq!(f.checker.calls(), 1);
+        assert_eq!(f.current(), state);
+        assert_eq!((f.count("messages"), f.count("task_transitions")), rows);
+    }
+}
+
+// Break caught: a stale checker must lose both version and attempt races with no controller effect.
+#[tokio::test]
+async fn checker_races_reload_state_and_never_emit_controller_work() {
+    for race in ["version", "attempt"] {
+        let mut f = Fixture::new(None, TaskStatus::Active).await;
+        f.ordinary(ordinary_response("saved answer", true)).await;
+        f.checker
+            .reply(checked(0, Some("stale proposal"), continue_decision()));
+        let database = f._directory.path().join("workflow.sqlite3");
+        *f.checker.before_reply.lock().unwrap() = Some(Box::new(move || {
+            if race == "version" {
+                Connection::open(database)
+                    .unwrap()
+                    .execute(
+                        "UPDATE workflow_tasks SET version=1,expected_action='competing session'",
+                        [],
+                    )
+                    .unwrap();
+            } else {
+                DialogStore::open(&database)
+                    .unwrap()
+                    .lease_processing(1, 0, ProcessingLeaseMode::Recovery)
+                    .unwrap();
+            }
+        }));
+        let result = f.run("implement", |_| Ok(())).await.unwrap();
+        assert_eq!(result.stop_reason, AutonomyStopReason::CheckerFailed);
+        assert_eq!(f.count("workflow_inputs"), 1);
+        assert_eq!(f.count("task_transitions"), 0);
+        if race == "version" {
+            assert_eq!(
+                result.final_state.unwrap().expected_action.as_deref(),
+                Some("competing session")
+            );
+        }
+        assert_eq!(result.answer.as_deref(), Some("saved answer"));
+    }
+}
+
+// Break caught: recovery must close stale jobs before checker calls and after a recovered patch advances version.
+#[tokio::test]
+async fn recovery_closes_stale_jobs_and_preserves_paused_stage() {
+    for paused in [false, true] {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        let first = f.pending_answer();
+        let second = f.pending_answer();
+        let stage = f.current().unwrap().current_stage_run_id;
+        if paused {
+            f.connection
+                .execute("UPDATE workflow_tasks SET status='paused'", [])
+                .unwrap();
+        }
+        f.checker.reply(checked(
+            0,
+            Some("review recovered patch"),
+            continue_decision(),
+        ));
+        assert_eq!(f.recover().await.len(), 1);
+        assert_eq!(f.checker.calls(), 1);
+        assert_eq!(
+            f.current().unwrap().status,
+            if paused {
+                TaskStatus::Paused
+            } else {
+                TaskStatus::Active
+            }
+        );
+        assert_eq!(f.current().unwrap().current_stage_run_id, stage);
+        let first_status: String = f
+            .connection
+            .query_row(
+                "SELECT status FROM response_processing WHERE id=?1",
+                [first.processing_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stale: (String, u32, String) = f
+            .connection
+            .query_row(
+                "SELECT status,attempts,last_error FROM response_processing WHERE id=?1",
+                [second.processing_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(first_status, "completed");
+        assert_eq!(stale, ("failed".into(), 2, "stale task version".into()));
+        assert_eq!(f.count("workflow_inputs"), 1);
+    }
+    let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+    f.pending_answer();
+    f.connection
+        .execute(
+            "UPDATE response_processing SET result_json=?1",
+            [checked(0, None, continue_decision()).to_string()],
+        )
+        .unwrap();
+    f.connection
+        .execute("UPDATE workflow_tasks SET version=1", [])
+        .unwrap();
+    assert!(f.recover().await.is_empty());
+    assert_eq!(f.checker.calls(), 0);
+    assert_eq!(f.count("workflow_inputs"), 1);
+}
+
+#[tokio::test]
+async fn recovery_reclaims_crash_left_processing_and_paused_failures_are_bounded() {
+    for succeeds in [false, true] {
+        let mut f = Fixture::new(Some(TaskPhase::Planning), TaskStatus::Active).await;
+        let job = f.pending_answer();
+        f.store
+            .lease_processing(job.processing_id, 0, ProcessingLeaseMode::Normal)
+            .unwrap();
+        f.connection
+            .execute("UPDATE workflow_tasks SET status='paused'", [])
+            .unwrap();
+        if succeeds {
+            f.checker
+                .reply(checked(0, None, json!({"type":"await_user"})));
+        }
+        let result = f.recover().await;
+        assert_eq!(
+            result[0].stop_reason,
+            if succeeds {
+                AutonomyStopReason::AwaitUserAfterRestart
+            } else {
+                AutonomyStopReason::CheckerFailed
+            }
+        );
+        assert_eq!(f.current().unwrap().status, TaskStatus::Paused);
+        assert!(f.recover().await.is_empty());
+        let attempts: u32 = f
+            .connection
+            .query_row("SELECT attempts FROM response_processing", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, 2);
+    }
+}
+
+#[tokio::test]
+async fn validation_repair_patch_is_not_applied_without_its_transition() {
+    for recovery in [false, true] {
+        let mut f = Fixture::new(Some(TaskPhase::Validation), TaskStatus::Active).await;
+        let job = f.pending_answer();
+        let mut proposal = checked(
+            0,
+            Some("repair"),
+            json!({"type":"emit_transition","event":"validation_failed","evidence":["test failed"],"confidence":0.95}),
+        );
+        proposal["patch"]["plan_append"]["steps"] =
+            json!([{"id":"fix","description":"repair failure","status":"pending"}]);
+        f.checker.reply(proposal);
+        let before = f.current();
+        if recovery {
+            assert_eq!(
+                f.recover().await[0].stop_reason,
+                AutonomyStopReason::AwaitUserAfterRestart
+            );
+        } else {
+            f.limits(1, 1);
+            let mut budget = AutonomyBudget::new(f.config.workflow());
+            let result = f
+                .process(
+                    job.processing_id,
+                    &mut budget,
+                    ProcessingLeaseMode::Normal,
+                    None,
+                )
+                .await;
+            assert!(matches!(
+                result,
+                deepseek_cli::workflow_engine::ProcessingOutcome::Stop(
+                    AutonomyStopReason::TokenLimit
+                )
+            ));
+        }
+        assert_eq!(f.current(), before);
+        assert_eq!(f.handoff.calls(), 0);
+        assert_eq!(f.count("workflow_inputs"), 1);
+        assert!(
+            f.store
+                .load_pending_processing(f.dialog_id.unwrap())
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
@@ -479,7 +1350,14 @@ async fn human_routing_matrix_preserves_phase_status_and_stage_boundaries() {
             "{}",
             case.name
         );
-        assert_eq!(f.checker.calls(), 0, "Task 8 does not process answers");
+        assert_eq!(
+            f.checker.calls(),
+            if case.kind == "managed" {
+                case.calls
+            } else {
+                0
+            }
+        );
         let state = f.current().unwrap();
         assert_eq!(state.phase, case.target, "{}", case.name);
         assert_eq!(
@@ -568,7 +1446,8 @@ async fn human_transition_is_applied_before_the_ordinary_request() {
         .store
         .load_pending_processing(f.dialog_id.unwrap())
         .unwrap();
-    assert_eq!(pending[0].status, ProcessingStatus::Pending);
+    assert_eq!(pending[0].status, ProcessingStatus::Failed);
+    assert_eq!(pending[0].attempts, 1);
     assert_eq!(
         pending[0].assistant_message_id,
         result.persisted_answer.unwrap().message_id
@@ -966,6 +1845,8 @@ async fn stage_facts_refresh_excludes_controller_and_dialog_wide_reductions() {
     f.interpreter.reply(interpretation(
         json!({"type":"continue","instruction":"I use Rust"}),
     ));
+    f.checker
+        .reply(checked(2, None, json!({"type":"await_user"})));
     Mock::given(body_string_contains("Update the key-value memory"))
         .respond_with(ordinary_response("{\"language\":\"Rust\"}", true))
         .mount(&f.server)
@@ -976,6 +1857,11 @@ async fn stage_facts_refresh_excludes_controller_and_dialog_wide_reductions() {
         .await;
     let result = f.run("I use Rust", |_| Ok(())).await.unwrap();
     assert_eq!(result.answer.as_deref(), Some("ordinary answer"));
+    assert_eq!(
+        result.tokens, 12,
+        "interpreter, facts, ordinary, checker all consume budget"
+    );
+    assert!(result.usage_complete);
     let requests = f.server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2);
     let facts: Value = requests[0].body_json().unwrap();
@@ -1028,6 +1914,8 @@ async fn stage_summary_runs_after_atomic_answer_commit_and_fails_open() {
         f.interpreter.reply(interpretation(
             json!({"type":"continue","instruction":"continue"}),
         ));
+        f.checker
+            .reply(checked(1, None, json!({"type":"await_user"})));
         Mock::given(body_string_contains("BASE"))
             .respond_with(ordinary_response("ordinary answer", true))
             .mount(&f.server)
@@ -1073,6 +1961,8 @@ async fn stage_summary_runs_after_atomic_answer_commit_and_fails_open() {
         assert_eq!(f.count("response_processing"), 1);
         assert_eq!(f.server.received_requests().await.unwrap().len(), 2);
         assert_eq!(warning, failure);
+        assert_eq!(result.tokens, if failure { 9 } else { 12 });
+        assert_eq!(result.usage_complete, !failure);
         let reductions = f
             .store
             .load_stage_reductions(f.current().unwrap().current_stage_run_id)
