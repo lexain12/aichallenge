@@ -161,11 +161,22 @@ impl DeepSeekClient {
                     Ok(())
                 },
             )
-            .await?;
-        if answer.trim().is_empty() {
-            return Err(ClientError::EmptyAnswer);
-        }
-        Ok(SummaryResult { answer, usage })
+            .await;
+        answer
+            .and_then(|answer| {
+                if answer.trim().is_empty() {
+                    Err(ClientError::EmptyAnswer)
+                } else {
+                    Ok(SummaryResult { answer, usage })
+                }
+            })
+            .map_err(|source| match usage {
+                Some(usage) => ClientError::WithUsage {
+                    source: Box::new(source),
+                    usage,
+                },
+                None => source,
+            })
     }
 
     async fn stream_chat_events_with_options<F>(
@@ -374,6 +385,13 @@ struct Delta {
 
 #[derive(Debug, Error)]
 pub enum ClientError {
+    /// Deterministic service calls retain provider usage even when completion fails.
+    #[error("{source}")]
+    WithUsage {
+        #[source]
+        source: Box<ClientError>,
+        usage: TokenUsage,
+    },
     #[error("ответ обрезан лимитом токенов; увеличьте max_tokens")]
     Truncated,
     #[error("модель вернула пустой ответ")]
@@ -394,4 +412,13 @@ pub enum ClientError {
     Output(#[source] io::Error),
     #[error("DeepSeek stream closed before the [DONE] event")]
     IncompleteStream,
+}
+
+impl ClientError {
+    pub fn usage(&self) -> Option<TokenUsage> {
+        match self {
+            Self::WithUsage { usage, .. } => Some(*usage),
+            _ => None,
+        }
+    }
 }

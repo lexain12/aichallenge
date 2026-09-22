@@ -1388,8 +1388,8 @@ impl<'a> WorkflowEngine<'a> {
                     self.context_config.facts_max_tokens(),
                 )
                 .await
-                .inspect_err(|_| {
-                    budget.record_usage(None);
+                .inspect_err(|error| {
+                    budget.record_usage(error.usage());
                 })?;
             budget.record_usage(result.usage());
             let facts = parse_facts_json(result.answer())?;
@@ -1439,6 +1439,7 @@ impl<'a> WorkflowEngine<'a> {
         F: FnMut(AgentEvent<'_>) -> io::Result<()>,
     {
         if self.context_config.strategy() != ContextStrategy::Summary
+            || budget.allow_provider_call().is_err()
             || !usage.is_some_and(|usage| {
                 usage.prompt_tokens >= self.context_config.compact_after_prompt_tokens()
             })
@@ -1476,8 +1477,8 @@ impl<'a> WorkflowEngine<'a> {
                 self.context_config.summary_max_tokens(),
             )
             .await
-            .inspect_err(|_| {
-                budget.record_usage(None);
+            .inspect_err(|error| {
+                budget.record_usage(error.usage());
             })?;
         budget.record_usage(result.usage());
         self.session.store.replace_stage_context(
@@ -1544,4 +1545,135 @@ pub enum WorkflowEngineError {
     Client(#[from] ClientError),
     #[error(transparent)]
     Facts(#[from] FactsError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::workflow_model::DeepSeekCompletionModel;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Facts failure aborts the turn, so inspect the actual budget at this private boundary.
+    #[tokio::test]
+    async fn failed_stage_facts_retains_reported_usage_without_mutating_state() {
+        for complete in [false, true] {
+            for reported_usage in [
+                None,
+                Some(TokenUsage {
+                    prompt_tokens: 12,
+                    completion_tokens: 5,
+                    total_tokens: 17,
+                    completion_tokens_details: None,
+                }),
+            ] {
+                let server = MockServer::start().await;
+                let chunk = json!({"choices":[{"delta":{"content":"   "},"finish_reason":"stop"}],"usage":reported_usage});
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_string(format!(
+                                "data: {chunk}\n\n{}",
+                                if complete { "data: [DONE]\n\n" } else { "" }
+                            )),
+                    )
+                    .mount(&server)
+                    .await;
+                let config = Config::from_toml(
+                    &format!(
+                        "api_key='test-key'\nbase_url='{}'\n[context]\nstrategy='sticky_facts'",
+                        server.uri()
+                    ),
+                    None,
+                )
+                .unwrap();
+                let client = DeepSeekClient::new(&config).unwrap();
+                let model = Arc::new(
+                    DeepSeekCompletionModel::new(client.clone(), "service".into()).unwrap(),
+                );
+                let models = WorkflowModels {
+                    interpreter: model.clone(),
+                    checker: model.clone(),
+                    handoff: model,
+                };
+                let directory = tempfile::tempdir().unwrap();
+                let mut store = DialogStore::open(&directory.path().join("facts.sqlite3")).unwrap();
+                let mut scope = RequestScope::default();
+                let started = store
+                    .start_dialog_with_workflow_task(&scope, "BASE", "human fact")
+                    .unwrap();
+                let mut dialog_id = Some(started.dialog_id);
+                scope = scope.with_dialog_id(dialog_id);
+                let task = store
+                    .load_workflow(started.dialog_id)
+                    .unwrap()
+                    .current_task
+                    .unwrap();
+                let messages = store
+                    .load_stage_messages(task.current_stage_run_id)
+                    .unwrap();
+                let mut reductions = store
+                    .load_stage_reductions(task.current_stage_run_id)
+                    .unwrap();
+                let original_facts = reductions.facts.clone();
+                let mut history = ChatHistory::new("BASE".into());
+                let mut last_usage = None;
+                let mut budget = AutonomyBudget::new(config.workflow());
+                let mut engine = WorkflowEngine::new(
+                    &client,
+                    config.context(),
+                    config.workflow(),
+                    &models,
+                    WorkflowSession {
+                        store: &mut store,
+                        dialog_id: &mut dialog_id,
+                        scope: &mut scope,
+                        history: &mut history,
+                        last_usage: &mut last_usage,
+                    },
+                );
+                let mut failed = false;
+                let error = engine
+                    .refresh_stage_facts(
+                        &task,
+                        &messages,
+                        &mut reductions,
+                        &mut budget,
+                        &mut |event| {
+                            failed |= matches!(event, AgentEvent::FactsUpdateFailed { .. });
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(failed);
+                let WorkflowEngineError::Client(error) = error else {
+                    panic!("expected client error")
+                };
+                assert_eq!(error.usage(), reported_usage);
+                assert_eq!(
+                    budget.tokens(),
+                    reported_usage.map_or(0, |usage| usage.total_tokens)
+                );
+                assert_eq!(budget.usage_complete(), reported_usage.is_some());
+                assert_eq!(reductions.facts, original_facts);
+                assert_eq!(
+                    store
+                        .load_stage_reductions(task.current_stage_run_id)
+                        .unwrap()
+                        .facts,
+                    original_facts
+                );
+                assert_eq!(
+                    store.load_workflow(started.dialog_id).unwrap().current_task,
+                    Some(task)
+                );
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            }
+        }
+    }
 }

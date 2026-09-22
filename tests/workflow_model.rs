@@ -286,6 +286,56 @@ async fn interpreter_falls_back_on_api_malformed_and_low_confidence_and_keeps_us
     }
 }
 
+// Break caught: the real adapter rejects whitespace, but its billed usage must survive checker errors and human fallback.
+#[tokio::test]
+async fn real_adapter_blank_completion_retains_checker_and_interpreter_usage() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let chunk = serde_json::json!({"choices":[{"delta":{"content":" \n\t "},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}});
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+        )
+        .mount(&server)
+        .await;
+    let config = Config::from_toml(
+        &format!(
+            "api_key='key'\nbase_url='{}'\n[context]\nstrategy='summary'",
+            server.uri()
+        ),
+        None,
+    )
+    .unwrap();
+    let model = Arc::new(
+        DeepSeekCompletionModel::new(DeepSeekClient::new(&config).unwrap(), "real-service".into())
+            .unwrap(),
+    );
+    let state = task(TaskPhase::Execution);
+    let context = CheckContext {
+        task: state.clone(),
+        stage_messages: vec![],
+        triggering_input: input(),
+    };
+    let checker = ContinuationChecker::new(model.clone(), config.workflow());
+    let error = checker
+        .check(&context, "complete answer")
+        .await
+        .unwrap_err();
+    assert_eq!(error.usage().map(|usage| usage.total_tokens), Some(17));
+    let interpreter = HumanInputInterpreter::new(model, config.workflow());
+    assert!(
+        matches!(interpreter.interpret("raw human", Some(&state)).await.unwrap(),
+        HumanInterpretation::Managed { intent: WorkflowIntent::Continue { instruction }, usage: Some(usage), confidence }
+        if instruction == "raw human" && confidence == 0.0 && usage.total_tokens == 17)
+    );
+    assert_eq!(context.task, state);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn interpreter_uses_high_confidence_intent_and_validates_human_before_calling() {
     let model = recording(Some(

@@ -451,7 +451,10 @@ impl HumanInputInterpreter {
         );
         let response = match self.model.complete(request).await {
             Ok(response) => response,
-            Err(_) => return Ok(fallback),
+            Err(error) => {
+                set_interpretation_usage(&mut fallback, error.usage());
+                return Ok(fallback);
+            }
         };
         let mut result = match parse_human_interpretation(&response.content) {
             Ok(result @ HumanInterpretation::Managed { confidence, .. })
@@ -504,7 +507,7 @@ pub enum CheckError {
 impl CheckError {
     pub fn usage(&self) -> Option<TokenUsage> {
         match self {
-            Self::Model(_) => None,
+            Self::Model(error) => error.usage(),
             Self::Policy { usage, .. } => *usage,
         }
     }
@@ -672,6 +675,15 @@ pub enum ModelError {
     BlankModelName,
     #[error(transparent)]
     Client(#[from] ClientError),
+}
+
+impl ModelError {
+    pub fn usage(&self) -> Option<TokenUsage> {
+        match self {
+            Self::Client(error) => error.usage(),
+            Self::BlankModelName => None,
+        }
+    }
 }
 
 pub type ModelFuture<'a> =

@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use deepseek_cli::chat::{ChatHistory, Message, Role};
-use deepseek_cli::client::DeepSeekClient;
+use deepseek_cli::client::{ClientError, DeepSeekClient, StreamEvent, TokenUsage};
 use deepseek_cli::config::Config;
 use serde_json::json;
 use tempfile::NamedTempFile;
@@ -391,4 +391,105 @@ async fn complete_uses_the_requested_model_and_preserves_usage() {
 
     assert_eq!(result.answer(), "checked");
     assert_eq!(result.usage().unwrap().total_tokens, 4);
+}
+
+// Break caught: errors after a usage event must retain that usage for every deterministic provider API.
+#[tokio::test]
+async fn deterministic_failures_preserve_observed_usage_and_error_category() {
+    let reported = TokenUsage {
+        prompt_tokens: 9,
+        completion_tokens: 4,
+        total_tokens: 13,
+        completion_tokens_details: None,
+    };
+    for operation in ["complete", "summarize", "facts"] {
+        for failure in ["blank", "incomplete", "truncated", "malformed"] {
+            let server = MockServer::start().await;
+            let chunk = json!({"choices":[{"delta":{"content":if failure == "blank" { " \n\t " } else { "partial" }},
+                "finish_reason": if failure == "truncated" { "length" } else { "stop" }}],"usage":reported});
+            let tail = match failure {
+                "incomplete" => "",
+                "malformed" => "data: SECRET_INVALID_STREAM\n\n",
+                _ => "data: [DONE]\n\n",
+            };
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(format!("data: {chunk}\n\n{tail}")),
+                )
+                .mount(&server)
+                .await;
+            let client = DeepSeekClient::new(&config_for(&server, "test-key")).unwrap();
+            let messages = request_messages();
+            let error = match operation {
+                "complete" => client.complete("service", &messages, 64).await,
+                "summarize" => client.summarize(&messages, 64).await,
+                _ => client.update_facts(&messages, 64).await,
+            }
+            .unwrap_err();
+            assert_eq!(error.usage(), Some(reported), "{operation}: {failure}");
+            assert!(!error.to_string().contains("SECRET_INVALID_STREAM"));
+            let ClientError::WithUsage { source, .. } = error else {
+                panic!("missing usage envelope");
+            };
+            assert!(
+                match failure {
+                    "blank" => matches!(*source, ClientError::EmptyAnswer),
+                    "incomplete" => matches!(*source, ClientError::IncompleteStream),
+                    "truncated" => matches!(*source, ClientError::Truncated),
+                    _ => matches!(*source, ClientError::Json(_)),
+                },
+                "{operation}: {failure}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn deterministic_failures_without_usage_and_ordinary_stream_errors_keep_their_shape() {
+    for with_usage in [false, true] {
+        let server = MockServer::start().await;
+        let mut chunk =
+            json!({"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]});
+        if with_usage {
+            chunk["usage"] = json!({"prompt_tokens":9,"completion_tokens":4,"total_tokens":13});
+        }
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+            )
+            .mount(&server)
+            .await;
+        let client = DeepSeekClient::new(&config_for(&server, "test-key")).unwrap();
+        let mut seen_usage = None;
+        let error = client
+            .stream_chat_events(&request_messages(), |event| {
+                if let StreamEvent::Usage(usage) = event {
+                    seen_usage = Some(usage);
+                }
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientError::Truncated),
+            "ordinary errors must remain compatible"
+        );
+        assert_eq!(
+            seen_usage.map(|usage| usage.total_tokens),
+            if with_usage { Some(13) } else { None }
+        );
+        assert_eq!(error.usage(), None);
+        if !with_usage {
+            let error = client
+                .complete("service", &request_messages(), 64)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ClientError::Truncated));
+            assert_eq!(error.usage(), None);
+        }
+    }
 }

@@ -20,8 +20,8 @@ use deepseek_cli::workflow_engine::{
 };
 use deepseek_cli::workflow_model::{
     CheckContext, CheckFuture, CheckerMode, CompletionModel, ContinuationCheckResult,
-    ControllerDecision, HandoffBuilder, ModelError, ModelFuture, ModelRequest, ModelResponse,
-    ResponseChecker,
+    ControllerDecision, DeepSeekCompletionModel, HandoffBuilder, ModelError, ModelFuture,
+    ModelRequest, ModelResponse, ResponseChecker,
 };
 use deepseek_cli::workflow_store::{
     AcceptedInputEffect, AnswerCommit, ControllerInputCommit, ExpectedCurrentTask, InputCommit,
@@ -291,11 +291,23 @@ impl Fixture {
         F: FnMut(AgentEvent<'_>) -> std::io::Result<()>,
     {
         let models = self.models();
+        self.run_with_models(prompt, &models, callback).await
+    }
+
+    async fn run_with_models<F>(
+        &mut self,
+        prompt: &str,
+        models: &WorkflowModels,
+        callback: F,
+    ) -> Result<deepseek_cli::workflow_engine::WorkflowTurnResult, WorkflowEngineError>
+    where
+        F: FnMut(AgentEvent<'_>) -> std::io::Result<()>,
+    {
         WorkflowEngine::new(
             &self.client,
             self.config.context(),
             self.config.workflow(),
-            &models,
+            models,
             WorkflowSession {
                 store: &mut self.store,
                 dialog_id: &mut self.dialog_id,
@@ -1984,6 +1996,198 @@ async fn stage_summary_runs_after_atomic_answer_commit_and_fails_open() {
             );
         }
         assert_eq!(f.count("dialog_context"), 0);
+    }
+}
+
+// Break caught: a service adapter rejecting a blank answer must not turn reported usage into MissingUsage.
+#[tokio::test]
+async fn real_adapter_failed_checker_interpreter_and_handoff_keep_budget_usage() {
+    use wiremock::matchers::body_partial_json;
+    for service in ["checker", "interpreter", "handoff"] {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        f.interpreter.reply(interpretation(
+            json!({"type":"continue","instruction":"continue"}),
+        ));
+        f.checker.reply(checked(1, None, if service == "handoff" {
+            json!({"type":"emit_transition","event":"execution_completed","evidence":["observed build"],"confidence":0.95})
+        } else { json!({"type":"await_user"}) }));
+        f.ordinary(ordinary_response("saved answer", true)).await;
+        let chunk = json!({"choices":[{"delta":{"content":" \t\n "},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}});
+        Mock::given(body_partial_json(json!({"model":"real-service"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+            )
+            .with_priority(1)
+            .mount(&f.server)
+            .await;
+        let model = Arc::new(
+            DeepSeekCompletionModel::new(f.client.clone(), "real-service".into()).unwrap(),
+        );
+        let mut models = f.models();
+        match service {
+            "checker" => models.checker = model,
+            "interpreter" => models.interpreter = model,
+            _ => models.handoff = model,
+        }
+        let result = f
+            .run_with_models("continue", &models, |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.tokens,
+            if service == "handoff" { 26 } else { 23 },
+            "{service}"
+        );
+        assert!(result.usage_complete, "{service}");
+        assert_eq!(
+            result.stop_reason,
+            match service {
+                "checker" => AutonomyStopReason::CheckerFailed,
+                "interpreter" => AutonomyStopReason::AwaitUser,
+                _ => AutonomyStopReason::TransitionFailed,
+            }
+        );
+        assert_eq!(result.answer.as_deref(), Some("saved answer"));
+        assert_eq!(f.current().unwrap().phase, TaskPhase::Execution);
+        assert_eq!(f.count("workflow_inputs"), 2);
+        assert_eq!(f.count("task_transitions"), 0);
+        assert_eq!(f.server.received_requests().await.unwrap().len(), 2);
+    }
+}
+
+// Break caught: summary failure must retain its known usage while failing open to the saved ordinary answer.
+#[tokio::test]
+async fn failed_summary_keeps_reported_usage_in_the_human_budget() {
+    for complete in [false, true] {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        f.strategy("summary", 1, 2);
+        f.interpreter.reply(interpretation(
+            json!({"type":"continue","instruction":"continue"}),
+        ));
+        f.checker
+            .reply(checked(1, None, json!({"type":"await_user"})));
+        Mock::given(body_string_contains("BASE"))
+            .respond_with(ordinary_response("saved answer", true))
+            .mount(&f.server)
+            .await;
+        let chunk = json!({"choices":[{"delta":{"content":" \n\t "},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}});
+        Mock::given(body_string_contains("Create a faithful cumulative summary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!(
+                        "data: {chunk}\n\n{}",
+                        if complete { "data: [DONE]\n\n" } else { "" }
+                    )),
+            )
+            .mount(&f.server)
+            .await;
+        let mut failed = false;
+        let result = f
+            .run("continue", |event| {
+                if matches!(event, AgentEvent::CompactionFailed { .. }) {
+                    failed = true;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(failed);
+        assert_eq!(result.tokens, 26);
+        assert!(result.usage_complete);
+        assert_eq!(result.stop_reason, AutonomyStopReason::AwaitUser);
+        assert_eq!(result.answer.as_deref(), Some("saved answer"));
+        assert!(
+            f.store
+                .load_stage_reductions(f.current().unwrap().current_stage_run_id)
+                .unwrap()
+                .context
+                .summary()
+                .is_none()
+        );
+        assert_eq!(f.server.received_requests().await.unwrap().len(), 2);
+    }
+}
+
+// Break caught: optional summary must not spend beyond the scheduling boundary; the mandatory checker still runs.
+#[tokio::test]
+async fn summary_is_skipped_at_token_equality_ordinary_overshoot_and_missing_usage() {
+    for (case, limit, ordinary_tokens, expected_tokens) in [
+        ("equality", 6, 3, 9),
+        ("overshoot", 10, 11, 17),
+        ("missing", 1000, 3, 6),
+    ] {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        f.config = Config::from_toml(&format!("api_key='test-key'\nbase_url='{}'\nsystem_prompt='BASE'\n[workflow]\nmax_autonomous_tokens={limit}\n[context]\nstrategy='summary'\ncompact_after_prompt_tokens=1\nkeep_last_messages=2", f.server.uri()), None).unwrap();
+        if case == "missing" {
+            f.interpreter = Arc::new(FakeModel {
+                missing_usage: true,
+                ..Default::default()
+            });
+        }
+        f.interpreter.reply(interpretation(
+            json!({"type":"continue","instruction":"continue"}),
+        ));
+        f.checker.reply(checked(1, None, continue_decision()));
+        let chunk = json!({"choices":[{"delta":{"content":"saved answer"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":ordinary_tokens - 1,"completion_tokens":1,"total_tokens":ordinary_tokens}});
+        Mock::given(body_string_contains("BASE"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+            )
+            .mount(&f.server)
+            .await;
+        Mock::given(body_string_contains("Create a faithful cumulative summary"))
+            .respond_with(ordinary_response("summary must not run", true))
+            .mount(&f.server)
+            .await;
+        let mut compaction_started = 0;
+        let result = f
+            .run("continue", |event| {
+                if matches!(event, AgentEvent::CompactionStarted { .. }) {
+                    compaction_started += 1;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(compaction_started, 0, "{case}");
+        assert_eq!(
+            f.server.received_requests().await.unwrap().len(),
+            1,
+            "{case}"
+        );
+        assert_eq!(
+            f.checker.calls(),
+            1,
+            "mandatory checker must still finish processing"
+        );
+        assert_eq!(result.tokens, expected_tokens, "{case}");
+        assert_eq!(result.usage_complete, case != "missing");
+        assert_eq!(
+            result.stop_reason,
+            if case == "missing" {
+                AutonomyStopReason::MissingUsage
+            } else {
+                AutonomyStopReason::TokenLimit
+            }
+        );
+        assert_eq!(result.answer.as_deref(), Some("saved answer"));
+        assert_eq!(f.count("workflow_inputs"), 2);
+        assert!(
+            f.store
+                .load_stage_reductions(f.current().unwrap().current_stage_run_id)
+                .unwrap()
+                .context
+                .summary()
+                .is_none()
+        );
     }
 }
 
