@@ -710,6 +710,13 @@ pub enum WorkflowTurnEvent {
     InputRejected {
         reason: String,
     },
+    ProcessingFailed {
+        checker: String,
+        error: String,
+    },
+    Stopped {
+        reason: AutonomyStopReason,
+    },
 }
 
 #[derive(Debug)]
@@ -846,10 +853,24 @@ impl<'a> WorkflowEngine<'a> {
                         reason: reason.clone(),
                     }),
                 )?;
-                return self.finish(routing, None, None, AutonomyStopReason::AwaitUser, &budget);
+                return self.finish(
+                    routing,
+                    None,
+                    None,
+                    AutonomyStopReason::AwaitUser,
+                    &budget,
+                    &mut on_event,
+                );
             }
             RoutingOutcome::Managed { state, .. } if state.phase == TaskPhase::Done => {
-                return self.finish(routing, None, None, AutonomyStopReason::Done, &budget);
+                return self.finish(
+                    routing,
+                    None,
+                    None,
+                    AutonomyStopReason::Done,
+                    &budget,
+                    &mut on_event,
+                );
             }
             _ => {}
         }
@@ -864,6 +885,7 @@ impl<'a> WorkflowEngine<'a> {
                     None,
                     AutonomyStopReason::AwaitUser,
                     &budget,
+                    &mut on_event,
                 );
             };
             let processing = self
@@ -875,12 +897,22 @@ impl<'a> WorkflowEngine<'a> {
                 .await?;
             match processing {
                 ProcessingOutcome::Stop(reason) => {
+                    if let Some(error) = processing_failure_message(&reason) {
+                        emit(
+                            &mut on_event,
+                            AgentEvent::Workflow(WorkflowTurnEvent::ProcessingFailed {
+                                checker: "continuation".into(),
+                                error: error.into(),
+                            }),
+                        )?;
+                    }
                     return self.finish(
                         routing,
                         Some(turn.answer),
                         turn.persisted_answer,
                         reason,
                         &budget,
+                        &mut on_event,
                     );
                 }
                 ProcessingOutcome::Completed(result) => {
@@ -896,6 +928,7 @@ impl<'a> WorkflowEngine<'a> {
                         turn.persisted_answer,
                         reason,
                         &budget,
+                        &mut on_event,
                     );
                 }
                 ProcessingOutcome::Controller(next) => {
@@ -908,6 +941,7 @@ impl<'a> WorkflowEngine<'a> {
                                 turn.persisted_answer,
                                 AutonomyStopReason::Done,
                                 &budget,
+                                &mut on_event,
                             );
                         }
                         // Scheduling is checked before the commit; reservation counts actual extra ordinary turns.
@@ -927,14 +961,24 @@ impl<'a> WorkflowEngine<'a> {
         }
     }
 
-    fn finish(
+    fn finish<F>(
         &self,
         routing: RoutingOutcome,
         answer: Option<String>,
         persisted_answer: Option<PersistedAnswer>,
         stop_reason: AutonomyStopReason,
         budget: &AutonomyBudget,
-    ) -> Result<WorkflowTurnResult, WorkflowEngineError> {
+        on_event: &mut F,
+    ) -> Result<WorkflowTurnResult, WorkflowEngineError>
+    where
+        F: FnMut(AgentEvent<'_>) -> io::Result<()>,
+    {
+        emit(
+            on_event,
+            AgentEvent::Workflow(WorkflowTurnEvent::Stopped {
+                reason: stop_reason.clone(),
+            }),
+        )?;
         let final_state = self
             .session
             .dialog_id
@@ -1514,6 +1558,15 @@ impl<'a> WorkflowEngine<'a> {
                 .blocks(self.session.scope)?,
         );
         Ok(blocks)
+    }
+}
+
+fn processing_failure_message(reason: &AutonomyStopReason) -> Option<&'static str> {
+    match reason {
+        AutonomyStopReason::CheckerFailed => Some("workflow checker failed"),
+        AutonomyStopReason::LowConfidence => Some("workflow checker confidence too low"),
+        AutonomyStopReason::TransitionFailed => Some("workflow transition failed"),
+        _ => None,
     }
 }
 

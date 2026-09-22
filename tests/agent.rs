@@ -8,9 +8,9 @@ use deepseek_cli::config::Config;
 use deepseek_cli::dialog::DialogStore;
 use deepseek_cli::memory::{DurableMemoryScope, RequestScope};
 use deepseek_cli::workflow::{TaskPhase, TaskStatus};
-use deepseek_cli::workflow_engine::WorkflowModels;
+use deepseek_cli::workflow_engine::{AutonomyStopReason, WorkflowModels, WorkflowTurnEvent};
 use deepseek_cli::workflow_model::{CompletionModel, ModelFuture, ModelRequest, ModelResponse};
-use deepseek_cli::workflow_store::WorkflowRepository;
+use deepseek_cli::workflow_store::{AnswerCommit, ProcessingStatus, WorkflowRepository};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
@@ -68,6 +68,274 @@ fn injected_models(service: &Arc<AgentWorkflowModel>) -> WorkflowModels {
 
 fn await_check(version: u64) -> String {
     json!({"patch":{"expected_version":version,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},"decision":{"type":"await_user"}}).to_string()
+}
+
+// Break caught: status must observe the committed snapshot plus the newest
+// processing row without leasing or otherwise advancing either one.
+#[tokio::test]
+async fn workflow_status_is_a_read_only_durable_projection() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("workflow-status.sqlite3");
+    let mut store = DialogStore::open(&database).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "saved goal")
+        .unwrap();
+    store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: started.dialog_id,
+            task_id: started.task.id,
+            stage_run_id: started.stage_run_id,
+            expected_version: started.task.version,
+            content: "candidate answer",
+            usage: None,
+        })
+        .unwrap();
+    let before = store
+        .load_workflow(started.dialog_id)
+        .unwrap()
+        .current_task
+        .unwrap();
+    drop(store);
+
+    let agent = Agent::from_dialog(
+        &managed_config(&server),
+        DialogStore::open(&database).unwrap(),
+        started.dialog_id,
+    )
+    .unwrap();
+    let status = agent.workflow_status().unwrap().unwrap();
+
+    assert_eq!(status.task_id, before.id);
+    assert_eq!(status.ordinal, 1);
+    assert_eq!(status.phase, TaskPhase::Planning);
+    assert_eq!(status.status, TaskStatus::Active);
+    assert_eq!(status.plan_revision, 0);
+    assert_eq!(status.current_step_id, None);
+    assert_eq!(status.expected_action, None);
+    assert_eq!(status.stage_sequence, 1);
+    assert_eq!(status.processing, Some(ProcessingStatus::Pending));
+    assert!(server.received_requests().await.unwrap().is_empty());
+    drop(agent);
+
+    let store = DialogStore::open(&database).unwrap();
+    assert_eq!(
+        store
+            .load_workflow(started.dialog_id)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        store.load_pending_processing(started.dialog_id).unwrap()[0].status,
+        ProcessingStatus::Pending
+    );
+    drop(store);
+    let disabled_agent = Agent::from_dialog(
+        &config(&server),
+        DialogStore::open(&database).unwrap(),
+        started.dialog_id,
+    )
+    .unwrap();
+    assert_eq!(
+        disabled_agent.workflow_status().unwrap().unwrap().task_id,
+        before.id
+    );
+}
+
+// Break caught: UI consumers need typed, payload-free workflow failure and
+// stop events instead of inferring lifecycle state from hidden controller data.
+#[tokio::test]
+async fn workflow_events_report_sanitized_processing_failure_and_stop_reason() {
+    let server = MockServer::start().await;
+    mount_sequence(&server, [sse("visible answer", 2, 1, 3)]).await;
+    let service = Arc::new(AgentWorkflowModel::default());
+    service
+        .responses
+        .lock()
+        .unwrap()
+        .push_back("RAW_CHECKER_SECRET_11".into());
+    let directory = tempfile::tempdir().unwrap();
+    let mut agent = Agent::with_store(
+        &managed_config(&server),
+        DialogStore::open(&directory.path().join("workflow-events.sqlite3")).unwrap(),
+    )
+    .unwrap()
+    .with_workflow_models(injected_models(&service));
+    let mut events = Vec::new();
+
+    agent
+        .run_streaming("start task", |event| {
+            if let AgentEvent::Workflow(event) = event {
+                events.push(event);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        events,
+        vec![
+            WorkflowTurnEvent::ResponseStarted {
+                autonomous_turn: 0,
+                phase: TaskPhase::Planning,
+            },
+            WorkflowTurnEvent::ProcessingFailed {
+                checker: "continuation".into(),
+                error: "workflow checker failed".into(),
+            },
+            WorkflowTurnEvent::Stopped {
+                reason: AutonomyStopReason::CheckerFailed,
+            },
+        ]
+    );
+    assert!(!format!("{events:?}").contains("RAW_CHECKER_SECRET_11"));
+}
+
+// Break caught: managed turns must emit useful workflow metadata in production,
+// while default diagnostics remain free of every human/model/controller payload.
+#[tokio::test]
+async fn managed_workflow_writes_metadata_only_debug_event_by_default() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("ORDINARY_SECRET_ONE", 2, 1, 3),
+            sse("ORDINARY_SECRET_TWO", 2, 1, 3),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("workflow-debug.sqlite3");
+    let log_path = directory.path().join("workflow-debug.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\nsystem_prompt='BASE_SECRET'\n[workflow]\ninterpreter_model='interpreter-model'\nchecker_model='checker-model'\nhandoff_model='handoff-model'\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=false",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let marker = "CONTROLLER_SECRET_11";
+    let service = Arc::new(AgentWorkflowModel::default());
+    service.responses.lock().unwrap().push_back(
+        json!({
+            "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+            "decision": {"type":"continue","instruction":marker,"confidence":0.95}
+        })
+        .to_string(),
+    );
+    service.responses.lock().unwrap().push_back(await_check(1));
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap())
+        .unwrap()
+        .with_workflow_models(injected_models(&service));
+
+    agent.run_with_prompt("HUMAN_SECRET_11").await.unwrap();
+
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(log.contains(r#""event":"workflow""#), "{log}");
+    for metadata in [
+        r#""component":"workflow_engine""#,
+        r#""model":"agent-test-model""#,
+        r#""mode":"advisory""#,
+        r#""autonomous_turn":0"#,
+        r#""autonomous_tokens":3"#,
+        r#""processing_status":"completed""#,
+    ] {
+        assert!(log.contains(metadata), "missing {metadata:?} in {log}");
+    }
+    for secret in [
+        "HUMAN_SECRET_11",
+        "ORDINARY_SECRET_ONE",
+        "ORDINARY_SECRET_TWO",
+        marker,
+        "BASE_SECRET",
+        "test-key",
+    ] {
+        assert!(!log.contains(secret), "workflow debug log leaked {secret}");
+    }
+    let value: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert!(value["details"].get("payload").is_none());
+}
+
+// Break caught: opting into payload logging must expose persisted workflow
+// audit payloads only below `payload`, never as top-level metadata.
+#[tokio::test]
+async fn managed_workflow_nests_controller_and_checker_payloads_when_enabled() {
+    let server = MockServer::start().await;
+    let marker = "OPT_IN_CONTROLLER_SECRET_11";
+    mount_sequence(
+        &server,
+        [
+            sse("first answer", 2, 1, 3),
+            sse(
+                &json!({
+                    "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+                    "decision": {"type":"continue","instruction":marker,"confidence":0.95}
+                })
+                .to_string(),
+                2,
+                1,
+                3,
+            ),
+            sse("second answer", 2, 1, 3),
+            sse(
+                &json!({
+                    "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+                    "decision": {"type":"await_user"}
+                })
+                .to_string(),
+                2,
+                1,
+                3,
+            ),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("workflow-debug-full.sqlite3");
+    let log_path = directory.path().join("workflow-debug-full.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=true",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+
+    agent.run_with_prompt("human prompt").await.unwrap();
+
+    let value: Value = serde_json::from_str(
+        std::fs::read_to_string(log_path)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value["details"]["payload"]["controller_instruction"],
+        marker
+    );
+    assert!(
+        value["details"]["payload"]["checker_output"]
+            .as_str()
+            .unwrap()
+            .contains(marker)
+    );
+    assert_eq!(value["details"]["payload"]["model_output"], "second answer");
+    let mut metadata_only = value.clone();
+    metadata_only["details"]
+        .as_object_mut()
+        .unwrap()
+        .remove("payload");
+    assert!(!metadata_only.to_string().contains(marker));
 }
 
 // Break caught: restoring an Agent must expose advisory recovery without running the ordinary model.

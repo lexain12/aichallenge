@@ -9,7 +9,7 @@ use crate::config::{Config, ContextConfig, ContextStrategy, WorkflowConfig};
 use crate::context::{
     ContextState, ContextStats, ContextSummary, plan_compaction, prepare_request, stats,
 };
-use crate::debug_log::{DebugLog, RequestMetadata};
+use crate::debug_log::{DebugLog, RequestMetadata, WorkflowDebugMetadata, WorkflowDebugPayload};
 use crate::dialog::{BranchInfo, DialogStore, ForkResult, StoreError};
 use crate::facts::{FactsState, parse_facts_json, plan_facts_update};
 use crate::memory::{
@@ -18,11 +18,26 @@ use crate::memory::{
 };
 use crate::profile::{ProfileRepository, UserProfile};
 use crate::system_context::{CompactionPolicy, ContextScope, SystemBlock, SystemBlockMetadata};
+use crate::workflow::{TaskPhase, TaskStatus, WorkflowTaskId, WorkflowTaskState};
 use crate::workflow_engine::{
-    RecoveredProcessing, WorkflowEngine, WorkflowEngineError, WorkflowModels, WorkflowSession,
+    RecoveredProcessing, RoutingOutcome, WorkflowEngine, WorkflowEngineError, WorkflowModels,
+    WorkflowSession,
 };
 use crate::workflow_model::DeepSeekCompletionModel;
-use crate::workflow_store::{PauseOutcome, WorkflowRepository};
+use crate::workflow_store::{PauseOutcome, ProcessingStatus, WorkflowRepository};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowStatus {
+    pub task_id: WorkflowTaskId,
+    pub ordinal: u32,
+    pub phase: TaskPhase,
+    pub status: TaskStatus,
+    pub plan_revision: u32,
+    pub current_step_id: Option<String>,
+    pub expected_action: Option<String>,
+    pub stage_sequence: u32,
+    pub processing: Option<ProcessingStatus>,
+}
 
 /// An API client and its independent conversation, optionally backed by SQLite.
 pub struct Agent {
@@ -287,10 +302,30 @@ impl Agent {
         Ok(store.pause_current_task(dialog_id)?)
     }
 
+    /// Reload the compact committed workflow projection without leasing,
+    /// resuming, recovering, or otherwise mutating workflow state.
+    pub fn workflow_status(&self) -> Result<Option<WorkflowStatus>, AgentError> {
+        let (Some(dialog_id), Some(store)) = (self.dialog_id, self.store.as_ref()) else {
+            return Ok(None);
+        };
+        let snapshot = store.load_workflow_status(dialog_id)?;
+        Ok(snapshot.current_task.map(|task| WorkflowStatus {
+            task_id: task.id,
+            ordinal: task.ordinal,
+            phase: task.phase,
+            status: task.status,
+            plan_revision: task.plan.revision,
+            current_step_id: task.current_step_id,
+            expected_action: task.expected_action,
+            stage_sequence: task.current_stage_sequence,
+            processing: snapshot.processing,
+        }))
+    }
+
     pub async fn run_workflow_streaming<F>(
         &mut self,
         prompt: &str,
-        on_event: F,
+        mut on_event: F,
     ) -> Result<String, AgentError>
     where
         F: FnMut(AgentEvent<'_>) -> io::Result<()>,
@@ -303,27 +338,131 @@ impl Agent {
             .workflow_config
             .as_ref()
             .filter(|config| config.enabled())
-            .ok_or(AgentError::WorkflowUnavailable)?;
+            .ok_or(AgentError::WorkflowUnavailable)?
+            .clone();
         let models = self
             .workflow_models
             .as_ref()
-            .ok_or(AgentError::WorkflowUnavailable)?;
-        let store = self.store.as_mut().ok_or(AgentError::WorkflowUnavailable)?;
-        let result = WorkflowEngine::new(
-            &self.client,
-            &self.context_config,
-            config,
-            models,
-            WorkflowSession {
-                store,
-                dialog_id: &mut self.dialog_id,
-                scope: &mut self.scope,
-                history: &mut self.history,
-                last_usage: &mut self.last_usage,
-            },
-        )
-        .run_human_input(prompt, on_event)
-        .await?;
+            .ok_or(AgentError::WorkflowUnavailable)?
+            .clone();
+        let checker_model = models.checker.name().to_owned();
+        let initial_task = match (self.dialog_id, self.store.as_ref()) {
+            (Some(dialog_id), Some(store)) => store.load_workflow(dialog_id)?.current_task,
+            _ => None,
+        };
+        let result = {
+            let store = self.store.as_mut().ok_or(AgentError::WorkflowUnavailable)?;
+            WorkflowEngine::new(
+                &self.client,
+                &self.context_config,
+                &config,
+                &models,
+                WorkflowSession {
+                    store,
+                    dialog_id: &mut self.dialog_id,
+                    scope: &mut self.scope,
+                    history: &mut self.history,
+                    last_usage: &mut self.last_usage,
+                },
+            )
+            .run_human_input(prompt, &mut on_event)
+            .await?
+        };
+        let diagnostics = self
+            .dialog_id
+            .zip(self.store.as_ref())
+            .map(|(dialog_id, store)| store.load_workflow_status(dialog_id))
+            .transpose()?;
+        let current = diagnostics
+            .as_ref()
+            .and_then(|snapshot| snapshot.current_task.as_ref());
+        let processing = diagnostics
+            .as_ref()
+            .and_then(|snapshot| snapshot.processing)
+            .map_or("none", workflow_processing_status_name);
+        let stage_message_count = match (current, self.store.as_ref()) {
+            (Some(task), Some(store)) => {
+                store.load_stage_messages(task.current_stage_run_id)?.len()
+            }
+            _ => 0,
+        };
+        let plan = current.and_then(|task| serde_json::to_string(&task.plan).ok());
+        let checkpoint = current.and_then(|task| serde_json::to_string(&task.checkpoint).ok());
+        let audit_payload = if self.debug_log.payloads_enabled() {
+            match self
+                .dialog_id
+                .zip(self.store.as_ref())
+                .map(|(dialog_id, store)| store.load_workflow_debug_payload(dialog_id))
+                .transpose()
+            {
+                Ok(payload) => payload,
+                Err(_) => {
+                    emit_event(
+                        &mut on_event,
+                        AgentEvent::DebugLogFailed {
+                            error: "workflow debug audit payload unavailable".into(),
+                        },
+                    )?;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let proposed_event = committed_event_name(initial_task.as_ref(), current);
+        let metadata = WorkflowDebugMetadata {
+            source: "human",
+            component: "workflow_engine",
+            model: &checker_model,
+            mode: "advisory",
+            input_version: initial_task.as_ref().map_or(0, |task| task.version),
+            output_version: current.map(|task| task.version),
+            proposed_event,
+            accepted: !matches!(result.routing, RoutingOutcome::Rejected { .. }),
+            autonomous_turn: result.autonomous_turns,
+            autonomous_tokens: result.tokens,
+            stage_run_id: current.map_or(0, |task| task.current_stage_run_id.0),
+            transition_id: proposed_event.and_then(|_| {
+                diagnostics
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.latest_transition_id)
+            }),
+            processing_status: processing,
+            usage: self.last_usage,
+            input_chars: prompt.chars().count(),
+            output_chars: result
+                .answer
+                .as_deref()
+                .map_or(0, |answer| answer.chars().count()),
+            stage_message_count,
+            plan_step_count: current.map_or(0, |task| task.plan.steps.len()),
+            checkpoint_item_count: current.map_or(0, |task| {
+                task.checkpoint.decisions.len()
+                    + task.checkpoint.open_issues.len()
+                    + usize::from(!task.checkpoint.summary.is_empty())
+            }),
+        };
+        let payload = WorkflowDebugPayload {
+            interpreter_output: audit_payload
+                .as_ref()
+                .and_then(|payload| payload.interpreter_output.as_deref()),
+            checker_output: audit_payload
+                .as_ref()
+                .and_then(|payload| payload.checker_output.as_deref()),
+            plan: plan.as_deref(),
+            checkpoint: checkpoint.as_deref(),
+            controller_instruction: audit_payload
+                .as_ref()
+                .and_then(|payload| payload.controller_instruction.as_deref()),
+            handoff: audit_payload
+                .as_ref()
+                .and_then(|payload| payload.handoff.as_deref()),
+            model_prompt: Some(prompt),
+            model_output: result.answer.as_deref(),
+        };
+        if let Some(error) = self.debug_log.log_workflow(&metadata, Some(&payload)) {
+            emit_event(&mut on_event, AgentEvent::DebugLogFailed { error })?;
+        }
         Ok(result.answer.unwrap_or_default())
     }
 
@@ -805,6 +944,35 @@ where
 {
     on_event(event).map_err(ClientError::Output)?;
     Ok(())
+}
+
+fn workflow_processing_status_name(status: ProcessingStatus) -> &'static str {
+    match status {
+        ProcessingStatus::Pending => "pending",
+        ProcessingStatus::Processing => "processing",
+        ProcessingStatus::Completed => "completed",
+        ProcessingStatus::Failed => "failed",
+    }
+}
+
+fn committed_event_name(
+    initial: Option<&WorkflowTaskState>,
+    current: Option<&WorkflowTaskState>,
+) -> Option<&'static str> {
+    let (Some(initial), Some(current)) = (initial, current) else {
+        return None;
+    };
+    if initial.id != current.id || initial.current_stage_run_id == current.current_stage_run_id {
+        return None;
+    }
+    match (initial.phase, current.phase) {
+        (TaskPhase::Planning, TaskPhase::Execution) => Some("planning_completed"),
+        (TaskPhase::Execution, TaskPhase::Validation) => Some("execution_completed"),
+        (TaskPhase::Validation, TaskPhase::Done) => Some("validation_passed"),
+        (TaskPhase::Validation, TaskPhase::Execution) => Some("validation_failed"),
+        (_, TaskPhase::Planning) => Some("replan_requested"),
+        _ => None,
+    }
 }
 
 pub enum AgentEvent<'a> {

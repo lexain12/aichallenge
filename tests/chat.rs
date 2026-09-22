@@ -139,6 +139,17 @@ fn recognizes_commands_and_ignores_blank_input() {
     );
 }
 
+// Break caught: task status is local metadata, while command arguments must not
+// be sent to the model as ordinary chat text.
+#[test]
+fn parses_task_status_command_exactly() {
+    assert_eq!(parse_input(" /task "), InputAction::TaskStatus);
+    assert_eq!(
+        parse_input("/task extra"),
+        InputAction::InvalidCommand("usage: /task".into())
+    );
+}
+
 #[test]
 fn stages_a_user_message_without_mutating_committed_history() {
     let history = ChatHistory::new("Be concise".into());

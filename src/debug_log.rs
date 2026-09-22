@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::chat::{Message, Role};
+use crate::client::TokenUsage;
 use crate::config::{ContextStrategy, DebugConfig};
 use crate::system_context::SystemBlockMetadata;
 
@@ -36,6 +37,41 @@ impl RequestMetadata {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WorkflowDebugMetadata<'a> {
+    pub source: &'a str,
+    pub component: &'a str,
+    pub model: &'a str,
+    pub mode: &'a str,
+    pub input_version: u64,
+    pub output_version: Option<u64>,
+    pub proposed_event: Option<&'a str>,
+    pub accepted: bool,
+    pub autonomous_turn: u32,
+    pub autonomous_tokens: u64,
+    pub stage_run_id: i64,
+    pub transition_id: Option<i64>,
+    pub processing_status: &'a str,
+    pub usage: Option<TokenUsage>,
+    pub input_chars: usize,
+    pub output_chars: usize,
+    pub stage_message_count: usize,
+    pub plan_step_count: usize,
+    pub checkpoint_item_count: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WorkflowDebugPayload<'a> {
+    pub interpreter_output: Option<&'a str>,
+    pub checker_output: Option<&'a str>,
+    pub plan: Option<&'a str>,
+    pub checkpoint: Option<&'a str>,
+    pub controller_instruction: Option<&'a str>,
+    pub handoff: Option<&'a str>,
+    pub model_prompt: Option<&'a str>,
+    pub model_output: Option<&'a str>,
+}
+
 pub struct DebugLog {
     writer: Option<BufWriter<File>>,
     log_payloads: bool,
@@ -44,6 +80,10 @@ pub struct DebugLog {
 }
 
 impl DebugLog {
+    pub fn payloads_enabled(&self) -> bool {
+        self.log_payloads
+    }
+
     pub fn new(path: Option<PathBuf>, log_payloads: bool, api_key: &str) -> Self {
         let (writer, pending_warning) = match path {
             None => (None, None),
@@ -116,6 +156,30 @@ impl DebugLog {
     pub fn log_event(&mut self, event: &'static str, details: Value) -> Option<String> {
         self.write_value(json!({
             "event": event,
+            "timestamp_unix_ms": timestamp_unix_ms(),
+            "details": details,
+        }))
+    }
+
+    pub fn log_workflow(
+        &mut self,
+        metadata: &WorkflowDebugMetadata<'_>,
+        payload: Option<&WorkflowDebugPayload<'_>>,
+    ) -> Option<String> {
+        let mut details = match serde_json::to_value(metadata) {
+            Ok(value) => value,
+            Err(error) => return self.disable(format!("serialization failed: {error}")),
+        };
+        if self.log_payloads
+            && let Some(payload) = payload
+        {
+            details["payload"] = match serde_json::to_value(payload) {
+                Ok(value) => value,
+                Err(error) => return self.disable(format!("serialization failed: {error}")),
+            };
+        }
+        self.write_value(json!({
+            "event": "workflow",
             "timestamp_unix_ms": timestamp_unix_ms(),
             "details": details,
         }))

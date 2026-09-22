@@ -20,6 +20,11 @@ use crate::workflow_context::{StageReductionState, facts_candidates};
 use crate::workflow_model::{CheckContext, HandoffPayload, project_handoff};
 
 pub trait WorkflowRepository {
+    fn load_workflow_debug_payload(
+        &self,
+        dialog_id: i64,
+    ) -> Result<WorkflowDebugPayloadSnapshot, StoreError>;
+    fn load_workflow_status(&self, dialog_id: i64) -> Result<WorkflowStatusSnapshot, StoreError>;
     fn pause_current_task(&mut self, dialog_id: i64) -> Result<PauseOutcome, StoreError>;
     fn load_processing_context(
         &self,
@@ -323,6 +328,21 @@ pub struct DialogWorkflowSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowStatusSnapshot {
+    pub current_task: Option<WorkflowTaskState>,
+    pub processing: Option<ProcessingStatus>,
+    pub latest_transition_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkflowDebugPayloadSnapshot {
+    pub interpreter_output: Option<String>,
+    pub checker_output: Option<String>,
+    pub controller_instruction: Option<String>,
+    pub handoff: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StageProtocolMessage {
     pub message_id: i64,
     pub message: Message,
@@ -365,6 +385,111 @@ pub struct ProcessingContext {
 }
 
 impl WorkflowRepository for DialogStore {
+    fn load_workflow_debug_payload(
+        &self,
+        dialog_id: i64,
+    ) -> Result<WorkflowDebugPayloadSnapshot, StoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        let Some(task) = load_workflow(&tx, dialog_id)?.current_task else {
+            tx.commit()?;
+            return Ok(WorkflowDebugPayloadSnapshot::default());
+        };
+        let latest_input = |source: &str| -> Result<Option<(String, String)>, StoreError> {
+            Ok(tx
+                .query_row(
+                    "SELECT wi.intent_json, m.content
+                     FROM workflow_inputs wi
+                     JOIN messages m ON m.id=wi.message_id
+                     JOIN message_task_stages ms ON ms.message_id=m.id
+                     WHERE wi.dialog_id=?1 AND wi.source=?2 AND ms.workflow_task_id=?3
+                     ORDER BY wi.id DESC LIMIT 1",
+                    params![dialog_id, source, task.id.0],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?)
+        };
+        let human = latest_input("human")?;
+        let controller = latest_input("controller")?;
+        let handoff = tx
+            .query_row(
+                "SELECT handoff_json FROM task_transitions
+                 WHERE workflow_task_id=?1 ORDER BY id DESC LIMIT 1",
+                [task.id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok(WorkflowDebugPayloadSnapshot {
+            interpreter_output: human.map(|(intent, _)| intent),
+            checker_output: controller.as_ref().map(|(intent, _)| intent.clone()),
+            controller_instruction: controller.map(|(_, instruction)| instruction),
+            handoff,
+        })
+    }
+
+    fn load_workflow_status(&self, dialog_id: i64) -> Result<WorkflowStatusSnapshot, StoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        let current_task = load_workflow(&tx, dialog_id)?.current_task;
+        let processing = if let Some(task) = current_task.as_ref() {
+            let row = tx
+                .query_row(
+                    "SELECT p.status, m.dialog_id, m.role, s.workflow_task_id
+                     FROM response_processing p
+                     JOIN message_task_stages ms ON ms.message_id=p.assistant_message_id
+                     JOIN messages m ON m.id=p.assistant_message_id
+                     JOIN task_stage_runs s ON s.id=ms.stage_run_id
+                     WHERE ms.workflow_task_id=?1 AND ms.stage_run_id=?2
+                     ORDER BY p.id DESC LIMIT 1",
+                    params![task.id.0, task.current_stage_run_id.0],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match row {
+                Some((status, owner_dialog_id, role, owner_task_id)) => {
+                    if owner_dialog_id != dialog_id
+                        || role != "assistant"
+                        || owner_task_id != task.id.0
+                    {
+                        return invalid("workflow status processing ownership mismatch");
+                    }
+                    Some(
+                        serde_json::from_value(serde_json::Value::String(status)).map_err(
+                            |error| {
+                                StoreError::InvalidWorkflow(format!(
+                                    "invalid stored processing status: {error}"
+                                ))
+                            },
+                        )?,
+                    )
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let latest_transition_id = match current_task.as_ref() {
+            Some(task) => tx.query_row(
+                "SELECT max(id) FROM task_transitions WHERE workflow_task_id=?1",
+                [task.id.0],
+                |row| row.get(0),
+            )?,
+            None => None,
+        };
+        tx.commit()?;
+        Ok(WorkflowStatusSnapshot {
+            current_task,
+            processing,
+            latest_transition_id,
+        })
+    }
+
     fn pause_current_task(&mut self, dialog_id: i64) -> Result<PauseOutcome, StoreError> {
         let tx = self
             .connection

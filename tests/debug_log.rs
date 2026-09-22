@@ -1,6 +1,9 @@
 use deepseek_cli::chat::{Message, Role};
+use deepseek_cli::client::TokenUsage;
 use deepseek_cli::config::ContextStrategy;
-use deepseek_cli::debug_log::{DebugLog, RequestMetadata};
+use deepseek_cli::debug_log::{
+    DebugLog, RequestMetadata, WorkflowDebugMetadata, WorkflowDebugPayload,
+};
 use deepseek_cli::system_context::{CompactionPolicy, ContextScope, SystemBlockMetadata};
 
 #[test]
@@ -59,4 +62,78 @@ fn logging_failure_warns_once_and_disables_future_writes() {
         log.log_event("second", serde_json::json!({"value": 2})),
         None
     );
+}
+
+// Break caught: workflow payloads and controller/model secrets must never be
+// flattened into default diagnostics or escape the opt-in payload envelope.
+#[test]
+fn workflow_payloads_are_metadata_only_by_default_and_nested_when_enabled() {
+    let directory = tempfile::tempdir().unwrap();
+    let safe_path = directory.path().join("workflow-safe.jsonl");
+    let full_path = directory.path().join("workflow-full.jsonl");
+    let marker = "WORKFLOW_MARKER_secret-key";
+    let metadata = WorkflowDebugMetadata {
+        source: "controller",
+        component: "continuation_checker",
+        model: "checker-model",
+        mode: "advisory",
+        input_version: 4,
+        output_version: Some(5),
+        proposed_event: Some("execution_completed"),
+        accepted: false,
+        autonomous_turn: 2,
+        autonomous_tokens: 144,
+        stage_run_id: 9,
+        transition_id: Some(11),
+        processing_status: "failed",
+        usage: Some(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 4,
+            total_tokens: 14,
+            completion_tokens_details: None,
+        }),
+        input_chars: 31,
+        output_chars: 47,
+        stage_message_count: 3,
+        plan_step_count: 2,
+        checkpoint_item_count: 1,
+    };
+    let payload = WorkflowDebugPayload {
+        interpreter_output: Some(marker),
+        checker_output: Some(marker),
+        plan: Some(marker),
+        checkpoint: Some(marker),
+        controller_instruction: Some(marker),
+        handoff: Some(marker),
+        model_prompt: Some(marker),
+        model_output: Some(marker),
+    };
+
+    let mut safe = DebugLog::new(Some(safe_path.clone()), false, "secret-key");
+    assert_eq!(safe.log_workflow(&metadata, Some(&payload)), None);
+    let safe_value: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(safe_path).unwrap().trim()).unwrap();
+    assert_eq!(safe_value["event"], "workflow");
+    assert_eq!(safe_value["details"]["component"], "continuation_checker");
+    assert_eq!(safe_value["details"]["autonomous_tokens"], 144);
+    assert!(safe_value["details"].get("payload").is_none());
+    let safe_text = safe_value.to_string();
+    assert!(!safe_text.contains(marker));
+    assert!(!safe_text.contains("secret-key"));
+
+    let mut full = DebugLog::new(Some(full_path.clone()), true, "secret-key");
+    assert_eq!(full.log_workflow(&metadata, Some(&payload)), None);
+    let full_value: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(full_path).unwrap().trim()).unwrap();
+    assert_eq!(
+        full_value["details"]["payload"]["controller_instruction"],
+        "WORKFLOW_MARKER_[REDACTED]"
+    );
+    let mut without_payload = full_value.clone();
+    without_payload["details"]
+        .as_object_mut()
+        .unwrap()
+        .remove("payload");
+    assert!(!without_payload.to_string().contains("WORKFLOW_MARKER"));
+    assert!(!full_value.to_string().contains("secret-key"));
 }

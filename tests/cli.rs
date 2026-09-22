@@ -305,6 +305,205 @@ fn run_cli_args(config_path: &Path, database: &Path, args: &[&str], input: &str)
     child.wait_with_output().expect("wait for deepseek-cli")
 }
 
+// Break caught: workflow status is a read-only local command and must not
+// manufacture a dialog or call the provider when no workflow task exists.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_status_without_task_is_local_and_exact() {
+    let server = MockServer::start().await;
+    let config = write_workflow_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("status-empty.sqlite3");
+
+    let output = run_cli_args(config.path(), &database, &[], "/task extra\n/task\n/exit\n");
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("No workflow task in this dialog.")
+    );
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("usage: /task")
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(
+        DialogStore::open(&database)
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// Break caught: resume and /task render the same committed projection without
+// activating the task, running recovery work, or conflating the workflow ID
+// with the existing memory-task label.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_status_is_printed_after_resume_and_on_command_without_mutation() {
+    let server = MockServer::start().await;
+    let config = write_workflow_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("status.sqlite3");
+    let mut store = DialogStore::open(&database).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "saved goal")
+        .unwrap();
+    drop(store);
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE workflow_tasks SET plan_json=?1, current_step_id='write', expected_action='Run focused tests' WHERE id=?2",
+            rusqlite::params![
+                json!({
+                    "revision": 7,
+                    "steps": [{"id":"write","description":"Implement status","status":"in_progress"}],
+                    "acceptance_criteria": []
+                })
+                .to_string(),
+                started.task.id.0,
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    let before = DialogStore::open(&database)
+        .unwrap()
+        .load_workflow(started.dialog_id)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let id = started.dialog_id.to_string();
+
+    let resumed = run_cli_args(config.path(), &database, &["--resume", &id], "/exit\n");
+    assert!(resumed.status.success());
+    let stdout = String::from_utf8(resumed.stdout).unwrap();
+    assert_eq!(
+        stdout.matches("Workflow task #1 · ID: ").count(),
+        1,
+        "{stdout}"
+    );
+    for expected in [
+        "Phase: planning · status: active",
+        "Plan revision: 7 · current step: write",
+        "Expected action: Run focused tests",
+        "Stage sequence: 1 · processing: none",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in {stdout}"
+        );
+    }
+    assert!(stdout.contains(&format!("Workflow task #1 · ID: {}", before.id.0)));
+
+    let commanded = run_cli_args(
+        config.path(),
+        &database,
+        &["--resume", &id],
+        "/task\n/exit\n",
+    );
+    assert!(commanded.status.success());
+    let stdout = String::from_utf8(commanded.stdout).unwrap();
+    assert_eq!(
+        stdout.matches("Workflow task #1 · ID: ").count(),
+        2,
+        "{stdout}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        DialogStore::open(&database)
+            .unwrap()
+            .load_workflow(started.dialog_id)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        before
+    );
+}
+
+// Break caught: autonomous ordinary turns must render as distinct assistant
+// blocks without attributing the hidden controller instruction to the user.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_autonomous_responses_are_separate_and_hide_controller_text() {
+    let server = MockServer::start().await;
+    let marker = "SYNTHETIC_CONTROLLER_SECRET_11";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(
+                [
+                    sse("first visible answer", 2, 1, 3),
+                    sse(
+                        &json!({
+                            "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+                            "decision": {"type":"continue","instruction":marker,"confidence":0.95}
+                        })
+                        .to_string(),
+                        2,
+                        1,
+                        3,
+                    ),
+                    sse("second visible answer", 2, 1, 3),
+                    sse(
+                        &json!({
+                            "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+                            "decision": {"type":"await_user"}
+                        })
+                        .to_string(),
+                        2,
+                        1,
+                        3,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        })
+        .mount(&server)
+        .await;
+    let config = write_workflow_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("autonomous-output.sqlite3");
+
+    let output = run_cli_args(config.path(), &database, &[], "build it\n/exit\n");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stdout.matches("assistant> ").count(), 2, "{stdout}");
+    assert!(
+        stdout.contains("assistant> first visible answer"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("assistant> second visible answer"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Controller · autonomous turn 1 · planning"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(marker), "{stdout}");
+    assert!(!stderr.contains(marker), "{stderr}");
+
+    let replay = run_cli_args(config.path(), &database, &["--resume-last"], "/exit\n");
+    assert!(replay.status.success());
+    let replay = String::from_utf8(replay.stdout).unwrap();
+    assert!(replay.contains("first visible answer"), "{replay}");
+    assert!(replay.contains("second visible answer"), "{replay}");
+    assert!(!replay.contains(marker), "{replay}");
+    let listed = DialogStore::open(&database).unwrap().list().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].title.contains(marker));
+}
+
 // Break caught: the CLI must recover before reading the first restored prompt, even when that prompt exits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_cli_recovers_pending_work_before_prompt_and_warns_on_failure() {

@@ -59,6 +59,7 @@ pub enum InputAction {
     Exit,
     Clear,
     Stats,
+    TaskStatus,
     Branch,
     Switch(i64),
     Remember {
@@ -153,6 +154,13 @@ pub fn parse_input(input: &str) -> InputAction {
                 InputAction::Branch
             } else {
                 InputAction::InvalidCommand("usage: /branch".to_owned())
+            };
+        }
+        Some("/task") => {
+            return if parts.next().is_none() {
+                InputAction::TaskStatus
+            } else {
+                InputAction::InvalidCommand("usage: /task".to_owned())
             };
         }
         Some("/switch") => {

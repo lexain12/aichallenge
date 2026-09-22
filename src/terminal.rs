@@ -1,5 +1,6 @@
 use std::io::{self, IsTerminal, Write};
 
+use crate::agent::WorkflowStatus;
 use crate::client::TokenUsage;
 use crate::context::{ContextStats, UsageTotals};
 use crate::memory::{DurableMemoryScope, MemorySnapshot, RequestScope};
@@ -44,6 +45,39 @@ pub struct TerminalUi {
 }
 
 impl TerminalUi {
+    pub fn write_workflow_status<W: Write>(
+        &self,
+        writer: &mut W,
+        status: Option<&WorkflowStatus>,
+    ) -> io::Result<()> {
+        let Some(status) = status else {
+            return self.write_block(
+                writer,
+                BlockStyle::System,
+                "No workflow task in this dialog.",
+            );
+        };
+        let current_step = status.current_step_id.as_deref().unwrap_or("none");
+        let expected_action = status.expected_action.as_deref().unwrap_or("none");
+        let processing = status.processing.map_or("none", processing_status_name);
+        self.write_block(
+            writer,
+            BlockStyle::System,
+            &format!(
+                "Workflow task #{} · ID: {}\nPhase: {} · status: {}\nPlan revision: {} · current step: {}\nExpected action: {}\nStage sequence: {} · processing: {}",
+                status.ordinal,
+                status.task_id.0,
+                task_phase_name(status.phase),
+                task_status_name(status.status),
+                status.plan_revision,
+                current_step,
+                expected_action,
+                status.stage_sequence,
+                processing,
+            ),
+        )
+    }
+
     pub fn write_profile<W: Write>(
         &self,
         writer: &mut W,
@@ -335,6 +369,31 @@ impl TerminalUi {
     }
 }
 
+fn task_phase_name(phase: crate::workflow::TaskPhase) -> &'static str {
+    match phase {
+        crate::workflow::TaskPhase::Planning => "planning",
+        crate::workflow::TaskPhase::Execution => "execution",
+        crate::workflow::TaskPhase::Validation => "validation",
+        crate::workflow::TaskPhase::Done => "done",
+    }
+}
+
+fn task_status_name(status: crate::workflow::TaskStatus) -> &'static str {
+    match status {
+        crate::workflow::TaskStatus::Active => "active",
+        crate::workflow::TaskStatus::Paused => "paused",
+    }
+}
+
+fn processing_status_name(status: crate::workflow_store::ProcessingStatus) -> &'static str {
+    match status {
+        crate::workflow_store::ProcessingStatus::Pending => "pending",
+        crate::workflow_store::ProcessingStatus::Processing => "processing",
+        crate::workflow_store::ProcessingStatus::Completed => "completed",
+        crate::workflow_store::ProcessingStatus::Failed => "failed",
+    }
+}
+
 fn format_usage_totals(label: &str, usage: UsageTotals) -> String {
     let mut text = format!(
         "{label} · вход: {} · выход: {} · всего: {}",
@@ -363,6 +422,7 @@ pub struct FullWidthBlock<'a, W: Write> {
     status_visible: bool,
     waiting_for_text: bool,
     inline_images: bool,
+    closed: bool,
 }
 
 impl<'a, W: Write> FullWidthBlock<'a, W> {
@@ -388,6 +448,7 @@ impl<'a, W: Write> FullWidthBlock<'a, W> {
             status_visible: false,
             waiting_for_text: false,
             inline_images: false,
+            closed: false,
         };
         block.write_text(prefix)?;
         block.flush_pending_grapheme()?;
@@ -396,6 +457,11 @@ impl<'a, W: Write> FullWidthBlock<'a, W> {
     }
 
     pub fn write_text(&mut self, text: &str) -> io::Result<()> {
+        if self.closed {
+            return Err(io::Error::other(
+                "cannot write to a finished terminal block",
+            ));
+        }
         if text.is_empty() {
             return Ok(());
         }
@@ -549,7 +615,10 @@ impl<'a, W: Write> FullWidthBlock<'a, W> {
         Ok(())
     }
 
-    pub fn finish(mut self) -> io::Result<()> {
+    pub fn finish_current(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
         self.hide_live_status()?;
         self.live_status = false;
         self.flush_pending_grapheme()?;
@@ -560,7 +629,33 @@ impl<'a, W: Write> FullWidthBlock<'a, W> {
         } else {
             self.finish_line(false)?;
         }
+        self.writer.flush()?;
+        self.closed = true;
+        Ok(())
+    }
+
+    pub fn start_next_response(&mut self, status: &str, live_status: bool) -> io::Result<()> {
+        self.finish_current()?;
+        let status = fit_line(status, self.width.saturating_sub(1));
+        if self.styled {
+            write!(self.writer, "\x1b[2m{status}{RESET}\r\n{ASSISTANT_STYLE}")?;
+        } else {
+            writeln!(self.writer, "{status}")?;
+        }
+        self.column = 0;
+        self.last_was_newline = false;
+        self.live_status = live_status;
+        self.status_visible = false;
+        self.waiting_for_text = true;
+        self.closed = false;
+        self.write_content("assistant> ")?;
+        self.flush_pending_grapheme()?;
+        self.draw_live_status()?;
         self.writer.flush()
+    }
+
+    pub fn finish(mut self) -> io::Result<()> {
+        self.finish_current()
     }
 }
 

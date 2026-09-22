@@ -11,6 +11,8 @@ use deepseek_cli::config::{Config, ConfigError};
 use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::memory::{DEFAULT_TASK_ID, DEFAULT_USER_ID, DurableMemoryScope, RequestScope};
 use deepseek_cli::terminal::{BlockStyle, TerminalUi};
+use deepseek_cli::workflow::TaskPhase;
+use deepseek_cli::workflow_engine::WorkflowTurnEvent;
 use deepseek_cli::workflow_store::PauseOutcome;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -203,6 +205,8 @@ async fn run() -> Result<(), AppError> {
             block.write_text(message.content())?;
             block.finish()?;
         }
+        let status = agent.workflow_status()?;
+        stdout_ui.write_workflow_status(&mut stdout, status.as_ref())?;
     }
 
     let mut lines = stdin_lines()?;
@@ -257,6 +261,10 @@ async fn run() -> Result<(), AppError> {
             }
             InputAction::Stats => {
                 stdout_ui.write_context_stats(&mut stdout, agent.context_stats())?;
+            }
+            InputAction::TaskStatus => {
+                let status = agent.workflow_status()?;
+                stdout_ui.write_workflow_status(&mut stdout, status.as_ref())?;
             }
             InputAction::Remember { scope, key, value } => {
                 agent.remember(scope, &key, &value)?;
@@ -496,6 +504,7 @@ async fn run_prompt<W: io::Write, E: io::Write>(
 ) -> Result<(), AppError> {
     let mut block = Some(stdout_ui.start_response(stdout)?);
     let mut deferred_warnings = Vec::new();
+    let mut pending_autonomous_status = None;
     let result = agent
         .run_streaming(user_message, |event| match event {
             AgentEvent::Text(fragment) => block
@@ -503,14 +512,51 @@ async fn run_prompt<W: io::Write, E: io::Write>(
                 .expect("compaction starts after ordinary response text")
                 .write_text(fragment),
             AgentEvent::Usage(_) => Ok(()),
-            AgentEvent::Workflow(_) => Ok(()),
+            AgentEvent::Workflow(event) => match event {
+                WorkflowTurnEvent::AutonomousTurnStarted { number, phase } => {
+                    block
+                        .as_mut()
+                        .expect("workflow response renderer remains available")
+                        .finish_current()?;
+                    pending_autonomous_status = Some(format!(
+                        "Controller · autonomous turn {number} · {}",
+                        task_phase_name(phase)
+                    ));
+                    Ok(())
+                }
+                WorkflowTurnEvent::ResponseStarted {
+                    autonomous_turn, ..
+                } if autonomous_turn > 0 => {
+                    let status = pending_autonomous_status
+                        .take()
+                        .unwrap_or_else(|| format!("Controller · autonomous turn {autonomous_turn}"));
+                    block
+                        .as_mut()
+                        .expect("workflow response renderer remains available")
+                        .start_next_response(&status, stdout_ui.is_interactive())
+                }
+                WorkflowTurnEvent::ResponseStarted { .. } => Ok(()),
+                WorkflowTurnEvent::InputRejected { reason } => {
+                    if let Some(response) = block.take() {
+                        response.finish()?;
+                    }
+                    stderr_ui.write_block(stderr, BlockStyle::Error, &reason)
+                }
+                WorkflowTurnEvent::ProcessingFailed { checker, error } => {
+                    deferred_warnings.push(format!(
+                        "workflow processing failed ({checker}): {error}"
+                    ));
+                    Ok(())
+                }
+                WorkflowTurnEvent::Stopped { .. } => Ok(()),
+            },
             AgentEvent::CompactionStarted {
                 covered_message_count,
                 kept_message_count,
                 ..
             } => {
-                if let Some(response) = block.take() {
-                    response.finish()?;
+                if let Some(response) = block.as_mut() {
+                    response.finish_current()?;
                 }
                 if stderr_ui.is_interactive() {
                     stderr_ui.write_status(
@@ -653,6 +699,15 @@ fn memory_address_label(scope: &RequestScope, layer: DurableMemoryScope) -> Stri
         DurableMemoryScope::Task => {
             format!("user: {} · task: {}", scope.user_id(), scope.task_id())
         }
+    }
+}
+
+fn task_phase_name(phase: TaskPhase) -> &'static str {
+    match phase {
+        TaskPhase::Planning => "planning",
+        TaskPhase::Execution => "execution",
+        TaskPhase::Validation => "validation",
+        TaskPhase::Done => "done",
     }
 }
 
