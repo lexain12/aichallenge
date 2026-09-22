@@ -23,6 +23,21 @@ fn context_config(strategy: &str, keep: usize) -> ContextConfig {
 }
 
 #[test]
+fn persisted_stage_context_restores_summary_boundary_and_usage() {
+    let raw = r#"{"summary":{"content":"stage only","covered_message_count":2},"compaction_usage":{"call_count":3,"prompt_tokens":10,"completion_tokens":4,"total_tokens":14,"missing_usage_count":1}}"#;
+    let state: ContextState = serde_json::from_str(raw).unwrap();
+    assert_eq!(state.summary().unwrap().content(), "stage only");
+    assert_eq!(state.summary().unwrap().covered_message_count(), 2);
+    assert_eq!(state.compaction_usage().call_count(), 3);
+    assert_eq!(state.compaction_usage().total_tokens(), 14);
+    assert_eq!(state.compaction_usage().missing_usage_count(), 1);
+    assert_eq!(
+        serde_json::to_value(&state).unwrap(),
+        serde_json::from_str::<serde_json::Value>(raw).unwrap()
+    );
+}
+
+#[test]
 fn system_blocks_are_ordered_before_windowed_history() {
     let mut system = SystemContext::default();
     system.push(SystemBlock::new(

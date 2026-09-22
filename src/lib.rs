@@ -13,5 +13,6 @@ pub mod profile;
 pub mod system_context;
 pub mod terminal;
 pub mod workflow;
+pub mod workflow_context;
 pub mod workflow_model;
 pub mod workflow_store;

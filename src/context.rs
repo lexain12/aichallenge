@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
 use crate::chat::{ChatHistory, Message, Role};
@@ -11,7 +12,7 @@ use crate::system_context::{
 const SUMMARY_CONTEXT_PREFIX: &str = "Summary of earlier conversation:\n";
 const SUMMARY_SYSTEM_PROMPT: &str = "Create a faithful cumulative summary of the conversation context. Preserve facts, names, decisions, constraints, user preferences, unresolved questions, and exact technical identifiers. Distinguish user statements from assistant suggestions. Do not invent missing information. Return only the updated summary.";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ContextSummary {
     content: String,
     covered_message_count: usize,
@@ -34,7 +35,7 @@ impl ContextSummary {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageTotals {
     call_count: u64,
     prompt_tokens: u64,
@@ -97,7 +98,7 @@ impl UsageTotals {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ContextState {
     summary: Option<ContextSummary>,
     compaction_usage: UsageTotals,
@@ -241,6 +242,22 @@ pub fn prepare_request(
     user_message: &str,
     additional_system_blocks: &[SystemBlock],
 ) -> PreparedContext {
+    prepare_request_with_pending(
+        history,
+        state,
+        config,
+        Some(user_message),
+        additional_system_blocks,
+    )
+}
+
+pub(crate) fn prepare_request_with_pending(
+    history: &ChatHistory,
+    state: &ContextState,
+    config: &ContextConfig,
+    pending_input: Option<&str>,
+    additional_system_blocks: &[SystemBlock],
+) -> PreparedContext {
     let mut system = SystemContext::default();
     system.push(SystemBlock::new(
         "base",
@@ -273,7 +290,9 @@ pub fn prepare_request(
         .map(|block| block.name)
         .collect();
     let mut ordinary_messages = history.messages().to_vec();
-    ordinary_messages.push(Message::new(Role::User, user_message.to_owned()));
+    if let Some(input) = pending_input {
+        ordinary_messages.push(Message::new(Role::User, input.to_owned()));
+    }
     let selected_message_count = match selection {
         HistorySelection::Full => ordinary_messages.len(),
         HistorySelection::Last(count) => ordinary_messages.len().min(count),

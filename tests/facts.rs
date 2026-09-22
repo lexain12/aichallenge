@@ -10,6 +10,29 @@ fn msg(role: Role, content: &str) -> Message {
 }
 
 #[test]
+fn persisted_stage_facts_restore_candidate_boundary_and_usage() {
+    let state = FactsState::default().updated(
+        BTreeMap::from([("deadline".into(), "Friday".into())]),
+        2,
+        None,
+    );
+    let encoded = serde_json::to_string(&state).unwrap();
+    let restored: FactsState = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(restored.facts()["deadline"], "Friday");
+    assert_eq!(restored.covered_message_count(), 2);
+    assert_eq!(restored.update_usage().call_count(), 1);
+    assert_eq!(restored.update_usage().missing_usage_count(), 1);
+    let messages = [
+        msg(Role::User, "old"),
+        msg(Role::Assistant, "answer"),
+        msg(Role::User, "new"),
+    ];
+    let plan = plan_facts_update(&messages, &restored).unwrap();
+    assert!(plan.request_messages()[1].content().contains("1. new"));
+    assert!(!plan.request_messages()[1].content().contains("1. old"));
+}
+
+#[test]
 fn update_plan_contains_previous_map_and_only_uncovered_user_messages() {
     let state = FactsState::restored(
         BTreeMap::from([("goal".into(), "ship CLI".into())]),

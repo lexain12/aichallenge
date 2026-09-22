@@ -1,4 +1,5 @@
 use deepseek_cli::client::TokenUsage;
+use deepseek_cli::context::ContextSummary;
 use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::memory::RequestScope;
 use deepseek_cli::workflow::{
@@ -7,6 +8,7 @@ use deepseek_cli::workflow::{
 use deepseek_cli::workflow::{PlanAppend, PlanStepStatus, StepStatusUpdate, TaskStatePatch};
 use deepseek_cli::workflow::{StageRunId, TaskPhase, TaskStatus};
 use deepseek_cli::workflow::{WorkflowInput, WorkflowInputSource, WorkflowIntent, WorkflowTaskId};
+use deepseek_cli::workflow_context::StageReductionState;
 use deepseek_cli::workflow_model::HandoffPayload;
 use deepseek_cli::workflow_store::TransitionCommit;
 use deepseek_cli::workflow_store::{
@@ -15,6 +17,326 @@ use deepseek_cli::workflow_store::{
 use deepseek_cli::workflow_store::{ControllerInputCommit, ProcessingLeaseMode, ProcessingResult};
 use deepseek_cli::workflow_store::{ProcessingStatus, ProtocolSource, WorkflowRepository};
 use rusqlite::Connection;
+
+#[test]
+fn stage_reductions_restore_independently_accumulate_usage_and_leave_paused_task_unchanged() {
+    let mut fixture = Fixture::new();
+    let before = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(
+        fixture.store.load_stage_reductions(StageRunId(1)).unwrap(),
+        StageReductionState::default()
+    );
+    let context = fixture
+        .store
+        .replace_stage_context(
+            StageRunId(1),
+            3,
+            1,
+            ContextSummary::new("stage summary", 1),
+            Some(TokenUsage {
+                prompt_tokens: 4,
+                completion_tokens: 2,
+                total_tokens: 6,
+                completion_tokens_details: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(context.compaction_usage().total_tokens(), 6);
+    let facts = fixture
+        .store
+        .replace_stage_facts(
+            StageRunId(1),
+            3,
+            1,
+            [("goal".into(), "ship".into())].into(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(facts.covered_message_count(), 1);
+    let context = fixture
+        .store
+        .replace_stage_context(
+            StageRunId(1),
+            3,
+            1,
+            ContextSummary::new("replacement", 1),
+            None,
+        )
+        .unwrap();
+    assert_eq!(context.compaction_usage().call_count(), 2);
+    assert_eq!(context.compaction_usage().missing_usage_count(), 1);
+    let reopened = DialogStore::open(&fixture._directory.path().join("workflow.sqlite3")).unwrap();
+    assert_eq!(
+        reopened.load_stage_reductions(StageRunId(1)).unwrap(),
+        StageReductionState { context, facts }
+    );
+    assert_eq!(
+        reopened.load_workflow(1).unwrap().current_task.unwrap(),
+        before
+    );
+    assert_eq!(count(&fixture.connection, "dialog_context"), 0);
+    assert_eq!(count(&fixture.connection, "dialog_facts"), 0);
+}
+
+#[test]
+fn stage_reduction_writes_reject_stale_version_count_closed_done_and_unselected_stages() {
+    for corruption in [
+        "UPDATE workflow_tasks SET version=4",
+        "DELETE FROM message_task_stages",
+        "UPDATE task_stage_runs SET finished_at='9999-01-01'",
+        "UPDATE workflow_tasks SET phase='done'; UPDATE task_stage_runs SET phase='done'",
+        "DELETE FROM dialog_workflow_state",
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.connection.execute_batch(corruption).unwrap();
+        assert!(
+            fixture
+                .store
+                .replace_stage_context(StageRunId(1), 3, 1, ContextSummary::new("stale", 1), None)
+                .is_err(),
+            "{corruption}"
+        );
+        assert!(
+            fixture
+                .store
+                .replace_stage_facts(StageRunId(1), 3, 1, Default::default(), None)
+                .is_err(),
+            "{corruption}"
+        );
+        assert_eq!(count(&fixture.connection, "task_stage_context"), 0);
+    }
+}
+
+#[test]
+fn stage_reductions_reject_invalid_boundaries_corrupt_json_and_ignored_writes() {
+    let mut fixture = Fixture::new();
+    for boundary in [0, 2] {
+        assert!(
+            fixture
+                .store
+                .replace_stage_context(
+                    StageRunId(1),
+                    3,
+                    1,
+                    ContextSummary::new("bad", boundary),
+                    None
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        fixture
+            .store
+            .load_stage_reductions(StageRunId(999))
+            .is_err()
+    );
+    fixture.connection.execute_batch("CREATE TRIGGER ignore_context BEFORE INSERT ON task_stage_context BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+    assert!(
+        fixture
+            .store
+            .replace_stage_context(StageRunId(1), 3, 1, ContextSummary::new("lost", 1), None)
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .replace_stage_facts(StageRunId(1), 3, 1, Default::default(), None)
+            .is_err()
+    );
+    assert_eq!(count(&fixture.connection, "task_stage_context"), 0);
+    fixture
+        .connection
+        .execute_batch("DROP TRIGGER ignore_context;")
+        .unwrap();
+    fixture
+        .store
+        .replace_stage_context(StageRunId(1), 3, 1, ContextSummary::new("saved", 1), None)
+        .unwrap();
+    let saved = fixture.store.load_stage_reductions(StageRunId(1)).unwrap();
+    fixture.connection.execute_batch("CREATE TRIGGER ignore_context BEFORE UPDATE ON task_stage_context BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+    assert!(
+        fixture
+            .store
+            .replace_stage_context(StageRunId(1), 3, 1, ContextSummary::new("lost", 1), None)
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .replace_stage_facts(StageRunId(1), 3, 1, Default::default(), None)
+            .is_err()
+    );
+    assert_eq!(
+        fixture.store.load_stage_reductions(StageRunId(1)).unwrap(),
+        saved
+    );
+    fixture
+        .connection
+        .execute_batch(
+            "DROP TRIGGER ignore_context; UPDATE task_stage_context SET facts_json='{}';",
+        )
+        .unwrap();
+    assert!(fixture.store.load_stage_reductions(StageRunId(1)).is_err());
+    assert!(
+        fixture
+            .store
+            .replace_stage_facts(StageRunId(1), 3, 1, Default::default(), None)
+            .is_err()
+    );
+}
+
+#[test]
+fn stage_facts_coverage_excludes_controller_but_write_guard_counts_it() {
+    let (mut fixture, processing, assistant) = pending_fixture();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    let intent = WorkflowIntent::human_continue("Do next").unwrap();
+    fixture
+        .store
+        .commit_controller_decision(controller_command(
+            processing,
+            assistant,
+            &intent,
+            &patch(3),
+        ))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .load_stage_messages(StageRunId(1))
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(
+        fixture
+            .store
+            .replace_stage_facts(StageRunId(1), 4, 2, Default::default(), None)
+            .is_err()
+    );
+    let facts = fixture
+        .store
+        .replace_stage_facts(
+            StageRunId(1),
+            4,
+            3,
+            [("goal".into(), "build".into())].into(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(facts.covered_message_count(), 2);
+}
+
+#[test]
+fn stage_transition_resets_reductions_retains_audit_and_rejects_outgoing_writes() {
+    let mut fixture = Fixture::new();
+    fixture
+        .store
+        .replace_stage_context(
+            StageRunId(1),
+            3,
+            1,
+            ContextSummary::new("old summary", 1),
+            None,
+        )
+        .unwrap();
+    fixture
+        .store
+        .replace_stage_facts(
+            StageRunId(1),
+            3,
+            1,
+            [("old".into(), "fact".into())].into(),
+            None,
+        )
+        .unwrap();
+    let old = fixture.store.load_stage_reductions(StageRunId(1)).unwrap();
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let input = transition_input(TransitionEvent::PlanningCompleted);
+    let auth = authorize(&source, &input, None);
+    let result = fixture
+        .store
+        .commit_stage_change(transition_command(&source, &input, &auth, &handoff()))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .load_stage_reductions(result.target_state.current_stage_run_id)
+            .unwrap(),
+        StageReductionState::default()
+    );
+    assert_eq!(
+        fixture.store.load_stage_reductions(StageRunId(1)).unwrap(),
+        old
+    );
+    // Even the new task version and matching old count cannot authorize old-stage writes.
+    assert!(
+        fixture
+            .store
+            .replace_stage_context(
+                StageRunId(1),
+                result.target_state.version,
+                1,
+                ContextSummary::new("stale", 1),
+                None
+            )
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .replace_stage_facts(
+                StageRunId(1),
+                result.target_state.version,
+                1,
+                Default::default(),
+                None
+            )
+            .is_err()
+    );
+    assert_eq!(
+        fixture.store.load_stage_reductions(StageRunId(1)).unwrap(),
+        old
+    );
+}
+
+#[test]
+fn malformed_stage_context_is_an_error_and_cannot_be_overwritten_by_facts() {
+    let mut fixture = Fixture::new();
+    fixture.connection.execute("INSERT INTO task_stage_context(stage_run_id,context_json,facts_json) VALUES (1,'{',?1)", [serde_json::to_string(&deepseek_cli::facts::FactsState::default()).unwrap()]).unwrap();
+    assert!(fixture.store.load_stage_reductions(StageRunId(1)).is_err());
+    assert!(
+        fixture
+            .store
+            .replace_stage_context(StageRunId(1), 3, 1, ContextSummary::new("new", 1), None)
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .replace_stage_facts(StageRunId(1), 3, 1, Default::default(), None)
+            .is_err()
+    );
+    let stored: String = fixture
+        .connection
+        .query_row("SELECT context_json FROM task_stage_context", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored, "{");
+}
 
 fn handoff() -> HandoffPayload {
     HandoffPayload {

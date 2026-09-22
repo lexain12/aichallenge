@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::chat::{Message, Role};
@@ -13,7 +14,7 @@ pub type Facts = BTreeMap<String, String>;
 const FACTS_SYSTEM_PROMPT: &str = "Update the key-value memory using only facts grounded in the supplied user messages. Return only a bare JSON object with string keys and string values. Use stable descriptive keys. Replace obsolete values, remove facts explicitly revoked by the user, and never turn assistant suggestions into facts. Do not invent information.";
 const FACTS_BLOCK_PREFIX: &str = "Facts (JSON key-value memory):\n";
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FactsState {
     facts: Facts,
     covered_message_count: usize,

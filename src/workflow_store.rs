@@ -7,16 +7,39 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::chat::{Message, Role};
 use crate::client::TokenUsage;
+use crate::context::{ContextState, ContextSummary};
 use crate::dialog::{DialogStore, StoreError};
+use crate::facts::{Facts, FactsState};
 use crate::memory::RequestScope;
 use crate::workflow::{
     PatchContext, StageChangeAuthorization, StageRunId, StateMachine, TaskPhase, TaskStatePatch,
     TaskStatus, TransitionEvent, WorkflowInput, WorkflowInputSource, WorkflowIntent,
     WorkflowTaskId, WorkflowTaskState,
 };
+use crate::workflow_context::{StageReductionState, facts_candidates};
 use crate::workflow_model::{HandoffPayload, project_handoff};
 
 pub trait WorkflowRepository {
+    fn load_stage_reductions(
+        &self,
+        stage_run_id: StageRunId,
+    ) -> Result<StageReductionState, StoreError>;
+    fn replace_stage_context(
+        &mut self,
+        stage_run_id: StageRunId,
+        expected_task_version: u64,
+        expected_stage_message_count: usize,
+        summary: ContextSummary,
+        usage: Option<TokenUsage>,
+    ) -> Result<ContextState, StoreError>;
+    fn replace_stage_facts(
+        &mut self,
+        stage_run_id: StageRunId,
+        expected_task_version: u64,
+        expected_stage_message_count: usize,
+        facts: Facts,
+        usage: Option<TokenUsage>,
+    ) -> Result<FactsState, StoreError>;
     fn copy_workflow_branch(
         tx: &Transaction<'_>,
         source_dialog_id: i64,
@@ -264,6 +287,79 @@ pub struct PendingProcessing {
 }
 
 impl WorkflowRepository for DialogStore {
+    fn load_stage_reductions(
+        &self,
+        stage_run_id: StageRunId,
+    ) -> Result<StageReductionState, StoreError> {
+        load_stage_reductions(&self.connection, stage_run_id)
+    }
+
+    fn replace_stage_context(
+        &mut self,
+        stage_run_id: StageRunId,
+        expected_task_version: u64,
+        expected_stage_message_count: usize,
+        summary: ContextSummary,
+        usage: Option<TokenUsage>,
+    ) -> Result<ContextState, StoreError> {
+        if summary.covered_message_count() == 0
+            || summary.covered_message_count() > expected_stage_message_count
+        {
+            return Err(StoreError::InvalidContext(
+                "summary boundary must cover an existing non-empty stage prefix",
+            ));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (dialog_id, _) = guard_stage_reduction(
+            &tx,
+            stage_run_id,
+            expected_task_version,
+            expected_stage_message_count,
+        )?;
+        let mut state = load_stage_reductions(&tx, stage_run_id)?;
+        state.context.replace_summary(summary, usage);
+        require_one(tx.execute(
+            "INSERT INTO task_stage_context (stage_run_id,context_json,facts_json) VALUES (?1,?2,?3)
+             ON CONFLICT(stage_run_id) DO UPDATE SET context_json=excluded.context_json,
+             updated_at=strftime('%Y-%m-%d %H:%M:%f','now')",
+            params![stage_run_id.0, serde_json::to_string(&state.context)?, serde_json::to_string(&state.facts)?],
+        )?, dialog_id)?;
+        tx.commit()?;
+        Ok(state.context)
+    }
+
+    fn replace_stage_facts(
+        &mut self,
+        stage_run_id: StageRunId,
+        expected_task_version: u64,
+        expected_stage_message_count: usize,
+        facts: Facts,
+        usage: Option<TokenUsage>,
+    ) -> Result<FactsState, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (dialog_id, messages) = guard_stage_reduction(
+            &tx,
+            stage_run_id,
+            expected_task_version,
+            expected_stage_message_count,
+        )?;
+        let mut state = load_stage_reductions(&tx, stage_run_id)?;
+        state.facts = state
+            .facts
+            .updated(facts, facts_candidates(&messages).len(), usage);
+        require_one(tx.execute(
+            "INSERT INTO task_stage_context (stage_run_id,context_json,facts_json) VALUES (?1,?2,?3)
+             ON CONFLICT(stage_run_id) DO UPDATE SET facts_json=excluded.facts_json,
+             updated_at=strftime('%Y-%m-%d %H:%M:%f','now')",
+            params![stage_run_id.0, serde_json::to_string(&state.context)?, serde_json::to_string(&state.facts)?],
+        )?, dialog_id)?;
+        tx.commit()?;
+        Ok(state.facts)
+    }
     fn copy_workflow_branch(
         tx: &Transaction<'_>,
         source_dialog_id: i64,
@@ -492,55 +588,7 @@ impl WorkflowRepository for DialogStore {
         &self,
         stage_run_id: StageRunId,
     ) -> Result<Vec<StageProtocolMessage>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT m.id, m.role, m.content, u.usage_json, i.source,
-                    m.dialog_id, t.dialog_id, ms.workflow_task_id, s.workflow_task_id, i.dialog_id
-             FROM message_task_stages ms
-             LEFT JOIN messages m ON m.id = ms.message_id
-             LEFT JOIN task_stage_runs s ON s.id = ms.stage_run_id
-             LEFT JOIN workflow_tasks t ON t.id = ms.workflow_task_id
-             LEFT JOIN message_usage u ON u.message_id = m.id
-             LEFT JOIN workflow_inputs i ON i.message_id = m.id
-             WHERE ms.stage_run_id = ?1 ORDER BY m.id",
-        )?;
-        let mut rows = statement.query([stage_run_id.0])?;
-        let mut messages = Vec::new();
-        while let Some(row) = rows.next()? {
-            let message_id = positive(integer(row, 0)?, "message id")?;
-            let dialog_id = positive(integer(row, 5)?, "message dialog id")?;
-            if dialog_id != integer(row, 6)?
-                || integer(row, 7)? != integer(row, 8)?
-                || field::<Option<i64>>(row, 9)?.is_some_and(|id| id != dialog_id)
-            {
-                return invalid("stage message ownership mismatch");
-            }
-            let role = match field::<String>(row, 1)?.as_str() {
-                "user" => Role::User,
-                "assistant" => Role::Assistant,
-                _ => return invalid("unknown protocol role"),
-            };
-            let input_source: Option<String> = field(row, 4)?;
-            if input_source
-                .as_deref()
-                .is_some_and(|source| source != "human" && source != "controller")
-            {
-                return invalid("unknown workflow input source");
-            }
-            let source = match (role, input_source.as_deref()) {
-                (Role::Assistant, _) => ProtocolSource::Assistant,
-                (_, Some("controller")) => ProtocolSource::Controller,
-                _ => ProtocolSource::Human,
-            };
-            let usage = field::<Option<String>>(row, 3)?
-                .map(|value| json(&value))
-                .transpose()?;
-            messages.push(StageProtocolMessage {
-                message_id,
-                message: Message::new(role, field(row, 2)?).with_usage(usage),
-                source,
-            });
-        }
-        Ok(messages)
+        load_stage_messages(&self.connection, stage_run_id)
     }
 
     fn load_pending_processing(
@@ -940,17 +988,118 @@ pub(crate) fn copy_workflow_branch(
 }
 
 fn initialize_stage_context(connection: &Connection, stage: StageRunId) -> Result<(), StoreError> {
-    // These are the default ContextState/FactsState shapes, including usage boundaries.
-    let usage = serde_json::json!({"call_count":0,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"missing_usage_count":0});
     let changed = connection.execute(
         "INSERT INTO task_stage_context (stage_run_id, context_json, facts_json) VALUES (?1, ?2, ?3)",
-        params![stage.0, serde_json::json!({"summary":null,"compaction_usage":usage}).to_string(),
-            serde_json::json!({"facts":{},"covered_message_count":0,"update_usage":usage}).to_string()],
+        params![stage.0, serde_json::to_string(&ContextState::default())?,
+            serde_json::to_string(&FactsState::default())?],
     )?;
     if changed != 1 {
         return invalid("stage context insertion lost");
     }
     Ok(())
+}
+
+fn load_stage_messages(
+    connection: &Connection,
+    stage_run_id: StageRunId,
+) -> Result<Vec<StageProtocolMessage>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT m.id, m.role, m.content, u.usage_json, i.source,
+                m.dialog_id, t.dialog_id, ms.workflow_task_id, s.workflow_task_id, i.dialog_id
+         FROM message_task_stages ms
+         LEFT JOIN messages m ON m.id = ms.message_id
+         LEFT JOIN task_stage_runs s ON s.id = ms.stage_run_id
+         LEFT JOIN workflow_tasks t ON t.id = ms.workflow_task_id
+         LEFT JOIN message_usage u ON u.message_id = m.id
+         LEFT JOIN workflow_inputs i ON i.message_id = m.id
+         WHERE ms.stage_run_id = ?1 ORDER BY m.id",
+    )?;
+    let mut rows = statement.query([stage_run_id.0])?;
+    let mut messages = Vec::new();
+    while let Some(row) = rows.next()? {
+        let message_id = positive(integer(row, 0)?, "message id")?;
+        let dialog_id = positive(integer(row, 5)?, "message dialog id")?;
+        if dialog_id != integer(row, 6)?
+            || integer(row, 7)? != integer(row, 8)?
+            || field::<Option<i64>>(row, 9)?.is_some_and(|id| id != dialog_id)
+        {
+            return invalid("stage message ownership mismatch");
+        }
+        let role = match field::<String>(row, 1)?.as_str() {
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            _ => return invalid("unknown protocol role"),
+        };
+        let input_source: Option<String> = field(row, 4)?;
+        if input_source
+            .as_deref()
+            .is_some_and(|source| source != "human" && source != "controller")
+        {
+            return invalid("unknown workflow input source");
+        }
+        let source = match (role, input_source.as_deref()) {
+            (Role::Assistant, _) => ProtocolSource::Assistant,
+            (_, Some("controller")) => ProtocolSource::Controller,
+            _ => ProtocolSource::Human,
+        };
+        let usage = field::<Option<String>>(row, 3)?
+            .map(|value| json(&value))
+            .transpose()?;
+        messages.push(StageProtocolMessage {
+            message_id,
+            message: Message::new(role, field(row, 2)?).with_usage(usage),
+            source,
+        });
+    }
+    Ok(messages)
+}
+
+fn load_stage_reductions(
+    connection: &Connection,
+    stage: StageRunId,
+) -> Result<StageReductionState, StoreError> {
+    let row: Option<(Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT c.context_json,c.facts_json FROM task_stage_runs s
+         LEFT JOIN task_stage_context c ON c.stage_run_id=s.id WHERE s.id=?1",
+            [stage.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((Some(context), Some(facts))) => Ok(StageReductionState {
+            context: json(&context)?,
+            facts: json(&facts)?,
+        }),
+        Some((None, None)) => Ok(StageReductionState::default()),
+        _ => invalid("missing stage or incomplete stage reductions"),
+    }
+}
+
+fn guard_stage_reduction(
+    connection: &Connection,
+    stage: StageRunId,
+    expected_version: u64,
+    expected_count: usize,
+) -> Result<(i64, Vec<StageProtocolMessage>), StoreError> {
+    let dialog_id: i64 = connection.query_row(
+        "SELECT t.dialog_id FROM task_stage_runs s JOIN workflow_tasks t ON t.id=s.workflow_task_id WHERE s.id=?1",
+        [stage.0], |row| row.get(0),
+    ).optional()?.ok_or_else(|| StoreError::InvalidWorkflow("missing reduction stage".into()))?;
+    let task = load_workflow(connection, dialog_id)?
+        .current_task
+        .ok_or(StoreError::WorkflowConflict(dialog_id))?;
+    if task.current_stage_run_id != stage
+        || task.version != expected_version
+        || task.phase == TaskPhase::Done
+    {
+        return Err(StoreError::WorkflowConflict(dialog_id));
+    }
+    let messages = load_stage_messages(connection, stage)?;
+    if messages.len() != expected_count {
+        return Err(StoreError::WorkflowConflict(dialog_id));
+    }
+    Ok((dialog_id, messages))
 }
 
 fn transition_projection(
