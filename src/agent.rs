@@ -1,10 +1,11 @@
 use std::io;
+use std::sync::Arc;
 
 use thiserror::Error;
 
 use crate::chat::{ChatHistory, Message, Role};
 use crate::client::{ClientError, DeepSeekClient, StreamEvent, TokenUsage};
-use crate::config::{Config, ContextConfig, ContextStrategy};
+use crate::config::{Config, ContextConfig, ContextStrategy, WorkflowConfig};
 use crate::context::{
     ContextState, ContextStats, ContextSummary, plan_compaction, prepare_request, stats,
 };
@@ -17,6 +18,10 @@ use crate::memory::{
 };
 use crate::profile::{ProfileRepository, UserProfile};
 use crate::system_context::{CompactionPolicy, ContextScope, SystemBlock, SystemBlockMetadata};
+use crate::workflow_engine::{
+    WorkflowEngine, WorkflowEngineError, WorkflowModels, WorkflowSession,
+};
+use crate::workflow_model::DeepSeekCompletionModel;
 
 /// An API client and its independent conversation, optionally backed by SQLite.
 pub struct Agent {
@@ -32,6 +37,8 @@ pub struct Agent {
     facts_state: FactsState,
     branch_info: Option<BranchInfo>,
     debug_log: DebugLog,
+    workflow_config: Option<WorkflowConfig>,
+    workflow_models: Option<WorkflowModels>,
 }
 
 impl Agent {
@@ -134,8 +141,20 @@ impl Agent {
     }
 
     pub fn new(config: &Config) -> Result<Self, ClientError> {
+        let client = DeepSeekClient::new(config)?;
+        let adapter = |model: &str| {
+            Arc::new(
+                DeepSeekCompletionModel::new(client.clone(), model.to_owned())
+                    .expect("workflow model names are validated by Config"),
+            )
+        };
+        let workflow_models = WorkflowModels {
+            interpreter: adapter(config.workflow().interpreter_model()),
+            checker: adapter(config.workflow().checker_model()),
+            handoff: adapter(config.workflow().handoff_model()),
+        };
         Ok(Self {
-            client: DeepSeekClient::new(config)?,
+            client,
             history: ChatHistory::new(config.system_prompt().to_owned()),
             prompt: None,
             store: None,
@@ -147,6 +166,8 @@ impl Agent {
             facts_state: FactsState::default(),
             branch_info: None,
             debug_log: DebugLog::from_config(config.debug(), config.api_key()),
+            workflow_config: Some(config.workflow().clone()),
+            workflow_models: Some(workflow_models),
         })
     }
 
@@ -165,7 +186,14 @@ impl Agent {
             facts_state: FactsState::default(),
             branch_info: None,
             debug_log: DebugLog::new(None, false, ""),
+            workflow_config: None,
+            workflow_models: None,
         }
+    }
+
+    pub fn with_workflow_models(mut self, models: WorkflowModels) -> Self {
+        self.workflow_models = Some(models);
+        self
     }
 
     /// Set the default user prompt for `run`; this is separate from the system prompt.
@@ -189,6 +217,66 @@ impl Agent {
     /// Persistent agents commit input before HTTP starts; it survives request
     /// errors and cancellation. In-memory agents commit only successful pairs.
     pub async fn run_streaming<F>(
+        &mut self,
+        prompt: &str,
+        on_event: F,
+    ) -> Result<String, AgentError>
+    where
+        F: FnMut(AgentEvent<'_>) -> io::Result<()>,
+    {
+        if self.store.is_some()
+            && self
+                .workflow_config
+                .as_ref()
+                .is_some_and(WorkflowConfig::enabled)
+        {
+            self.run_workflow_streaming(prompt, on_event).await
+        } else {
+            self.run_legacy_streaming(prompt, on_event).await
+        }
+    }
+
+    pub async fn run_workflow_streaming<F>(
+        &mut self,
+        prompt: &str,
+        on_event: F,
+    ) -> Result<String, AgentError>
+    where
+        F: FnMut(AgentEvent<'_>) -> io::Result<()>,
+    {
+        self.last_usage = None;
+        if prompt.trim().is_empty() {
+            return Err(AgentError::EmptyPrompt);
+        }
+        let config = self
+            .workflow_config
+            .as_ref()
+            .filter(|config| config.enabled())
+            .ok_or(AgentError::WorkflowUnavailable)?;
+        let models = self
+            .workflow_models
+            .as_ref()
+            .ok_or(AgentError::WorkflowUnavailable)?;
+        let store = self.store.as_mut().ok_or(AgentError::WorkflowUnavailable)?;
+        let result = WorkflowEngine::new(
+            &self.client,
+            &self.context_config,
+            config,
+            models,
+            WorkflowSession {
+                store,
+                dialog_id: &mut self.dialog_id,
+                scope: &mut self.scope,
+                history: &mut self.history,
+                last_usage: &mut self.last_usage,
+            },
+        )
+        .run_human_input(prompt, on_event)
+        .await?;
+        Ok(result.answer.unwrap_or_default())
+    }
+
+    async fn run_legacy_streaming<F>(
         &mut self,
         prompt: &str,
         mut on_event: F,
@@ -337,7 +425,16 @@ impl Agent {
         }
         let id = self.dialog_id.ok_or(AgentError::NoPersistentDialog)?;
         let store = self.store.as_mut().ok_or(AgentError::NoPersistentDialog)?;
-        let fork = store.fork_dialog(id, self.history.messages().len())?;
+        let expected_count = if self
+            .workflow_config
+            .as_ref()
+            .is_some_and(WorkflowConfig::enabled)
+        {
+            store.raw_message_count(id)?
+        } else {
+            self.history.messages().len()
+        };
+        let fork = store.fork_dialog(id, expected_count)?;
         self.branch_info = Some(BranchInfo {
             dialog_id: id,
             branch_group_id: fork.branch_group_id,
@@ -660,6 +757,7 @@ where
 }
 
 pub enum AgentEvent<'a> {
+    Workflow(crate::workflow_engine::WorkflowTurnEvent),
     Text(&'a str),
     Usage(TokenUsage),
     CompactionStarted {
@@ -692,6 +790,10 @@ pub enum AgentEvent<'a> {
 
 #[derive(Debug, Error)]
 pub enum AgentError {
+    #[error("workflow requires enabled configuration and a persistent store")]
+    WorkflowUnavailable,
+    #[error(transparent)]
+    Workflow(#[from] WorkflowEngineError),
     #[error("no default prompt configured; use with_prompt or run_with_prompt")]
     MissingPrompt,
     #[error("prompt must not be empty")]

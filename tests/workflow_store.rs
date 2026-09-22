@@ -11,12 +11,233 @@ use deepseek_cli::workflow::{WorkflowInput, WorkflowInputSource, WorkflowIntent,
 use deepseek_cli::workflow_context::StageReductionState;
 use deepseek_cli::workflow_model::HandoffPayload;
 use deepseek_cli::workflow_store::TransitionCommit;
+use deepseek_cli::workflow_store::UnmanagedAnswerCommit;
 use deepseek_cli::workflow_store::{
     AcceptedInputEffect, AnswerCommit, ExpectedCurrentTask, InputCommit,
 };
 use deepseek_cli::workflow_store::{ControllerInputCommit, ProcessingLeaseMode, ProcessingResult};
 use deepseek_cli::workflow_store::{ProcessingStatus, ProtocolSource, WorkflowRepository};
 use rusqlite::Connection;
+
+fn unmanaged_answer_fixture() -> (Fixture, i64) {
+    let (mut fixture, processing, assistant) = pending_fixture();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    let intent = WorkflowIntent::human_continue("Do next").unwrap();
+    fixture
+        .store
+        .commit_controller_decision(controller_command(
+            processing,
+            assistant,
+            &intent,
+            &patch(3),
+        ))
+        .unwrap();
+    fixture
+        .connection
+        .execute_batch(
+            "UPDATE workflow_tasks SET phase='done'; UPDATE task_stage_runs SET phase='done';",
+        )
+        .unwrap();
+    let input = WorkflowInput {
+        source: WorkflowInputSource::Human,
+        intent: WorkflowIntent::human_continue("unmanaged question").unwrap(),
+    };
+    let saved = fixture
+        .store
+        .append_input(
+            InputCommit {
+                dialog_id: 1,
+                input: &input,
+                protocol_text: "unmanaged question",
+                confidence: None,
+                expected_current_task: ExpectedCurrentTask::Present {
+                    task_id: WorkflowTaskId(1),
+                    version: 4,
+                },
+            },
+            AcceptedInputEffect::RouteUnmanaged,
+        )
+        .unwrap();
+    (fixture, saved.message_id)
+}
+
+// Break caught: unmapped answers must count hidden history correctly and never create a job.
+#[test]
+fn unmanaged_answer_is_atomic_unmapped_and_cannot_be_repeated() {
+    let (mut fixture, input) = unmanaged_answer_fixture();
+    let before = fixture.store.load_workflow(1).unwrap().current_task;
+    let rows = count(&fixture.connection, "messages");
+    let mappings = count(&fixture.connection, "message_task_stages");
+    let jobs = count(&fixture.connection, "response_processing");
+    let usage = TokenUsage {
+        prompt_tokens: 4,
+        completion_tokens: 2,
+        total_tokens: 6,
+        completion_tokens_details: None,
+    };
+    let saved = fixture
+        .store
+        .append_unmanaged_answer(UnmanagedAnswerCommit {
+            dialog_id: 1,
+            input_message_id: input,
+            expected_current_task: ExpectedCurrentTask::Present {
+                task_id: WorkflowTaskId(1),
+                version: 4,
+            },
+            content: "unmanaged answer",
+            usage: Some(usage),
+        })
+        .unwrap();
+    assert!(saved > input);
+    assert_eq!(count(&fixture.connection, "messages"), rows + 1);
+    assert_eq!(count(&fixture.connection, "message_task_stages"), mappings);
+    assert_eq!(count(&fixture.connection, "response_processing"), jobs);
+    assert_eq!(fixture.store.load_workflow(1).unwrap().current_task, before);
+    assert_eq!(
+        fixture
+            .store
+            .load(1)
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .usage(),
+        Some(usage)
+    );
+    assert!(
+        fixture
+            .store
+            .append_unmanaged_answer(UnmanagedAnswerCommit {
+                dialog_id: 1,
+                input_message_id: input,
+                expected_current_task: ExpectedCurrentTask::Present {
+                    task_id: WorkflowTaskId(1),
+                    version: 4
+                },
+                content: "duplicate",
+                usage: None
+            })
+            .is_err()
+    );
+    assert_eq!(count(&fixture.connection, "messages"), rows + 1);
+}
+
+// Break caught: a stale/unmapped-looking input must not append to another task or transcript turn.
+#[test]
+fn unmanaged_answer_rejects_changed_task_nonhuman_mapped_and_nonlatest_inputs() {
+    for mutation in [
+        "UPDATE workflow_tasks SET version=5",
+        "UPDATE workflow_tasks SET phase='planning'; UPDATE task_stage_runs SET phase='planning'",
+        "UPDATE messages SET role='assistant' WHERE id=(SELECT max(id) FROM messages)",
+        "INSERT INTO workflow_inputs (dialog_id,message_id,source,intent_json,outcome) SELECT 1,max(id),'human','{\"type\":\"continue\",\"instruction\":\"x\"}','rejected' FROM messages",
+        "INSERT INTO message_task_stages SELECT max(id),1,1 FROM messages",
+        "INSERT INTO messages (dialog_id,role,content) VALUES (1,'user','racing input')",
+        "DELETE FROM dialog_workflow_state",
+    ] {
+        let (mut fixture, input) = unmanaged_answer_fixture();
+        fixture.connection.execute_batch(mutation).unwrap();
+        let before = count(&fixture.connection, "messages");
+        assert!(
+            fixture
+                .store
+                .append_unmanaged_answer(UnmanagedAnswerCommit {
+                    dialog_id: 1,
+                    input_message_id: input,
+                    expected_current_task: ExpectedCurrentTask::Present {
+                        task_id: WorkflowTaskId(1),
+                        version: 4
+                    },
+                    content: "lost answer",
+                    usage: None
+                })
+                .is_err(),
+            "{mutation}"
+        );
+        assert_eq!(count(&fixture.connection, "messages"), before, "{mutation}");
+    }
+    for expected in [
+        ExpectedCurrentTask::Absent,
+        ExpectedCurrentTask::Present {
+            task_id: WorkflowTaskId(999),
+            version: 4,
+        },
+    ] {
+        let (mut fixture, input) = unmanaged_answer_fixture();
+        assert!(
+            fixture
+                .store
+                .append_unmanaged_answer(UnmanagedAnswerCommit {
+                    dialog_id: 1,
+                    input_message_id: input,
+                    expected_current_task: expected,
+                    content: "lost answer",
+                    usage: None
+                })
+                .is_err()
+        );
+    }
+}
+
+// Break caught: an ignored or failed insert/update must not leave a partial unmanaged answer.
+#[test]
+fn unmanaged_answer_rolls_back_each_required_write_and_rejects_blank_content() {
+    for (table, operation) in [
+        ("messages", "INSERT"),
+        ("message_usage", "INSERT"),
+        ("dialogs", "UPDATE"),
+    ] {
+        for action in ["ABORT, 'injected'", "IGNORE"] {
+            let (mut fixture, input) = unmanaged_answer_fixture();
+            let before = count(&fixture.connection, "messages");
+            fixture.connection.execute_batch(&format!("CREATE TRIGGER fail_unmanaged BEFORE {operation} ON {table} BEGIN SELECT RAISE({action}); END;")).unwrap();
+            assert!(
+                fixture
+                    .store
+                    .append_unmanaged_answer(UnmanagedAnswerCommit {
+                        dialog_id: 1,
+                        input_message_id: input,
+                        expected_current_task: ExpectedCurrentTask::Present {
+                            task_id: WorkflowTaskId(1),
+                            version: 4
+                        },
+                        content: "lost answer",
+                        usage: Some(TokenUsage {
+                            prompt_tokens: 1,
+                            completion_tokens: 1,
+                            total_tokens: 2,
+                            completion_tokens_details: None
+                        })
+                    })
+                    .is_err(),
+                "{table} {action}"
+            );
+            assert_eq!(
+                count(&fixture.connection, "messages"),
+                before,
+                "{table} {action}"
+            );
+        }
+    }
+    let (mut fixture, input) = unmanaged_answer_fixture();
+    assert!(
+        fixture
+            .store
+            .append_unmanaged_answer(UnmanagedAnswerCommit {
+                dialog_id: 1,
+                input_message_id: input,
+                expected_current_task: ExpectedCurrentTask::Present {
+                    task_id: WorkflowTaskId(1),
+                    version: 4
+                },
+                content: " \n ",
+                usage: None
+            })
+            .is_err()
+    );
+}
 
 #[test]
 fn stage_reductions_restore_independently_accumulate_usage_and_leave_paused_task_unchanged() {

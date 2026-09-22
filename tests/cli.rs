@@ -22,6 +22,9 @@ base_url = "{base_url}"
 model = "test-model"
 timeout_seconds = 5
 
+[workflow]
+enabled = false
+
 [context]
 strategy = "summary"
 "#
@@ -39,6 +42,9 @@ api_key = "test-key"
 base_url = "{base_url}"
 model = "test-model"
 timeout_seconds = 5
+
+[workflow]
+enabled = false
 
 [context]
 strategy = "summary"
@@ -60,6 +66,9 @@ api_key = "test-key"
 base_url = "{base_url}"
 model = "test-model"
 timeout_seconds = 5
+
+[workflow]
+enabled = false
 
 [context]
 strategy = "branching"

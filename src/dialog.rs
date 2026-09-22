@@ -181,6 +181,21 @@ impl DialogStore {
         self.start_dialog_in_scope(&RequestScope::default(), system_prompt, prompt)
     }
 
+    /// Raw branch checkpoints include hidden controller protocol rows.
+    pub fn raw_message_count(&self, dialog_id: i64) -> Result<usize, StoreError> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM messages WHERE dialog_id = d.id)
+             FROM dialogs d WHERE d.id = ?1",
+                [dialog_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound(dialog_id))?;
+        usize::try_from(count).map_err(|_| StoreError::InvalidBranch("invalid protocol count"))
+    }
+
     /// Reject stale sessions instead of silently mixing independently generated replies.
     pub fn append_message(
         &mut self,

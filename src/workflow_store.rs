@@ -84,6 +84,10 @@ pub trait WorkflowRepository {
         &mut self,
         command: AnswerCommit<'_>,
     ) -> Result<PersistedAnswer, StoreError>;
+    fn append_unmanaged_answer(
+        &mut self,
+        command: UnmanagedAnswerCommit<'_>,
+    ) -> Result<i64, StoreError>;
     fn start_dialog_with_workflow_task(
         &mut self,
         scope: &RequestScope,
@@ -189,6 +193,14 @@ pub struct AnswerCommit<'a> {
     pub task_id: WorkflowTaskId,
     pub stage_run_id: StageRunId,
     pub expected_version: u64,
+    pub content: &'a str,
+    pub usage: Option<TokenUsage>,
+}
+
+pub struct UnmanagedAnswerCommit<'a> {
+    pub dialog_id: i64,
+    pub input_message_id: i64,
+    pub expected_current_task: ExpectedCurrentTask,
     pub content: &'a str,
     pub usage: Option<TokenUsage>,
 }
@@ -536,6 +548,51 @@ impl WorkflowRepository for DialogStore {
             .map_err(|error| workflow_conflict(error, command.dialog_id))?;
         tx.commit()?;
         Ok(result)
+    }
+
+    fn append_unmanaged_answer(
+        &mut self,
+        command: UnmanagedAnswerCommit<'_>,
+    ) -> Result<i64, StoreError> {
+        if command.content.trim().is_empty() {
+            return invalid("assistant answer must not be blank");
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = load_workflow(&tx, command.dialog_id)?.current_task;
+        if !command.expected_current_task.matches(task.as_ref())
+            || !task
+                .as_ref()
+                .is_some_and(|task| task.phase == TaskPhase::Done)
+        {
+            return Err(StoreError::WorkflowConflict(command.dialog_id));
+        }
+        let valid_input: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages m
+             WHERE m.id=?1 AND m.dialog_id=?2 AND m.role='user'
+               AND NOT EXISTS(SELECT 1 FROM workflow_inputs i WHERE i.message_id=m.id)
+               AND NOT EXISTS(SELECT 1 FROM message_task_stages s WHERE s.message_id=m.id)
+               AND m.id=(SELECT max(id) FROM messages WHERE dialog_id=?2))",
+            params![command.input_message_id, command.dialog_id],
+            |row| row.get(0),
+        )?;
+        if !valid_input {
+            return Err(StoreError::WorkflowConflict(command.dialog_id));
+        }
+        let message_id = insert_message(&tx, command.dialog_id, "assistant", command.content)?;
+        if let Some(usage) = command.usage {
+            require_one(
+                tx.execute(
+                    "INSERT INTO message_usage (message_id,usage_json) VALUES (?1,?2)",
+                    params![message_id, serde_json::to_string(&usage)?],
+                )?,
+                command.dialog_id,
+            )?;
+        }
+        touch_dialog(&tx, command.dialog_id, message_id)?;
+        tx.commit()?;
+        Ok(message_id)
     }
     fn start_dialog_with_workflow_task(
         &mut self,

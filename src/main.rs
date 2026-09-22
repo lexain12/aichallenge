@@ -340,6 +340,7 @@ async fn run() -> Result<(), AppError> {
                             .expect("compaction starts after ordinary response text")
                             .write_text(fragment),
                         AgentEvent::Usage(_) => Ok(()),
+                        AgentEvent::Workflow(_) => Ok(()),
                         AgentEvent::CompactionStarted {
                             covered_message_count,
                             kept_message_count,

@@ -7,6 +7,10 @@ use deepseek_cli::client::ClientError;
 use deepseek_cli::config::Config;
 use deepseek_cli::dialog::DialogStore;
 use deepseek_cli::memory::{DurableMemoryScope, RequestScope};
+use deepseek_cli::workflow::{TaskPhase, TaskStatus};
+use deepseek_cli::workflow_engine::WorkflowModels;
+use deepseek_cli::workflow_model::{CompletionModel, ModelFuture, ModelRequest, ModelResponse};
+use deepseek_cli::workflow_store::WorkflowRepository;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
@@ -21,6 +25,314 @@ fn config(server: &MockServer) -> Config {
     )
     .unwrap();
     Config::load(file.path(), None).unwrap()
+}
+
+fn managed_config(server: &MockServer) -> Config {
+    Config::from_toml(&format!("api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\nsystem_prompt='MANAGED BASE'\n[workflow]\ninterpreter_model='interpreter-model'\nchecker_model='checker-model'\nhandoff_model='handoff-model'\n[context]\nstrategy='summary'",server.uri()),None).unwrap()
+}
+
+#[derive(Default)]
+struct AgentWorkflowModel {
+    responses: Mutex<VecDeque<String>>,
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+impl CompletionModel for AgentWorkflowModel {
+    fn name(&self) -> &str {
+        "agent-test-model"
+    }
+    fn complete(&self, request: ModelRequest) -> ModelFuture<'_> {
+        self.requests.lock().unwrap().push(request);
+        let content = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected workflow service call");
+        Box::pin(async move {
+            Ok(ModelResponse {
+                content,
+                usage: None,
+            })
+        })
+    }
+}
+
+fn injected_models(service: &Arc<AgentWorkflowModel>) -> WorkflowModels {
+    WorkflowModels {
+        interpreter: service.clone(),
+        checker: service.clone(),
+        handoff: service.clone(),
+    }
+}
+
+// Break caught: workflow-enabled persistent agents must create a tagged task/input and pending answer job.
+#[tokio::test]
+async fn managed_agent_persists_task_and_uses_injected_interpreter_before_the_next_answer() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [sse("first answer", 2, 1, 3), sse("second answer", 2, 1, 3)],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let service = Arc::new(AgentWorkflowModel::default());
+    service.responses.lock().unwrap().push_back(
+        json!({"confidence":0.95,"intent":{"type":"continue","instruction":"continue plan"}})
+            .to_string(),
+    );
+    let mut agent = Agent::with_store(
+        &managed_config(&server),
+        DialogStore::open(&database).unwrap(),
+    )
+    .unwrap()
+    .with_workflow_models(injected_models(&service));
+    agent.run_with_prompt("create a parser").await.unwrap();
+    assert!(
+        service.requests.lock().unwrap().is_empty(),
+        "first task is deterministic"
+    );
+    let observer = DialogStore::open(&database).unwrap();
+    let first = observer
+        .load_workflow(agent.dialog_id().unwrap())
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(first.phase, TaskPhase::Planning);
+    assert_eq!(
+        observer
+            .load_pending_processing(first.dialog_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    agent.run_with_prompt("continue plan").await.unwrap();
+    let requests = service.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "checker is deferred to Task 9");
+    let interpreted: Value = serde_json::from_str(requests[0].messages[1].content()).unwrap();
+    assert_eq!(interpreted["human_text"], "continue plan");
+    assert!(!requests[0].messages[1].content().contains("first answer"));
+    let task = observer
+        .load_workflow(first.dialog_id)
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(task.version, 1);
+    assert_eq!(agent.history().messages().len(), 4);
+    assert_eq!(
+        observer.load(first.dialog_id).unwrap().messages,
+        agent.history().messages()
+    );
+    let ordinary = server.received_requests().await.unwrap();
+    assert_eq!(ordinary.len(), 2);
+    let body: Value = ordinary[1].body_json().unwrap();
+    let text = body["messages"].to_string();
+    assert!(text.contains("workflow") || text.contains("current_step_id"));
+    assert_eq!(
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["content"] == "continue plan")
+            .count(),
+        1
+    );
+}
+
+// Break caught: constructors must honor each configured service model and route a transition before ordinary HTTP.
+#[tokio::test]
+async fn managed_agent_uses_configured_service_models_and_restored_stage_context() {
+    let server = MockServer::start().await;
+    let interpretation=json!({"confidence":0.95,"intent":{"type":"propose_transition","event":"execution_completed","evidence":["build green"]}}).to_string();
+    let handoff=json!({"summary":"CURRENT CHECKPOINT","completed_step_ids":[],"next_step_id":null,"expected_action":"validate","plan_changes":[],"decisions":[],"open_issues":[]}).to_string();
+    mount_sequence(
+        &server,
+        [
+            sse("old execution answer", 2, 1, 3),
+            sse(&interpretation, 2, 1, 3),
+            sse(&handoff, 2, 1, 3),
+            sse("validation answer", 2, 1, 3),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let config = managed_config(&server);
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+    agent.run_with_prompt("execution-only input").await.unwrap();
+    let id = agent.dialog_id().unwrap();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection.execute_batch("UPDATE workflow_tasks SET phase='execution',goal='current task goal'; UPDATE task_stage_runs SET phase='execution';").unwrap();
+    drop(agent);
+    let mut agent = Agent::from_dialog(&config, DialogStore::open(&database).unwrap(), id).unwrap();
+    assert_eq!(
+        agent
+            .run_with_prompt("implementation done; test it")
+            .await
+            .unwrap(),
+        "validation answer"
+    );
+    let requests = server.received_requests().await.unwrap();
+    let bodies: Vec<Value> = requests.iter().map(|r| r.body_json().unwrap()).collect();
+    assert_eq!(
+        bodies
+            .iter()
+            .map(|b| b["model"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "ordinary-model",
+            "interpreter-model",
+            "handoff-model",
+            "ordinary-model"
+        ]
+    );
+    let ordinary = bodies[3]["messages"].to_string();
+    assert!(ordinary.contains("validation"));
+    assert!(ordinary.contains("CURRENT CHECKPOINT"));
+    assert!(!ordinary.contains("execution-only input"));
+    assert!(!ordinary.contains("old execution answer"));
+}
+
+// Break caught: enabling workflow cannot change in-memory pair-commit semantics or call service models.
+#[tokio::test]
+async fn workflow_enabled_in_memory_agents_still_use_the_legacy_path() {
+    let server = MockServer::start().await;
+    mount(&server, response("answer", true)).await;
+    let service = Arc::new(AgentWorkflowModel::default());
+    let mut agent = Agent::new(&managed_config(&server))
+        .unwrap()
+        .with_workflow_models(injected_models(&service));
+    agent.run_with_prompt("one").await.unwrap();
+    agent.run_with_prompt("two").await.unwrap();
+    assert!(agent.dialog_id().is_none());
+    assert!(service.requests.lock().unwrap().is_empty());
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests[1].body_json().unwrap();
+    assert_eq!(body["messages"].as_array().unwrap().len(), 4);
+    assert_eq!(body["messages"][1]["content"], "one");
+}
+
+// Break caught: dropping an in-flight first turn cannot lose the newly persisted dialog/task identity.
+#[tokio::test]
+async fn cancelled_managed_first_turn_keeps_session_identity_and_input() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        response("late answer", true).set_delay(std::time::Duration::from_secs(2)),
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let mut agent = Agent::with_store(
+        &managed_config(&server),
+        DialogStore::open(&database).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(40),
+            agent.run_with_prompt("create task")
+        )
+        .await
+        .is_err()
+    );
+    let store = DialogStore::open(&database).unwrap();
+    let task = store
+        .load_workflow(agent.dialog_id().unwrap())
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(task.status, TaskStatus::Active);
+    assert_eq!(agent.scope().dialog_id(), Some(task.dialog_id));
+    assert_eq!(agent.history().messages().len(), 1);
+    assert_eq!(store.load(task.dialog_id).unwrap().messages.len(), 1);
+    assert!(
+        store
+            .load_pending_processing(task.dialog_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// Break caught: a managed fork checkpoint counts hidden protocol, while transcript replay stays visible-only.
+#[tokio::test]
+async fn restored_managed_dialog_with_hidden_controller_input_can_branch() {
+    use deepseek_cli::workflow::{TaskStatePatch, WorkflowIntent};
+    use deepseek_cli::workflow_store::{ControllerInputCommit, ProcessingLeaseMode};
+    let server = MockServer::start().await;
+    mount(&server, response("saved answer", true)).await;
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\n[context]\nstrategy='branching'",
+            server.uri()
+        ),
+        None,
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("dialogs.sqlite3");
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+    agent.run_with_prompt("human goal").await.unwrap();
+    let id = agent.dialog_id().unwrap();
+    drop(agent);
+    let mut store = DialogStore::open(&database).unwrap();
+    let task = store.load_workflow(id).unwrap().current_task.unwrap();
+    let processing = store.load_pending_processing(id).unwrap().remove(0);
+    store
+        .lease_processing(processing.id, task.version, ProcessingLeaseMode::Normal)
+        .unwrap();
+    let intent = WorkflowIntent::human_continue("HIDDEN CONTROLLER").unwrap();
+    store
+        .commit_controller_decision(ControllerInputCommit {
+            processing_id: processing.id,
+            task_id: task.id,
+            stage_run_id: task.current_stage_run_id,
+            expected_version: task.version,
+            checker: "continuation",
+            model: "checker",
+            triggering_assistant_message_id: processing.assistant_message_id,
+            instruction: "HIDDEN CONTROLLER",
+            intent: &intent,
+            confidence: 0.95,
+            accepted_patch: &TaskStatePatch {
+                expected_version: task.version,
+                plan_append: Default::default(),
+                step_updates: vec![],
+                current_step_id: None,
+                expected_action: None,
+                checkpoint: None,
+            },
+        })
+        .unwrap();
+    let mut restored = Agent::from_dialog(&config, store, id).unwrap();
+    assert_eq!(restored.history().messages().len(), 2);
+    let fork = restored.branch_dialog().unwrap();
+    assert_eq!(fork.checkpoint_message_count, 3);
+    let store = DialogStore::open(&database).unwrap();
+    let branch = store
+        .load_workflow(fork.new_dialog_id)
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_ne!(branch.id, task.id);
+    assert_eq!(
+        store
+            .load_stage_messages(branch.current_stage_run_id)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(store.load(fork.new_dialog_id).unwrap().messages.len(), 2);
+    restored.switch_branch(fork.new_dialog_id).unwrap();
+    assert!(
+        restored
+            .history()
+            .messages()
+            .iter()
+            .all(|m| m.content() != "HIDDEN CONTROLLER")
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 fn agent(server: &MockServer) -> Agent {
@@ -125,7 +437,8 @@ fn seen(event: AgentEvent<'_>) -> Seen {
         | AgentEvent::FactsUpdateStarted { .. }
         | AgentEvent::FactsUpdateCompleted { .. }
         | AgentEvent::FactsUpdateFailed { .. }
-        | AgentEvent::DebugLogFailed { .. } => Seen::Other,
+        | AgentEvent::DebugLogFailed { .. }
+        | AgentEvent::Workflow(_) => Seen::Other,
     }
 }
 
@@ -871,7 +1184,8 @@ async fn agents_do_not_share_history_and_forward_stream_events() {
                 | AgentEvent::FactsUpdateStarted { .. }
                 | AgentEvent::FactsUpdateCompleted { .. }
                 | AgentEvent::FactsUpdateFailed { .. }
-                | AgentEvent::DebugLogFailed { .. } => {}
+                | AgentEvent::DebugLogFailed { .. }
+                | AgentEvent::Workflow(_) => {}
             }
             Ok(())
         })
