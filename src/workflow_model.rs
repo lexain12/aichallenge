@@ -157,6 +157,25 @@ pub enum ControllerDecision {
     },
 }
 
+fn proposed_event_from_raw(raw: &str) -> Option<TransitionEvent> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let event = value.get("decision")?.get("event")?.as_str()?;
+    match event {
+        "planning_completed" => Some(TransitionEvent::PlanningCompleted),
+        "execution_completed" => Some(TransitionEvent::ExecutionCompleted),
+        "validation_passed" => Some(TransitionEvent::ValidationPassed),
+        "validation_failed" => Some(TransitionEvent::ValidationFailed),
+        _ => None,
+    }
+}
+
+fn authorization_event(authorization: &StageChangeAuthorization) -> Option<TransitionEvent> {
+    match authorization {
+        StageChangeAuthorization::Transition(authorization) => Some(authorization.event),
+        StageChangeAuthorization::Replan(_) => None,
+    }
+}
+
 // A struct variant is necessary here: serde ignores extra fields on tagged
 // unit variants even with deny_unknown_fields.
 #[derive(Deserialize)]
@@ -203,6 +222,8 @@ pub struct ContinuationCheckResult {
     pub patch: TaskStatePatch,
     pub decision: ControllerDecision,
     pub usage: Option<TokenUsage>,
+    pub raw_output: Option<String>,
+    pub output_chars: usize,
 }
 
 #[derive(Deserialize)]
@@ -259,6 +280,8 @@ pub fn parse_continuation_check(
         patch: parsed.patch,
         decision: parsed.decision,
         usage: None,
+        raw_output: None,
+        output_chars: raw.chars().count(),
     })
 }
 
@@ -423,6 +446,18 @@ pub struct HumanInputInterpreter {
     min_confidence: f32,
 }
 
+#[derive(Clone, Debug)]
+pub struct InterpretationResult {
+    pub interpretation: HumanInterpretation,
+    pub proposed_event: Option<String>,
+    pub model_output_accepted: bool,
+    pub raw_output: Option<String>,
+    pub provider_error: Option<String>,
+    pub failure_kind: Option<&'static str>,
+    pub http_status: Option<u16>,
+    pub output_chars: usize,
+}
+
 impl HumanInputInterpreter {
     pub fn new(model: Arc<dyn CompletionModel>, config: &WorkflowConfig) -> Self {
         Self {
@@ -437,6 +472,18 @@ impl HumanInputInterpreter {
         raw: &str,
         current: Option<&WorkflowTaskState>,
     ) -> Result<HumanInterpretation, ModelPolicyError> {
+        Ok(self
+            .interpret_observed(raw, current, false)
+            .await?
+            .interpretation)
+    }
+
+    pub async fn interpret_observed(
+        &self,
+        raw: &str,
+        current: Option<&WorkflowTaskState>,
+        capture_payloads: bool,
+    ) -> Result<InterpretationResult, ModelPolicyError> {
         let mut fallback = human_fallback(raw, current)?;
         if let Some(state) = current {
             state.validate()?;
@@ -453,22 +500,102 @@ impl HumanInputInterpreter {
             Ok(response) => response,
             Err(error) => {
                 set_interpretation_usage(&mut fallback, error.usage());
-                return Ok(fallback);
+                let (failure_kind, http_status) = error.operator_metadata();
+                return Ok(InterpretationResult {
+                    interpretation: fallback,
+                    proposed_event: None,
+                    model_output_accepted: false,
+                    raw_output: None,
+                    provider_error: capture_payloads.then(|| error.raw_diagnostic()),
+                    failure_kind: Some(failure_kind),
+                    http_status,
+                    output_chars: 0,
+                });
             }
         };
+        let raw_output = capture_payloads.then(|| response.content.clone());
         let mut result = match parse_human_interpretation(&response.content) {
             Ok(result @ HumanInterpretation::Managed { confidence, .. })
                 if confidence >= self.min_confidence =>
             {
                 result
             }
-            _ => {
+            Ok(result) => {
                 set_interpretation_usage(&mut fallback, response.usage);
-                return Ok(fallback);
+                return Ok(InterpretationResult {
+                    interpretation: fallback,
+                    proposed_event: interpretation_event_name(&result),
+                    model_output_accepted: false,
+                    raw_output,
+                    provider_error: None,
+                    failure_kind: Some("low_confidence"),
+                    http_status: None,
+                    output_chars: response.content.chars().count(),
+                });
+            }
+            Err(_) => {
+                set_interpretation_usage(&mut fallback, response.usage);
+                return Ok(InterpretationResult {
+                    interpretation: fallback,
+                    proposed_event: human_proposed_event_from_raw(&response.content),
+                    model_output_accepted: false,
+                    raw_output,
+                    provider_error: None,
+                    failure_kind: Some("invalid_output"),
+                    http_status: None,
+                    output_chars: response.content.chars().count(),
+                });
             }
         };
+        let proposed_event = interpretation_event_name(&result);
         set_interpretation_usage(&mut result, response.usage);
-        Ok(result)
+        Ok(InterpretationResult {
+            interpretation: result,
+            proposed_event,
+            model_output_accepted: true,
+            raw_output,
+            provider_error: None,
+            failure_kind: None,
+            http_status: None,
+            output_chars: response.content.chars().count(),
+        })
+    }
+}
+
+fn interpretation_event_name(interpretation: &HumanInterpretation) -> Option<String> {
+    let HumanInterpretation::Managed { intent, .. } = interpretation else {
+        return None;
+    };
+    match intent {
+        WorkflowIntent::StartNewTask { .. } => Some("start_new_task".into()),
+        WorkflowIntent::ReplanCurrent { .. } => Some("replan_requested".into()),
+        WorkflowIntent::ProposeTransition { event, .. } => Some(
+            match event {
+                TransitionEvent::PlanningCompleted => "planning_completed",
+                TransitionEvent::ExecutionCompleted => "execution_completed",
+                TransitionEvent::ValidationPassed => "validation_passed",
+                TransitionEvent::ValidationFailed => "validation_failed",
+            }
+            .into(),
+        ),
+        WorkflowIntent::Continue { .. } => None,
+    }
+}
+
+fn human_proposed_event_from_raw(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let intent = value.get("intent")?;
+    match intent.get("type")?.as_str()? {
+        "start_new_task" => Some("start_new_task".into()),
+        "replan_current" => Some("replan_requested".into()),
+        "propose_transition" => match intent.get("event")?.as_str()? {
+            event @ ("planning_completed"
+            | "execution_completed"
+            | "validation_passed"
+            | "validation_failed") => Some(event.to_owned()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -501,6 +628,9 @@ pub enum CheckError {
     Policy {
         error: ModelPolicyError,
         usage: Option<TokenUsage>,
+        raw_output: Option<String>,
+        proposed_event: Option<TransitionEvent>,
+        output_chars: usize,
     },
 }
 
@@ -511,11 +641,52 @@ impl CheckError {
             Self::Policy { usage, .. } => *usage,
         }
     }
+
+    pub fn operator_metadata(&self) -> (&'static str, Option<u16>) {
+        match self {
+            Self::Model(error) => error.operator_metadata(),
+            Self::Policy { .. } => ("invalid_output", None),
+        }
+    }
+
+    pub fn raw_output(&self) -> Option<&str> {
+        match self {
+            Self::Policy { raw_output, .. } => raw_output.as_deref(),
+            Self::Model(_) => None,
+        }
+    }
+
+    pub fn proposed_event(&self) -> Option<TransitionEvent> {
+        match self {
+            Self::Policy { proposed_event, .. } => *proposed_event,
+            Self::Model(_) => None,
+        }
+    }
+
+    pub fn output_chars(&self) -> usize {
+        match self {
+            Self::Policy { output_chars, .. } => *output_chars,
+            Self::Model(_) => 0,
+        }
+    }
+
+    pub fn raw_diagnostic(&self) -> String {
+        match self {
+            Self::Model(error) => error.raw_diagnostic(),
+            Self::Policy { error, .. } => error.to_string(),
+        }
+    }
 }
 
 impl From<ModelPolicyError> for CheckError {
     fn from(error: ModelPolicyError) -> Self {
-        Self::Policy { error, usage: None }
+        Self::Policy {
+            error,
+            usage: None,
+            raw_output: None,
+            proposed_event: None,
+            output_chars: 0,
+        }
     }
 }
 
@@ -526,6 +697,14 @@ pub trait ResponseChecker: Send + Sync {
     fn name(&self) -> &str;
     fn mode(&self) -> CheckerMode;
     fn check<'a>(&'a self, context: &'a CheckContext, response: &'a str) -> CheckFuture<'a>;
+    fn check_observed<'a>(
+        &'a self,
+        context: &'a CheckContext,
+        response: &'a str,
+        _capture_payloads: bool,
+    ) -> CheckFuture<'a> {
+        self.check(context, response)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -563,6 +742,14 @@ impl ResponseChecker for ContinuationChecker {
         CheckerMode::Advisory
     }
     fn check<'a>(&'a self, context: &'a CheckContext, response: &'a str) -> CheckFuture<'a> {
+        self.check_observed(context, response, false)
+    }
+    fn check_observed<'a>(
+        &'a self,
+        context: &'a CheckContext,
+        response: &'a str,
+        capture_payloads: bool,
+    ) -> CheckFuture<'a> {
         Box::pin(async move {
             context.task.validate().map_err(ModelPolicyError::from)?;
             context
@@ -579,14 +766,22 @@ impl ResponseChecker for ContinuationChecker {
                 self.max_tokens,
             );
             let response = self.model.complete(request).await?;
+            let output_chars = response.content.chars().count();
+            let proposed_event = proposed_event_from_raw(&response.content);
+            let raw_output = capture_payloads.then(|| response.content.clone());
             let mut result =
                 parse_continuation_check(&response.content, &context.task).map_err(|error| {
                     CheckError::Policy {
                         error,
                         usage: response.usage,
+                        raw_output: raw_output.clone(),
+                        proposed_event,
+                        output_chars,
                     }
                 })?;
             result.usage = response.usage;
+            result.raw_output = capture_payloads.then_some(response.content);
+            result.output_chars = output_chars;
             Ok(result)
         })
     }
@@ -596,6 +791,8 @@ impl ResponseChecker for ContinuationChecker {
 pub struct HandoffBuildResult {
     pub payload: HandoffPayload,
     pub usage: Option<TokenUsage>,
+    pub raw_output: Option<String>,
+    pub output_chars: usize,
 }
 
 pub struct HandoffBuilder {
@@ -618,6 +815,24 @@ impl HandoffBuilder {
         stage_messages: &[Message],
         triggering_input: &WorkflowInput,
     ) -> Result<HandoffBuildResult, CheckError> {
+        self.build_observed(
+            authorization,
+            state,
+            stage_messages,
+            triggering_input,
+            false,
+        )
+        .await
+    }
+
+    pub async fn build_observed(
+        &self,
+        authorization: &StageChangeAuthorization,
+        state: &WorkflowTaskState,
+        stage_messages: &[Message],
+        triggering_input: &WorkflowInput,
+        capture_payloads: bool,
+    ) -> Result<HandoffBuildResult, CheckError> {
         check_authorization(state, authorization)?;
         triggering_input
             .validate()
@@ -631,16 +846,27 @@ impl HandoffBuilder {
             self.max_tokens,
         );
         let response = self.model.complete(request).await?;
+        let output_chars = response.content.chars().count();
+        let raw_output = capture_payloads.then(|| response.content.clone());
         let payload = parse_handoff(&response.content, state, authorization).map_err(|error| {
             CheckError::Policy {
                 error,
                 usage: response.usage,
+                raw_output: raw_output.clone(),
+                proposed_event: authorization_event(authorization),
+                output_chars,
             }
         })?;
         Ok(HandoffBuildResult {
             payload,
             usage: response.usage,
+            raw_output: capture_payloads.then_some(response.content),
+            output_chars,
         })
+    }
+
+    pub fn model_name(&self) -> &str {
+        self.model.name()
     }
 }
 
@@ -682,6 +908,23 @@ impl ModelError {
         match self {
             Self::Client(error) => error.usage(),
             Self::BlankModelName => None,
+        }
+    }
+
+    pub fn operator_metadata(&self) -> (&'static str, Option<u16>) {
+        match self {
+            Self::Client(error) => {
+                let metadata = error.operator_metadata();
+                (metadata.kind, metadata.status)
+            }
+            Self::BlankModelName => ("configuration", None),
+        }
+    }
+
+    pub fn raw_diagnostic(&self) -> String {
+        match self {
+            Self::Client(error) => error.raw_diagnostic(),
+            Self::BlankModelName => self.to_string(),
         }
     }
 }

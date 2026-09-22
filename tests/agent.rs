@@ -236,17 +236,22 @@ async fn managed_workflow_writes_metadata_only_debug_event_by_default() {
     agent.run_with_prompt("HUMAN_SECRET_11").await.unwrap();
 
     let log = std::fs::read_to_string(log_path).unwrap();
-    assert!(log.contains(r#""event":"workflow""#), "{log}");
-    for metadata in [
-        r#""component":"workflow_engine""#,
-        r#""model":"agent-test-model""#,
-        r#""mode":"advisory""#,
-        r#""autonomous_turn":0"#,
-        r#""autonomous_tokens":3"#,
-        r#""processing_status":"completed""#,
-    ] {
-        assert!(log.contains(metadata), "missing {metadata:?} in {log}");
-    }
+    let values: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| event["event"] == "workflow")
+        .collect();
+    assert_eq!(values.len(), 3, "{values:#?}");
+    assert_eq!(values[0]["details"]["component"], "input_router");
+    assert_eq!(values[0]["details"]["model"], "local");
+    assert_eq!(values[1]["details"]["component"], "ordinary");
+    assert_eq!(values[1]["details"]["model"], "ordinary-model");
+    assert_eq!(values[1]["details"]["autonomous_tokens"], 3);
+    assert_eq!(values[2]["details"]["source"], "controller");
+    assert_eq!(values[2]["details"]["component"], "continuation");
+    assert_eq!(values[2]["details"]["model"], "agent-test-model");
+    assert_eq!(values[2]["details"]["processing_status"], "completed");
+    assert_eq!(values[2]["details"]["accepted"], false);
     for secret in [
         "HUMAN_SECRET_11",
         "ORDINARY_SECRET_ONE",
@@ -257,8 +262,272 @@ async fn managed_workflow_writes_metadata_only_debug_event_by_default() {
     ] {
         assert!(!log.contains(secret), "workflow debug log leaked {secret}");
     }
-    let value: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
-    assert!(value["details"].get("payload").is_none());
+    for value in values {
+        assert!(value["details"].get("payload").is_none());
+    }
+}
+
+// Break caught: an invalid checker transition is a rejected controller
+// proposal, not an accepted human decision inferred from endpoint phases.
+#[tokio::test]
+async fn rejected_checker_transition_logs_the_real_failed_decision() {
+    let server = MockServer::start().await;
+    let proposed = json!({
+        "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+        "decision": {"type":"emit_transition","event":"execution_completed","evidence":[],"confidence":0.95}
+    })
+    .to_string();
+    mount_sequence(
+        &server,
+        [sse("visible answer", 2, 1, 3), sse(&proposed, 4, 2, 6)],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("rejected-diagnostic.sqlite3");
+    let log_path = directory.path().join("rejected-diagnostic.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\ninterpreter_model='interpreter-model'\nchecker_model='checker-model'\nhandoff_model='handoff-model'\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=false",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+
+    agent.run_with_prompt("start task").await.unwrap();
+
+    let events: Vec<Value> = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| event["event"] == "workflow")
+        .collect();
+    let checker = events
+        .iter()
+        .find(|event| event["details"]["component"] == "continuation")
+        .expect("checker decision diagnostic");
+    let details = &checker["details"];
+    assert_eq!(details["source"], "controller");
+    assert_eq!(details["model"], "checker-model");
+    assert_eq!(details["mode"], "advisory");
+    assert_eq!(details["input_version"], 0);
+    assert_eq!(details["output_version"], 0);
+    assert_eq!(details["proposed_event"], "execution_completed");
+    assert_eq!(details["accepted"], false);
+    assert_eq!(details["outcome"], "failed");
+    assert_eq!(details["processing_status"], "failed");
+    assert!(details["processing_id"].as_i64().unwrap() > 0);
+    assert_eq!(details["usage"]["total_tokens"], 6);
+    assert!(details.get("payload").is_none());
+}
+
+// Break caught: an accepted transition has two real model decisions (checker
+// and handoff), each with its own response and the same committed transition.
+#[tokio::test]
+async fn accepted_transition_logs_matching_checker_and_handoff_invocations() {
+    let server = MockServer::start().await;
+    let checker = json!({
+        "patch": {
+            "expected_version":0,
+            "plan_append": {
+                "steps":[{"id":"s1","description":"implement it","status":"pending"}],
+                "acceptance_criteria":["it works"]
+            },
+            "step_updates":[],
+            "current_step_id":"s1",
+            "expected_action":"implement s1",
+            "checkpoint":null
+        },
+        "decision": {"type":"emit_transition","event":"planning_completed","evidence":[],"confidence":0.95}
+    })
+    .to_string();
+    let handoff = json!({
+        "summary":"plan approved",
+        "completed_step_ids":[],
+        "next_step_id":"s1",
+        "expected_action":"implement s1",
+        "plan_changes":[],
+        "decisions":[],
+        "open_issues":[]
+    })
+    .to_string();
+    let follow_up_interpreter = json!({
+        "confidence": 0.95,
+        "intent": {"type":"continue","instruction":"continue execution"}
+    })
+    .to_string();
+    mount_sequence(
+        &server,
+        [
+            sse("planning answer", 2, 1, 3),
+            sse(&checker, 3, 2, 5),
+            sse(&handoff, 4, 2, 6),
+            sse("execution answer", 2, 1, 3),
+            sse(&await_check(1), 2, 1, 3),
+            sse(&follow_up_interpreter, 3, 2, 5),
+            sse("follow-up answer", 2, 1, 3),
+            sse(&await_check(1), 2, 1, 3),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("transition-diagnostic.sqlite3");
+    let log_path = directory.path().join("transition-diagnostic.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\ninterpreter_model='interpreter-model'\nchecker_model='checker-model'\nhandoff_model='handoff-model'\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=true",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+
+    agent.run_with_prompt("start task").await.unwrap();
+    agent.run_with_prompt("more detail").await.unwrap();
+
+    let events: Vec<Value> = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| event["event"] == "workflow")
+        .collect();
+    let transition_checker = events
+        .iter()
+        .find(|event| {
+            event["details"]["component"] == "continuation"
+                && event["details"]["proposed_event"] == "planning_completed"
+        })
+        .expect("transition checker event");
+    let handoff_event = events
+        .iter()
+        .find(|event| event["details"]["component"] == "handoff_builder")
+        .expect("handoff event");
+    assert_eq!(transition_checker["details"]["accepted"], true);
+    assert_eq!(transition_checker["details"]["output_version"], 1);
+    assert_eq!(
+        transition_checker["details"]["processing_status"],
+        "completed"
+    );
+    assert_eq!(
+        transition_checker["details"]["payload"]["checker_output"],
+        checker
+    );
+    assert_eq!(handoff_event["details"]["source"], "controller");
+    assert_eq!(handoff_event["details"]["model"], "handoff-model");
+    assert_eq!(handoff_event["details"]["accepted"], true);
+    assert_eq!(handoff_event["details"]["payload"]["handoff"], handoff);
+    assert_eq!(
+        handoff_event["details"]["transition_id"],
+        transition_checker["details"]["transition_id"]
+    );
+    assert!(handoff_event["details"]["transition_id"].as_i64().unwrap() > 0);
+    let interpreter = events
+        .iter()
+        .find(|event| event["details"]["component"] == "human_input_interpreter")
+        .expect("follow-up interpreter event");
+    assert_eq!(interpreter["details"]["proposed_event"], Value::Null);
+    assert_eq!(interpreter["details"]["transition_id"], Value::Null);
+}
+
+// Break caught: when payload logging is explicitly enabled, a failed checker
+// event owns the raw response that failed; it must not reuse a persisted intent.
+#[tokio::test]
+async fn failed_checker_payload_is_bound_to_its_own_invocation() {
+    let server = MockServer::start().await;
+    let raw_checker = json!({
+        "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+        "decision": {"type":"emit_transition","event":"execution_completed","evidence":[],"confidence":0.95}
+    })
+    .to_string();
+    mount_sequence(
+        &server,
+        [sse("visible answer", 2, 1, 3), sse(&raw_checker, 4, 2, 6)],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("failed-checker-raw.sqlite3");
+    let log_path = directory.path().join("failed-checker-raw.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\nchecker_model='checker-model'\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=true",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+
+    agent.run_with_prompt("start task").await.unwrap();
+
+    let checker = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["details"]["component"] == "continuation")
+        .expect("failed checker event");
+    assert_eq!(checker["details"]["accepted"], false);
+    assert_eq!(checker["details"]["outcome"], "failed");
+    assert_eq!(checker["details"]["payload"]["checker_output"], raw_checker);
+    assert!(checker["details"]["payload"]["interpreter_output"].is_null());
+}
+
+// Break caught: raw provider diagnostics are available only inside the opt-in
+// payload envelope; the returned operator error remains body-free.
+#[tokio::test]
+async fn provider_error_body_is_opt_in_payload_only() {
+    let server = MockServer::start().await;
+    let marker = "OPT_IN_PROVIDER_BODY_SECRET";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(marker))
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("provider-error-raw.sqlite3");
+    let log_path = directory.path().join("provider-error-raw.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=true",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+
+    let error = agent.run_with_prompt("start task").await.unwrap_err();
+
+    assert!(!error.to_string().contains(marker));
+    let operator = error.operator_message();
+    assert!(!operator.contains(marker), "{operator}");
+    assert_eq!(
+        operator,
+        "provider failure · component: ordinary · kind: http · status: 400"
+    );
+    let ordinary = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["details"]["component"] == "ordinary")
+        .expect("ordinary failure event");
+    assert!(
+        ordinary["details"]["payload"]["provider_error"]
+            .as_str()
+            .unwrap()
+            .contains(marker)
+    );
+    let mut metadata_only = ordinary.clone();
+    metadata_only["details"]
+        .as_object_mut()
+        .unwrap()
+        .remove("payload");
+    assert!(!metadata_only.to_string().contains(marker));
 }
 
 // Break caught: opting into payload logging must expose persisted workflow
@@ -267,31 +536,23 @@ async fn managed_workflow_writes_metadata_only_debug_event_by_default() {
 async fn managed_workflow_nests_controller_and_checker_payloads_when_enabled() {
     let server = MockServer::start().await;
     let marker = "OPT_IN_CONTROLLER_SECRET_11";
+    let first_checker = json!({
+        "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+        "decision": {"type":"continue","instruction":marker,"confidence":0.95}
+    })
+    .to_string();
+    let second_checker = json!({
+        "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+        "decision": {"type":"await_user"}
+    })
+    .to_string();
     mount_sequence(
         &server,
         [
             sse("first answer", 2, 1, 3),
-            sse(
-                &json!({
-                    "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
-                    "decision": {"type":"continue","instruction":marker,"confidence":0.95}
-                })
-                .to_string(),
-                2,
-                1,
-                3,
-            ),
+            sse(&first_checker, 2, 1, 3),
             sse("second answer", 2, 1, 3),
-            sse(
-                &json!({
-                    "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
-                    "decision": {"type":"await_user"}
-                })
-                .to_string(),
-                2,
-                1,
-                3,
-            ),
+            sse(&second_checker, 2, 1, 3),
         ],
     )
     .await;
@@ -311,31 +572,120 @@ async fn managed_workflow_nests_controller_and_checker_payloads_when_enabled() {
 
     agent.run_with_prompt("human prompt").await.unwrap();
 
-    let value: Value = serde_json::from_str(
-        std::fs::read_to_string(log_path)
-            .unwrap()
-            .lines()
-            .last()
-            .unwrap(),
-    )
-    .unwrap();
+    let values: Vec<Value> = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| event["event"] == "workflow")
+        .collect();
+    let checkers: Vec<&Value> = values
+        .iter()
+        .filter(|event| event["details"]["component"] == "continuation")
+        .collect();
+    assert_eq!(checkers.len(), 2, "{values:#?}");
     assert_eq!(
-        value["details"]["payload"]["controller_instruction"],
+        checkers[0]["details"]["payload"]["checker_output"],
+        first_checker
+    );
+    assert_eq!(
+        checkers[0]["details"]["payload"]["controller_instruction"],
         marker
     );
-    assert!(
-        value["details"]["payload"]["checker_output"]
-            .as_str()
-            .unwrap()
-            .contains(marker)
+    assert_eq!(
+        checkers[1]["details"]["payload"]["checker_output"],
+        second_checker
     );
-    assert_eq!(value["details"]["payload"]["model_output"], "second answer");
-    let mut metadata_only = value.clone();
-    metadata_only["details"]
-        .as_object_mut()
+    assert!(
+        checkers[1]["details"]["payload"]["controller_instruction"].is_null(),
+        "{:#?}",
+        checkers[1]
+    );
+    let ordinary: Vec<&Value> = values
+        .iter()
+        .filter(|event| event["details"]["component"] == "ordinary")
+        .collect();
+    assert_eq!(ordinary.len(), 2, "{values:#?}");
+    assert_eq!(ordinary[0]["details"]["processing_status"], "pending");
+    assert_eq!(ordinary[1]["details"]["processing_status"], "pending");
+    assert!(ordinary[0]["details"]["processing_id"].as_i64().unwrap() > 0);
+    assert!(ordinary[1]["details"]["processing_id"].as_i64().unwrap() > 0);
+    assert_eq!(
+        ordinary[0]["details"]["payload"]["model_output"],
+        "first answer"
+    );
+    assert_eq!(
+        ordinary[1]["details"]["payload"]["model_output"],
+        "second answer"
+    );
+    for value in &values {
+        assert!(
+            value["details"]["payload"]["interpreter_output"].is_null(),
+            "a local new-task route fabricated interpreter output: {value:#?}"
+        );
+        let mut metadata_only = value.clone();
+        metadata_only["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("payload");
+        assert!(!metadata_only.to_string().contains(marker));
+    }
+}
+
+// Break caught: interpreter_output must be the response from this exact model
+// invocation, not the durable normalized intent written later by routing.
+#[tokio::test]
+async fn workflow_payload_logging_captures_matching_interpreter_response() {
+    let server = MockServer::start().await;
+    let raw_interpreter = json!({
+        "confidence": 0.95,
+        "intent": {"type":"continue","instruction":"interpreted follow-up"}
+    })
+    .to_string();
+    mount_sequence(
+        &server,
+        [
+            sse("first answer", 2, 1, 3),
+            sse(&await_check(0), 2, 1, 3),
+            sse(&raw_interpreter, 3, 2, 5),
+            sse("second answer", 2, 1, 3),
+            sse(&await_check(1), 2, 1, 3),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("interpreter-raw.sqlite3");
+    let log_path = directory.path().join("interpreter-raw.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\nmodel='ordinary-model'\n[workflow]\ninterpreter_model='interpreter-model'\nchecker_model='checker-model'\nhandoff_model='handoff-model'\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=true",
+            server.uri(),
+            log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+
+    agent.run_with_prompt("start task").await.unwrap();
+    agent.run_with_prompt("follow up").await.unwrap();
+
+    let values: Vec<Value> = std::fs::read_to_string(log_path)
         .unwrap()
-        .remove("payload");
-    assert!(!metadata_only.to_string().contains(marker));
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| event["event"] == "workflow")
+        .collect();
+    let interpreters: Vec<&Value> = values
+        .iter()
+        .filter(|event| event["details"]["component"] == "human_input_interpreter")
+        .collect();
+    assert_eq!(interpreters.len(), 1, "{values:#?}");
+    assert_eq!(interpreters[0]["details"]["model"], "interpreter-model");
+    assert_eq!(interpreters[0]["details"]["usage"]["total_tokens"], 5);
+    assert_eq!(
+        interpreters[0]["details"]["payload"]["interpreter_output"],
+        raw_interpreter
+    );
 }
 
 // Break caught: restoring an Agent must expose advisory recovery without running the ordinary model.

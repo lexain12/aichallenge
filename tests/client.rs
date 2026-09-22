@@ -185,9 +185,11 @@ async fn bounds_and_redacts_api_error_body() {
     let error = client
         .stream_chat(&request_messages(), |_| Ok(()))
         .await
-        .expect_err("HTTP failure must be returned")
-        .to_string();
+        .expect_err("HTTP failure must be returned");
+    let public = error.to_string();
+    let error = error.raw_diagnostic();
 
+    assert!(!public.contains("invalid key"));
     assert!(error.contains("401"), "unexpected error: {error}");
     assert!(error.contains("[REDACTED]"), "unexpected error: {error}");
     assert!(!error.contains(secret));
@@ -210,9 +212,11 @@ async fn redacts_api_key_that_crosses_error_body_limit() {
     let error = client
         .stream_chat(&request_messages(), |_| Ok(()))
         .await
-        .expect_err("HTTP failure must be returned")
-        .to_string();
+        .expect_err("HTTP failure must be returned");
+    let public = error.to_string();
+    let error = error.raw_diagnostic();
 
+    assert!(!public.contains("secret"));
     assert!(error.contains("[REDACTED]"), "unexpected error: {error}");
     assert!(!error.contains("secret"), "key prefix leaked: {error}");
     assert!(!error.contains("after-key"));

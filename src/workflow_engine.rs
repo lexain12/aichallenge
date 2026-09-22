@@ -11,6 +11,7 @@ use crate::chat::{ChatHistory, Role};
 use crate::client::{ClientError, DeepSeekClient, StreamEvent, TokenUsage};
 use crate::config::{ContextConfig, ContextStrategy, WorkflowConfig};
 use crate::context::{ContextState, ContextSummary, prepare_request};
+use crate::debug_log::{WorkflowDebugEvent, WorkflowDebugMetadata, WorkflowDebugPayload};
 use crate::dialog::{DialogStore, StoreError};
 use crate::facts::{FactsError, parse_facts_json, plan_facts_update};
 use crate::memory::{ContextError, ContextProvider, MemoryRepository, RequestScope};
@@ -26,9 +27,10 @@ use crate::workflow_context::{
     prepare_workflow_request,
 };
 use crate::workflow_model::{
-    CheckContext, CheckerMode, CompletionModel, ContinuationChecker, ControllerDecision,
-    HandoffBuilder, HumanInputInterpreter, HumanInterpretation, ModelPolicyError, ResponseChecker,
-    parse_continuation_check, project_handoff,
+    CheckContext, CheckError, CheckerMode, CompletionModel, ContinuationChecker,
+    ControllerDecision, HandoffBuildResult, HandoffBuilder, HumanInputInterpreter,
+    HumanInterpretation, ModelPolicyError, ResponseChecker, parse_continuation_check,
+    project_handoff,
 };
 use crate::workflow_store::{
     AcceptedInputEffect, AnswerCommit, ControllerInputCommit, DialogWorkflowSnapshot,
@@ -169,6 +171,26 @@ pub enum PipelineOutcome {
     LowConfidence,
 }
 
+#[derive(Debug)]
+pub struct PipelineResult {
+    pub outcome: PipelineOutcome,
+    observations: Vec<CheckerObservation>,
+}
+
+#[derive(Debug)]
+struct CheckerObservation {
+    checker: String,
+    mode: CheckerMode,
+    proposed_event: Option<TransitionEvent>,
+    usage: Option<TokenUsage>,
+    raw_output: Option<String>,
+    provider_error: Option<String>,
+    controller_instruction: Option<String>,
+    error_kind: Option<&'static str>,
+    http_status: Option<u16>,
+    output_chars: usize,
+}
+
 impl ResponsePipeline {
     pub fn new(checkers: Vec<Arc<dyn ResponseChecker>>) -> Result<Self, WorkflowEngineError> {
         if checkers
@@ -187,14 +209,56 @@ impl ResponsePipeline {
         budget: &mut AutonomyBudget,
         min_confidence: f32,
     ) -> PipelineOutcome {
+        self.collect_observed(context, response, budget, min_confidence, false, false)
+            .await
+            .outcome
+    }
+
+    async fn collect_observed(
+        &self,
+        context: &CheckContext,
+        response: &str,
+        budget: &mut AutonomyBudget,
+        min_confidence: f32,
+        observe: bool,
+        capture_payloads: bool,
+    ) -> PipelineResult {
         let mut proposals = Vec::new();
+        let mut observations = Vec::new();
         let mut failed = false;
         let mut low_confidence = false;
         // Collect every checker against this one immutable snapshot before deciding effects.
         for checker in &self.checkers {
-            match checker.check(context, response).await {
+            match checker
+                .check_observed(context, response, capture_payloads)
+                .await
+            {
                 Ok(result) => {
                     budget.record_usage(result.usage);
+                    let proposed_event = match &result.decision {
+                        ControllerDecision::EmitTransition { event, .. } => Some(*event),
+                        _ => None,
+                    };
+                    let controller_instruction = match &result.decision {
+                        ControllerDecision::Continue { instruction, .. } if capture_payloads => {
+                            Some(instruction.clone())
+                        }
+                        _ => None,
+                    };
+                    if observe {
+                        observations.push(CheckerObservation {
+                            checker: checker.name().to_owned(),
+                            mode: checker.mode(),
+                            proposed_event,
+                            usage: result.usage,
+                            raw_output: result.raw_output.clone(),
+                            provider_error: None,
+                            controller_instruction,
+                            error_kind: None,
+                            http_status: None,
+                            output_chars: result.output_chars,
+                        });
+                    }
                     // Pluggable checkers get the same strict policy checks as model-backed ones.
                     let raw =
                         serde_json::json!({"patch": result.patch, "decision": result.decision})
@@ -213,17 +277,39 @@ impl ResponsePipeline {
                 }
                 Err(error) => {
                     budget.record_usage(error.usage());
+                    let (error_kind, http_status) = error.operator_metadata();
+                    if observe {
+                        observations.push(CheckerObservation {
+                            checker: checker.name().to_owned(),
+                            mode: checker.mode(),
+                            proposed_event: error.proposed_event(),
+                            usage: error.usage(),
+                            raw_output: error.raw_output().map(str::to_owned),
+                            provider_error: (capture_payloads && error.raw_output().is_none())
+                                .then(|| error.raw_diagnostic()),
+                            controller_instruction: None,
+                            error_kind: Some(error_kind),
+                            http_status,
+                            output_chars: error.output_chars(),
+                        });
+                    }
                     failed = true;
                 }
             }
         }
         if failed {
-            return PipelineOutcome::FailedOpen {
-                error: "workflow checker failed".into(),
+            return PipelineResult {
+                outcome: PipelineOutcome::FailedOpen {
+                    error: "workflow checker failed".into(),
+                },
+                observations,
             };
         }
         if low_confidence {
-            return PipelineOutcome::LowConfidence;
+            return PipelineResult {
+                outcome: PipelineOutcome::LowConfidence,
+                observations,
+            };
         }
         let mut patch = empty_patch(context.task.version);
         let mut decision = None;
@@ -233,8 +319,11 @@ impl ResponsePipeline {
                     .as_ref()
                     .is_some_and(|prior| prior != &proposal.decision)
             {
-                return PipelineOutcome::Conflict {
-                    checker_names: proposals.iter().map(|(name, _)| name.clone()).collect(),
+                return PipelineResult {
+                    outcome: PipelineOutcome::Conflict {
+                        checker_names: proposals.iter().map(|(name, _)| name.clone()).collect(),
+                    },
+                    observations,
                 };
             }
             if !proposal.patch.is_empty() {
@@ -242,7 +331,7 @@ impl ResponsePipeline {
             }
             decision = Some(proposal.decision.clone());
         }
-        match decision.unwrap_or(ControllerDecision::AwaitUser) {
+        let outcome = match decision.unwrap_or(ControllerDecision::AwaitUser) {
             ControllerDecision::AwaitUser => PipelineOutcome::AwaitUser { patch },
             ControllerDecision::Continue {
                 instruction,
@@ -262,6 +351,10 @@ impl ResponsePipeline {
                 evidence,
                 confidence,
             },
+        };
+        PipelineResult {
+            outcome,
+            observations,
         }
     }
 }
@@ -329,6 +422,7 @@ impl WorkflowInputHandler<'_> {
             confidence,
             context,
             None,
+            None,
         )
         .await
     }
@@ -344,6 +438,7 @@ impl WorkflowInputHandler<'_> {
         confidence: Option<f32>,
         context: InputHandlingContext<'_>,
         mut budget: Option<&mut AutonomyBudget>,
+        mut diagnostics: Option<&mut WorkflowDiagnostics<'_>>,
     ) -> Result<RoutingOutcome, WorkflowEngineError> {
         // Forbidden controller intents never reach a repository or a service call.
         if let Err(error) = StateMachine::validate_source(&input.source, &input.intent) {
@@ -581,9 +676,12 @@ impl WorkflowInputHandler<'_> {
                     .into_iter()
                     .map(|row| row.message)
                     .collect::<Vec<_>>();
+                let capture_payloads = diagnostics
+                    .as_deref()
+                    .is_some_and(|diagnostics| diagnostics.capture_payloads);
                 let handoff = match self
                     .handoff_builder
-                    .build(&authorization, preview, &messages, &input)
+                    .build_observed(&authorization, preview, &messages, &input, capture_payloads)
                     .await
                 {
                     Ok(handoff) => handoff,
@@ -591,10 +689,30 @@ impl WorkflowInputHandler<'_> {
                         if let Some(budget) = budget.as_deref_mut() {
                             budget.record_usage(error.usage());
                         }
+                        if let (Some(diagnostics), Some(budget)) =
+                            (diagnostics.as_deref_mut(), budget.as_deref())
+                        {
+                            record_handoff_diagnostic(
+                                diagnostics,
+                                self.handoff_builder.model_name(),
+                                &input,
+                                task,
+                                None,
+                                &authorization,
+                                context.processing_id,
+                                "failed",
+                                false,
+                                "failed",
+                                None,
+                                Some(&error),
+                                budget,
+                                messages.len(),
+                            );
+                        }
                         return self.reject(command, source, context, "workflow handoff failed");
                     }
                 };
-                if let Some(budget) = budget {
+                if let Some(budget) = budget.as_deref_mut() {
                     budget.record_usage(handoff.usage);
                     if !human {
                         let mut next = project_handoff(preview, &authorization, &handoff.payload)?;
@@ -616,6 +734,24 @@ impl WorkflowInputHandler<'_> {
                     processing_id: context.processing_id,
                     processing_attempt: context.processing_attempt,
                 })?;
+                if let (Some(diagnostics), Some(budget)) = (diagnostics, budget.as_deref()) {
+                    record_handoff_diagnostic(
+                        diagnostics,
+                        self.handoff_builder.model_name(),
+                        &input,
+                        task,
+                        Some(&saved.target_state),
+                        &authorization,
+                        context.processing_id,
+                        if human { "none" } else { "completed" },
+                        true,
+                        "accepted",
+                        Some(&handoff),
+                        None,
+                        budget,
+                        messages.len(),
+                    );
+                }
                 Ok(RoutingOutcome::Managed {
                     input_message_id: saved.input_message_id,
                     state: saved.target_state,
@@ -693,8 +829,15 @@ pub struct WorkflowEngine<'a> {
     handoff_builder: HandoffBuilder,
     pipeline: ResponsePipeline,
     workflow_config: WorkflowConfig,
+    interpreter_model: String,
     checker_model: String,
+    diagnostics: Option<WorkflowDiagnostics<'a>>,
     session: WorkflowSession<'a>,
+}
+
+struct WorkflowDiagnostics<'a> {
+    events: &'a mut Vec<WorkflowDebugEvent>,
+    capture_payloads: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -749,6 +892,23 @@ struct OrdinaryTurn {
     persisted_answer: Option<PersistedAnswer>,
 }
 
+#[derive(Clone)]
+struct InputObservation {
+    component: &'static str,
+    model: String,
+    mode: &'static str,
+    input_state: Option<WorkflowTaskState>,
+    proposed_event: Option<String>,
+    usage: Option<TokenUsage>,
+    raw_output: Option<String>,
+    provider_error: Option<String>,
+    error_kind: Option<&'static str>,
+    http_status: Option<u16>,
+    output_chars: usize,
+    stage_message_count: usize,
+    model_output_accepted: bool,
+}
+
 impl<'a> WorkflowEngine<'a> {
     pub fn new(
         client: &'a DeepSeekClient,
@@ -768,14 +928,248 @@ impl<'a> WorkflowEngine<'a> {
             ))])
             .expect("continuation checker is advisory"),
             workflow_config: workflow_config.clone(),
+            interpreter_model: models.interpreter.name().to_owned(),
             checker_model: models.checker.name().to_owned(),
+            diagnostics: None,
             session,
         }
+    }
+
+    pub fn with_diagnostics(
+        mut self,
+        events: &'a mut Vec<WorkflowDebugEvent>,
+        capture_payloads: bool,
+    ) -> Self {
+        self.diagnostics = Some(WorkflowDiagnostics {
+            events,
+            capture_payloads,
+        });
+        self
     }
 
     pub fn with_pipeline(mut self, pipeline: ResponsePipeline) -> Self {
         self.pipeline = pipeline;
         self
+    }
+
+    fn diagnostics_enabled(&self) -> bool {
+        self.diagnostics.is_some()
+    }
+
+    fn capture_payloads(&self) -> bool {
+        self.diagnostics
+            .as_ref()
+            .is_some_and(|diagnostics| diagnostics.capture_payloads)
+    }
+
+    fn payload_for_task(&self, task: Option<&WorkflowTaskState>) -> Option<WorkflowDebugPayload> {
+        if !self.capture_payloads() {
+            return None;
+        }
+        Some(WorkflowDebugPayload {
+            plan: task.and_then(|task| serde_json::to_string(&task.plan).ok()),
+            checkpoint: task.and_then(|task| serde_json::to_string(&task.checkpoint).ok()),
+            ..WorkflowDebugPayload::default()
+        })
+    }
+
+    fn record_diagnostic(
+        &mut self,
+        metadata: WorkflowDebugMetadata,
+        payload: Option<WorkflowDebugPayload>,
+    ) {
+        if let Some(diagnostics) = self.diagnostics.as_mut() {
+            diagnostics
+                .events
+                .push(WorkflowDebugEvent { metadata, payload });
+        }
+    }
+
+    fn record_input_observation(
+        &mut self,
+        observation: InputObservation,
+        routing: &RoutingOutcome,
+        prompt: &str,
+        budget: &AutonomyBudget,
+        accepted_override: Option<bool>,
+    ) {
+        if !self.diagnostics_enabled() {
+            return;
+        }
+        let routed_output_state = match routing {
+            RoutingOutcome::Managed { state, .. } => Some(state),
+            RoutingOutcome::Rejected { state, .. } => state.as_ref(),
+            RoutingOutcome::Unmanaged { .. } => observation.input_state.as_ref(),
+        };
+        let accepted =
+            accepted_override.unwrap_or(!matches!(routing, RoutingOutcome::Rejected { .. }));
+        let output_state = if accepted_override == Some(false) {
+            observation.input_state.as_ref()
+        } else {
+            routed_output_state
+        };
+        let outcome = if !accepted {
+            if observation.error_kind == Some("low_confidence") {
+                "rejected"
+            } else if observation.error_kind.is_some() {
+                "failed"
+            } else {
+                "rejected"
+            }
+        } else if observation.error_kind.is_some() {
+            "fallback"
+        } else {
+            "accepted"
+        };
+        let transition_id = if accepted && observation.proposed_event.is_some() {
+            output_state.and_then(|task| task.incoming_handoff_id)
+        } else {
+            None
+        };
+        let mut payload = self.payload_for_task(observation.input_state.as_ref());
+        if let Some(payload) = payload.as_mut() {
+            payload.interpreter_output = observation.raw_output;
+            payload.provider_error = observation.provider_error;
+            payload.model_prompt = Some(prompt.to_owned());
+        }
+        let metadata = workflow_debug_metadata(
+            "human",
+            observation.component,
+            &observation.model,
+            observation.mode,
+            observation.input_state.as_ref(),
+            output_state,
+            observation.proposed_event,
+            accepted,
+            outcome,
+            budget,
+            observation.input_state.as_ref().or(output_state),
+            transition_id,
+            None,
+            "none",
+            observation.error_kind,
+            observation.http_status,
+            observation.usage,
+            prompt.chars().count(),
+            observation.output_chars,
+            observation.stage_message_count,
+        );
+        self.record_diagnostic(metadata, payload);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_checker_observations(
+        &mut self,
+        observations: Vec<CheckerObservation>,
+        task: &WorkflowTaskState,
+        output_state: Option<&WorkflowTaskState>,
+        processing_id: i64,
+        processing_status: &str,
+        accepted: bool,
+        outcome: &str,
+        response_chars: usize,
+        stage_message_count: usize,
+        budget: &AutonomyBudget,
+    ) {
+        if !self.diagnostics_enabled() {
+            return;
+        }
+        for observation in observations {
+            let transition_id = if accepted && observation.proposed_event.is_some() {
+                output_state.and_then(|state| state.incoming_handoff_id)
+            } else {
+                None
+            };
+            let mut payload = self.payload_for_task(Some(task));
+            if let Some(payload) = payload.as_mut() {
+                payload.checker_output = observation.raw_output;
+                payload.provider_error = observation.provider_error;
+                payload.controller_instruction = observation.controller_instruction;
+            }
+            let metadata = workflow_debug_metadata(
+                "controller",
+                &observation.checker,
+                &self.checker_model,
+                checker_mode_name(observation.mode),
+                Some(task),
+                output_state.or(Some(task)),
+                observation
+                    .proposed_event
+                    .map(|event| transition_event_name(event).to_owned()),
+                accepted,
+                outcome,
+                budget,
+                Some(task),
+                transition_id,
+                Some(processing_id),
+                processing_status,
+                observation.error_kind,
+                observation.http_status,
+                observation.usage,
+                response_chars,
+                observation.output_chars,
+                stage_message_count,
+            );
+            self.record_diagnostic(metadata, payload);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_service_diagnostic(
+        &mut self,
+        component: &'static str,
+        mode: &'static str,
+        task: Option<&WorkflowTaskState>,
+        budget: &AutonomyBudget,
+        accepted: bool,
+        outcome: &'static str,
+        error: Option<&ClientError>,
+        usage: Option<TokenUsage>,
+        input_chars: usize,
+        output_chars: usize,
+        stage_message_count: usize,
+        processing_id: Option<i64>,
+        processing_status: &'static str,
+        model_prompt: Option<String>,
+        model_output: Option<String>,
+    ) {
+        if !self.diagnostics_enabled() {
+            return;
+        }
+        let error_metadata = error.map(ClientError::operator_metadata);
+        let mut payload = self.payload_for_task(task);
+        if let Some(payload) = payload.as_mut() {
+            payload.model_prompt = model_prompt;
+            payload.model_output = model_output;
+            payload.provider_error = error.map(ClientError::raw_diagnostic);
+        }
+        let metadata = workflow_debug_metadata(
+            if budget.turns == 0 {
+                "human"
+            } else {
+                "controller"
+            },
+            component,
+            self.client.model_name(),
+            mode,
+            task,
+            task,
+            None,
+            accepted,
+            outcome,
+            budget,
+            task,
+            None,
+            processing_id,
+            processing_status,
+            error_metadata.map(|metadata| metadata.kind),
+            error_metadata.and_then(|metadata| metadata.status),
+            usage,
+            input_chars,
+            output_chars,
+            stage_message_count,
+        );
+        self.record_diagnostic(metadata, payload);
     }
 
     pub async fn run_human_input<F>(
@@ -789,10 +1183,33 @@ impl<'a> WorkflowEngine<'a> {
         *self.session.last_usage = None;
         let mut budget = AutonomyBudget::new(&self.workflow_config);
         WorkflowIntent::human_continue(prompt)?;
-        let mut routing = if let Some(dialog_id) = *self.session.dialog_id {
+        let (mut routing, input_observation) = if let Some(dialog_id) = *self.session.dialog_id {
             let snapshot = self.session.store.load_workflow(dialog_id)?;
-            let (intent, confidence) = if let Some(task) = snapshot.current_task.as_ref() {
-                match self.interpreter.interpret(prompt, Some(task)).await? {
+            let input_state = snapshot.current_task.clone();
+            let stage_message_count = if self.diagnostics_enabled() {
+                input_state
+                    .as_ref()
+                    .map(|task| {
+                        self.session
+                            .store
+                            .count_stage_messages(task.current_stage_run_id)
+                    })
+                    .transpose()?
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let capture_payloads = self.capture_payloads();
+            let (intent, confidence, observation) = if let Some(task) = input_state.as_ref() {
+                let observed = self
+                    .interpreter
+                    .interpret_observed(prompt, Some(task), capture_payloads)
+                    .await?;
+                let usage = match &observed.interpretation {
+                    HumanInterpretation::Managed { usage, .. }
+                    | HumanInterpretation::Unmanaged { usage } => *usage,
+                };
+                let (intent, confidence) = match observed.interpretation {
                     HumanInterpretation::Managed {
                         intent,
                         confidence,
@@ -805,16 +1222,45 @@ impl<'a> WorkflowEngine<'a> {
                         budget.record_usage(usage);
                         (WorkflowIntent::human_continue(prompt)?, None)
                     }
-                }
+                };
+                let observation = InputObservation {
+                    component: "human_input_interpreter",
+                    model: self.interpreter_model.clone(),
+                    mode: "advisory",
+                    input_state: input_state.clone(),
+                    proposed_event: observed.proposed_event,
+                    usage,
+                    raw_output: observed.raw_output,
+                    provider_error: observed.provider_error,
+                    error_kind: observed.failure_kind,
+                    http_status: observed.http_status,
+                    output_chars: observed.output_chars,
+                    stage_message_count,
+                    model_output_accepted: observed.model_output_accepted,
+                };
+                (intent, confidence, observation)
             } else {
-                (
-                    WorkflowIntent::StartNewTask {
-                        goal: prompt.trim().to_owned(),
-                    },
-                    None,
-                )
+                let intent = WorkflowIntent::StartNewTask {
+                    goal: prompt.trim().to_owned(),
+                };
+                let observation = InputObservation {
+                    component: "input_router",
+                    model: "local".into(),
+                    mode: "deterministic",
+                    input_state: None,
+                    proposed_event: None,
+                    usage: None,
+                    raw_output: None,
+                    provider_error: None,
+                    error_kind: None,
+                    http_status: None,
+                    output_chars: 0,
+                    stage_message_count: 0,
+                    model_output_accepted: true,
+                };
+                (intent, None, observation)
             };
-            WorkflowInputHandler {
+            let routing = WorkflowInputHandler {
                 store: self.session.store,
                 handoff_builder: &self.handoff_builder,
             }
@@ -829,8 +1275,10 @@ impl<'a> WorkflowEngine<'a> {
                 confidence,
                 InputHandlingContext::default(),
                 Some(&mut budget),
+                self.diagnostics.as_mut(),
             )
-            .await?
+            .await?;
+            (routing, observation)
         } else {
             let started = self.session.store.start_dialog_with_workflow_task(
                 self.session.scope,
@@ -839,11 +1287,56 @@ impl<'a> WorkflowEngine<'a> {
             )?;
             *self.session.dialog_id = Some(started.dialog_id);
             *self.session.scope = self.session.scope.with_dialog_id(Some(started.dialog_id));
-            RoutingOutcome::Managed {
+            let routing = RoutingOutcome::Managed {
                 input_message_id: started.message_id,
                 state: started.task,
-            }
+            };
+            let observation = InputObservation {
+                component: "input_router",
+                model: "local".into(),
+                mode: "deterministic",
+                input_state: None,
+                proposed_event: None,
+                usage: None,
+                raw_output: None,
+                provider_error: None,
+                error_kind: None,
+                http_status: None,
+                output_chars: 0,
+                stage_message_count: 0,
+                model_output_accepted: true,
+            };
+            (routing, observation)
         };
+        if input_observation.component == "human_input_interpreter"
+            && !input_observation.model_output_accepted
+        {
+            let local_observation = InputObservation {
+                component: "input_router",
+                model: "local".into(),
+                mode: "deterministic",
+                input_state: input_observation.input_state.clone(),
+                proposed_event: None,
+                usage: None,
+                raw_output: None,
+                provider_error: None,
+                error_kind: None,
+                http_status: None,
+                output_chars: 0,
+                stage_message_count: input_observation.stage_message_count,
+                model_output_accepted: true,
+            };
+            self.record_input_observation(
+                input_observation,
+                &routing,
+                prompt,
+                &budget,
+                Some(false),
+            );
+            self.record_input_observation(local_observation, &routing, prompt, &budget, None);
+        } else {
+            self.record_input_observation(input_observation, &routing, prompt, &budget, None);
+        }
         self.session.history.push(Role::User, prompt.to_owned());
         match &routing {
             RoutingOutcome::Rejected { reason, .. } => {
@@ -1041,7 +1534,7 @@ impl<'a> WorkflowEngine<'a> {
             .session
             .store
             .load_processing_context(dialog_id, processing_id)?;
-        let task = &work.context.task;
+        let task = work.context.task.clone();
         let Some(lease) = self
             .session
             .store
@@ -1049,39 +1542,67 @@ impl<'a> WorkflowEngine<'a> {
         else {
             return Ok(ProcessingOutcome::Stop(AutonomyStopReason::CheckerFailed));
         };
-        let outcome = self
+        let stage_message_count = work.context.stage_messages.len();
+        let pipeline = self
             .pipeline
-            .collect(
+            .collect_observed(
                 &work.context,
                 &work.response,
                 budget,
                 self.workflow_config.min_confidence(),
+                self.diagnostics_enabled(),
+                self.capture_payloads(),
             )
             .await;
-        let (patch, intent, protocol, confidence) = match outcome {
+        let observations = pipeline.observations;
+        let (patch, intent, protocol, confidence) = match pipeline.outcome {
             PipelineOutcome::FailedOpen { .. } | PipelineOutcome::Conflict { .. } => {
                 self.fail_advisory(
-                    task,
+                    &task,
                     &lease,
                     &work.checker_name,
                     mode,
                     "workflow checker failed",
                 )?;
+                self.record_checker_observations(
+                    observations,
+                    &task,
+                    Some(&task),
+                    processing_id,
+                    "failed",
+                    false,
+                    "failed",
+                    work.response.chars().count(),
+                    stage_message_count,
+                    budget,
+                );
                 return Ok(ProcessingOutcome::Stop(AutonomyStopReason::CheckerFailed));
             }
             PipelineOutcome::LowConfidence => {
                 self.fail_advisory(
-                    task,
+                    &task,
                     &lease,
                     &work.checker_name,
                     mode,
                     "workflow checker confidence too low",
                 )?;
+                self.record_checker_observations(
+                    observations,
+                    &task,
+                    Some(&task),
+                    processing_id,
+                    "failed",
+                    false,
+                    "rejected",
+                    work.response.chars().count(),
+                    stage_message_count,
+                    budget,
+                );
                 return Ok(ProcessingOutcome::Stop(AutonomyStopReason::LowConfidence));
             }
             PipelineOutcome::AwaitUser { patch } => {
-                return self.complete_as_await(
-                    task,
+                let result = self.complete_as_await(
+                    &task,
                     &lease,
                     &patch,
                     mode,
@@ -1090,7 +1611,25 @@ impl<'a> WorkflowEngine<'a> {
                     } else {
                         AutonomyStopReason::AwaitUser
                     },
+                )?;
+                let output_state = if self.diagnostics_enabled() {
+                    self.session.store.load_workflow(dialog_id)?.current_task
+                } else {
+                    None
+                };
+                self.record_checker_observations(
+                    observations,
+                    &task,
+                    output_state.as_ref(),
+                    processing_id,
+                    "completed",
+                    true,
+                    "accepted",
+                    work.response.chars().count(),
+                    stage_message_count,
+                    budget,
                 );
+                return Ok(result);
             }
             PipelineOutcome::Continue {
                 patch,
@@ -1117,13 +1656,31 @@ impl<'a> WorkflowEngine<'a> {
             ),
         };
         if mode == ProcessingLeaseMode::Recovery {
-            return self.complete_as_await(
-                task,
+            let result = self.complete_as_await(
+                &task,
                 &lease,
                 &patch,
                 mode,
                 AutonomyStopReason::AwaitUserAfterRestart,
+            )?;
+            let output_state = if self.diagnostics_enabled() {
+                self.session.store.load_workflow(dialog_id)?.current_task
+            } else {
+                None
+            };
+            self.record_checker_observations(
+                observations,
+                &task,
+                output_state.as_ref(),
+                processing_id,
+                "completed",
+                false,
+                "rejected",
+                work.response.chars().count(),
+                stage_message_count,
+                budget,
             );
+            return Ok(result);
         }
         let patch_context = if matches!(
             intent,
@@ -1139,7 +1696,25 @@ impl<'a> WorkflowEngine<'a> {
         let mut prospective = task.preview_patch(&patch, patch_context)?;
         prospective.version = task.version.saturating_add(1);
         if let Err(reason) = budget.check_turn(&StateFingerprint::from(&prospective)) {
-            return self.complete_as_await(task, &lease, &patch, mode, reason);
+            let result = self.complete_as_await(&task, &lease, &patch, mode, reason)?;
+            let output_state = if self.diagnostics_enabled() {
+                self.session.store.load_workflow(dialog_id)?.current_task
+            } else {
+                None
+            };
+            self.record_checker_observations(
+                observations,
+                &task,
+                output_state.as_ref(),
+                processing_id,
+                "completed",
+                false,
+                "rejected",
+                work.response.chars().count(),
+                stage_message_count,
+                budget,
+            );
+            return Ok(result);
         }
         let route = WorkflowInputHandler {
             store: self.session.store,
@@ -1165,18 +1740,88 @@ impl<'a> WorkflowEngine<'a> {
                 processing_attempt: Some(lease.attempts),
                 accepted_patch: Some(&patch),
             },
-            Some(budget),
+            Some(&mut *budget),
+            self.diagnostics.as_mut(),
         )
         .await;
         match route {
-            Ok(RoutingOutcome::Rejected { .. }) => Ok(ProcessingOutcome::Stop(
-                AutonomyStopReason::TransitionFailed,
-            )),
-            Ok(route) => Ok(ProcessingOutcome::Controller(route)),
-            Err(WorkflowEngineError::AutonomyStopped(reason)) => {
-                self.complete_as_await(task, &lease, &patch, mode, reason)
+            Ok(route @ RoutingOutcome::Rejected { .. }) => {
+                let output_state = match &route {
+                    RoutingOutcome::Rejected { state, .. } => state.as_ref(),
+                    _ => unreachable!(),
+                };
+                self.record_checker_observations(
+                    observations,
+                    &task,
+                    output_state,
+                    processing_id,
+                    "failed",
+                    false,
+                    "rejected",
+                    work.response.chars().count(),
+                    stage_message_count,
+                    budget,
+                );
+                Ok(ProcessingOutcome::Stop(
+                    AutonomyStopReason::TransitionFailed,
+                ))
             }
-            Err(error) => Err(error),
+            Ok(route) => {
+                let output_state = match &route {
+                    RoutingOutcome::Managed { state, .. } => Some(state),
+                    RoutingOutcome::Unmanaged { .. } => Some(&task),
+                    RoutingOutcome::Rejected { .. } => unreachable!(),
+                };
+                self.record_checker_observations(
+                    observations,
+                    &task,
+                    output_state,
+                    processing_id,
+                    "completed",
+                    true,
+                    "accepted",
+                    work.response.chars().count(),
+                    stage_message_count,
+                    budget,
+                );
+                Ok(ProcessingOutcome::Controller(route))
+            }
+            Err(WorkflowEngineError::AutonomyStopped(reason)) => {
+                let result = self.complete_as_await(&task, &lease, &patch, mode, reason)?;
+                let output_state = if self.diagnostics_enabled() {
+                    self.session.store.load_workflow(dialog_id)?.current_task
+                } else {
+                    None
+                };
+                self.record_checker_observations(
+                    observations,
+                    &task,
+                    output_state.as_ref(),
+                    processing_id,
+                    "completed",
+                    false,
+                    "rejected",
+                    work.response.chars().count(),
+                    stage_message_count,
+                    budget,
+                );
+                Ok(result)
+            }
+            Err(error) => {
+                self.record_checker_observations(
+                    observations,
+                    &task,
+                    Some(&task),
+                    processing_id,
+                    "failed",
+                    false,
+                    "failed",
+                    work.response.chars().count(),
+                    stage_message_count,
+                    budget,
+                );
+                Err(error)
+            }
         }
     }
 
@@ -1295,7 +1940,7 @@ impl<'a> WorkflowEngine<'a> {
             .expect("persisted input has a dialog");
         let inherited = self.inherited_blocks()?;
         let selected = self.session.store.load_workflow(dialog_id)?.current_task;
-        let prepared = match &routing {
+        let (prepared, diagnostic_state, stage_message_count) = match &routing {
             RoutingOutcome::Managed { state, .. } => {
                 let messages = self
                     .session
@@ -1324,17 +1969,30 @@ impl<'a> WorkflowEngine<'a> {
                         phase: state.phase,
                     }),
                 )?;
-                stage.prepared
+                (stage.prepared, Some(state.clone()), messages.len())
             }
-            RoutingOutcome::Unmanaged { .. } => prepare_request(
-                &ChatHistory::new(self.session.history.system_prompt().to_owned()),
-                &ContextState::default(),
-                &ContextConfig::full_history(),
-                prompt,
-                &inherited,
+            RoutingOutcome::Unmanaged { .. } => (
+                prepare_request(
+                    &ChatHistory::new(self.session.history.system_prompt().to_owned()),
+                    &ContextState::default(),
+                    &ContextConfig::full_history(),
+                    prompt,
+                    &inherited,
+                ),
+                selected.clone(),
+                0,
             ),
             RoutingOutcome::Rejected { .. } => unreachable!("rejected input has no ordinary turn"),
         };
+        let model_prompt = self
+            .capture_payloads()
+            .then(|| serde_json::to_string(prepared.messages()).ok())
+            .flatten();
+        let input_chars = prepared
+            .messages()
+            .iter()
+            .map(|message| message.content().chars().count())
+            .sum();
         let mut usage = None;
         let result = self
             .client
@@ -1348,9 +2006,49 @@ impl<'a> WorkflowEngine<'a> {
             .await;
         *self.session.last_usage = usage;
         budget.record_usage(usage);
-        let answer = result?;
+        let answer = match result {
+            Ok(answer) => answer,
+            Err(error) => {
+                self.record_service_diagnostic(
+                    "ordinary",
+                    "generation",
+                    diagnostic_state.as_ref(),
+                    budget,
+                    false,
+                    "failed",
+                    Some(&error),
+                    usage.or(error.usage()),
+                    input_chars,
+                    0,
+                    stage_message_count,
+                    None,
+                    "none",
+                    model_prompt,
+                    None,
+                );
+                return Err(WorkflowEngineError::provider("ordinary", error));
+            }
+        };
         if answer.trim().is_empty() {
-            return Err(ClientError::EmptyAnswer.into());
+            let error = ClientError::EmptyAnswer;
+            self.record_service_diagnostic(
+                "ordinary",
+                "generation",
+                diagnostic_state.as_ref(),
+                budget,
+                false,
+                "failed",
+                Some(&error),
+                usage,
+                input_chars,
+                0,
+                stage_message_count,
+                None,
+                "none",
+                model_prompt,
+                None,
+            );
+            return Err(WorkflowEngineError::provider("ordinary", error));
         }
         let persisted_answer = match &routing {
             RoutingOutcome::Managed { state, .. } => Some(
@@ -1380,16 +2078,44 @@ impl<'a> WorkflowEngine<'a> {
             RoutingOutcome::Rejected { .. } => unreachable!(),
         };
         self.session.history.push_answer(answer.clone(), usage);
+        self.record_service_diagnostic(
+            "ordinary",
+            "generation",
+            diagnostic_state.as_ref(),
+            budget,
+            true,
+            "accepted",
+            None,
+            usage,
+            input_chars,
+            answer.chars().count(),
+            stage_message_count,
+            persisted_answer.as_ref().map(|answer| answer.processing_id),
+            if persisted_answer.is_some() {
+                "pending"
+            } else {
+                "none"
+            },
+            model_prompt,
+            self.capture_payloads().then(|| answer.clone()),
+        );
         if let RoutingOutcome::Managed { state, .. } = &routing
             && let Err(error) = self
-                .compact_stage(state, usage, &inherited, budget, on_event)
+                .compact_stage(
+                    state,
+                    persisted_answer.as_ref().map(|answer| answer.processing_id),
+                    usage,
+                    &inherited,
+                    budget,
+                    on_event,
+                )
                 .await
         {
             // The answer and its processing job are already durable. Compaction is advisory.
             let _ = emit(
                 on_event,
                 AgentEvent::CompactionFailed {
-                    error: error.to_string(),
+                    error: error.operator_message(),
                 },
             );
         }
@@ -1424,37 +2150,94 @@ impl<'a> WorkflowEngine<'a> {
                 target_boundary: plan.covered_message_count(),
             },
         )?;
-        let updated = async {
-            let result = self
-                .client
-                .update_facts(
-                    plan.request_messages(),
-                    self.context_config.facts_max_tokens(),
-                )
-                .await
-                .inspect_err(|error| {
-                    budget.record_usage(error.usage());
-                })?;
-            budget.record_usage(result.usage());
-            let facts = parse_facts_json(result.answer())?;
-            let state = self.session.store.replace_stage_facts(
-                task.current_stage_run_id,
-                task.version,
-                messages.len(),
-                facts,
-                result.usage(),
-            )?;
-            Ok::<_, WorkflowEngineError>((state, result.usage()))
-        }
-        .await;
+        let model_prompt = self
+            .capture_payloads()
+            .then(|| serde_json::to_string(plan.request_messages()).ok())
+            .flatten();
+        let input_chars = plan
+            .request_messages()
+            .iter()
+            .map(|message| message.content().chars().count())
+            .sum();
+        let result = match self
+            .client
+            .update_facts(
+                plan.request_messages(),
+                self.context_config.facts_max_tokens(),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                budget.record_usage(error.usage());
+                self.record_service_diagnostic(
+                    "facts",
+                    "advisory",
+                    Some(task),
+                    budget,
+                    false,
+                    "failed",
+                    Some(&error),
+                    error.usage(),
+                    input_chars,
+                    0,
+                    messages.len(),
+                    None,
+                    "none",
+                    model_prompt,
+                    None,
+                );
+                let error = WorkflowEngineError::provider("facts", error);
+                emit(
+                    on_event,
+                    AgentEvent::FactsUpdateFailed {
+                        error: error.operator_message(),
+                    },
+                )?;
+                return Err(error);
+            }
+        };
+        budget.record_usage(result.usage());
+        let updated = parse_facts_json(result.answer())
+            .map_err(WorkflowEngineError::from)
+            .and_then(|facts| {
+                self.session
+                    .store
+                    .replace_stage_facts(
+                        task.current_stage_run_id,
+                        task.version,
+                        messages.len(),
+                        facts,
+                        result.usage(),
+                    )
+                    .map_err(WorkflowEngineError::from)
+            });
         match updated {
-            Ok((facts, usage)) => {
+            Ok(facts) => {
                 reductions.facts = facts;
+                let model_output = self.capture_payloads().then(|| result.answer().to_owned());
+                self.record_service_diagnostic(
+                    "facts",
+                    "advisory",
+                    Some(task),
+                    budget,
+                    true,
+                    "accepted",
+                    None,
+                    result.usage(),
+                    input_chars,
+                    result.answer().chars().count(),
+                    messages.len(),
+                    None,
+                    "none",
+                    model_prompt,
+                    model_output,
+                );
                 emit(
                     on_event,
                     AgentEvent::FactsUpdateCompleted {
                         covered_message_count: reductions.facts.covered_message_count(),
-                        usage,
+                        usage: result.usage(),
                     },
                 )?;
                 Ok(())
@@ -1463,7 +2246,7 @@ impl<'a> WorkflowEngine<'a> {
                 emit(
                     on_event,
                     AgentEvent::FactsUpdateFailed {
-                        error: error.to_string(),
+                        error: error.operator_message(),
                     },
                 )?;
                 Err(error)
@@ -1474,6 +2257,7 @@ impl<'a> WorkflowEngine<'a> {
     async fn compact_stage<F>(
         &mut self,
         task: &WorkflowTaskState,
+        processing_id: Option<i64>,
         usage: Option<TokenUsage>,
         inherited: &[SystemBlock],
         budget: &mut AutonomyBudget,
@@ -1514,16 +2298,50 @@ impl<'a> WorkflowEngine<'a> {
                 kept_message_count: messages.len() - plan.covered_message_count(),
             },
         )?;
-        let result = self
+        let model_prompt = self
+            .capture_payloads()
+            .then(|| serde_json::to_string(plan.request_messages()).ok())
+            .flatten();
+        let input_chars = plan
+            .request_messages()
+            .iter()
+            .map(|message| message.content().chars().count())
+            .sum();
+        let result = match self
             .client
             .summarize(
                 plan.request_messages(),
                 self.context_config.summary_max_tokens(),
             )
             .await
-            .inspect_err(|error| {
+        {
+            Ok(result) => result,
+            Err(error) => {
                 budget.record_usage(error.usage());
-            })?;
+                self.record_service_diagnostic(
+                    "compaction",
+                    "advisory",
+                    Some(task),
+                    budget,
+                    false,
+                    "failed",
+                    Some(&error),
+                    error.usage(),
+                    input_chars,
+                    0,
+                    messages.len(),
+                    processing_id,
+                    if processing_id.is_some() {
+                        "pending"
+                    } else {
+                        "none"
+                    },
+                    model_prompt,
+                    None,
+                );
+                return Err(WorkflowEngineError::provider("compaction", error));
+            }
+        };
         budget.record_usage(result.usage());
         self.session.store.replace_stage_context(
             task.current_stage_run_id,
@@ -1532,6 +2350,28 @@ impl<'a> WorkflowEngine<'a> {
             ContextSummary::new(result.answer(), plan.covered_message_count()),
             result.usage(),
         )?;
+        let model_output = self.capture_payloads().then(|| result.answer().to_owned());
+        self.record_service_diagnostic(
+            "compaction",
+            "advisory",
+            Some(task),
+            budget,
+            true,
+            "accepted",
+            None,
+            result.usage(),
+            input_chars,
+            result.answer().chars().count(),
+            messages.len(),
+            processing_id,
+            if processing_id.is_some() {
+                "pending"
+            } else {
+                "none"
+            },
+            model_prompt,
+            model_output,
+        );
         emit(
             on_event,
             AgentEvent::CompactionCompleted {
@@ -1570,6 +2410,152 @@ fn processing_failure_message(reason: &AutonomyStopReason) -> Option<&'static st
     }
 }
 
+fn transition_event_name(event: TransitionEvent) -> &'static str {
+    match event {
+        TransitionEvent::PlanningCompleted => "planning_completed",
+        TransitionEvent::ExecutionCompleted => "execution_completed",
+        TransitionEvent::ValidationPassed => "validation_passed",
+        TransitionEvent::ValidationFailed => "validation_failed",
+    }
+}
+
+fn checker_mode_name(mode: CheckerMode) -> &'static str {
+    match mode {
+        CheckerMode::Advisory => "advisory",
+        CheckerMode::Blocking => "blocking",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_handoff_diagnostic(
+    diagnostics: &mut WorkflowDiagnostics<'_>,
+    model: &str,
+    input: &WorkflowInput,
+    input_state: &WorkflowTaskState,
+    output_state: Option<&WorkflowTaskState>,
+    authorization: &StageChangeAuthorization,
+    processing_id: Option<i64>,
+    processing_status: &str,
+    accepted: bool,
+    outcome: &str,
+    handoff: Option<&HandoffBuildResult>,
+    error: Option<&CheckError>,
+    budget: &AutonomyBudget,
+    stage_message_count: usize,
+) {
+    let proposed_event = match authorization {
+        StageChangeAuthorization::Transition(authorization) => {
+            Some(transition_event_name(authorization.event).to_owned())
+        }
+        StageChangeAuthorization::Replan(_) => Some("replan_requested".into()),
+    };
+    let error_metadata = error.map(CheckError::operator_metadata);
+    let mut payload = diagnostics.capture_payloads.then(|| WorkflowDebugPayload {
+        plan: serde_json::to_string(&input_state.plan).ok(),
+        checkpoint: serde_json::to_string(&input_state.checkpoint).ok(),
+        ..WorkflowDebugPayload::default()
+    });
+    if let Some(payload) = payload.as_mut() {
+        payload.handoff = handoff
+            .and_then(|handoff| handoff.raw_output.clone())
+            .or_else(|| error.and_then(CheckError::raw_output).map(str::to_owned));
+        payload.provider_error = error
+            .filter(|error| error.raw_output().is_none())
+            .map(CheckError::raw_diagnostic);
+    }
+    let source = match &input.source {
+        WorkflowInputSource::Human => "human",
+        WorkflowInputSource::Controller { .. } => "controller",
+    };
+    let metadata = workflow_debug_metadata(
+        source,
+        "handoff_builder",
+        model,
+        "blocking",
+        Some(input_state),
+        output_state.or(Some(input_state)),
+        proposed_event,
+        accepted,
+        outcome,
+        budget,
+        Some(input_state),
+        accepted
+            .then(|| output_state.and_then(|state| state.incoming_handoff_id))
+            .flatten(),
+        processing_id,
+        processing_status,
+        error_metadata.map(|metadata| metadata.0),
+        error_metadata.and_then(|metadata| metadata.1),
+        handoff
+            .and_then(|handoff| handoff.usage)
+            .or_else(|| error.and_then(CheckError::usage)),
+        0,
+        handoff.map_or_else(
+            || error.map_or(0, CheckError::output_chars),
+            |handoff| handoff.output_chars,
+        ),
+        stage_message_count,
+    );
+    diagnostics
+        .events
+        .push(WorkflowDebugEvent { metadata, payload });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn workflow_debug_metadata(
+    source: &str,
+    component: &str,
+    model: &str,
+    mode: &str,
+    input_state: Option<&WorkflowTaskState>,
+    output_state: Option<&WorkflowTaskState>,
+    proposed_event: Option<String>,
+    accepted: bool,
+    outcome: &str,
+    budget: &AutonomyBudget,
+    stage_state: Option<&WorkflowTaskState>,
+    transition_id: Option<i64>,
+    processing_id: Option<i64>,
+    processing_status: &str,
+    error_kind: Option<&str>,
+    http_status: Option<u16>,
+    usage: Option<TokenUsage>,
+    input_chars: usize,
+    output_chars: usize,
+    stage_message_count: usize,
+) -> WorkflowDebugMetadata {
+    let counts = output_state.or(input_state);
+    WorkflowDebugMetadata {
+        source: source.to_owned(),
+        component: component.to_owned(),
+        model: model.to_owned(),
+        mode: mode.to_owned(),
+        input_version: input_state.map_or(0, |task| task.version),
+        output_version: output_state.map(|task| task.version),
+        proposed_event,
+        accepted,
+        outcome: outcome.to_owned(),
+        autonomous_turn: budget.turns,
+        autonomous_tokens: budget.tokens,
+        stage_run_id: stage_state.map_or(0, |task| task.current_stage_run_id.0),
+        transition_id,
+        processing_id,
+        processing_status: processing_status.to_owned(),
+        error_kind: error_kind.map(str::to_owned),
+        http_status,
+        usage,
+        input_chars,
+        output_chars,
+        stage_message_count,
+        plan_step_count: counts.map_or(0, |task| task.plan.steps.len()),
+        checkpoint_item_count: counts.map_or(0, |task| {
+            task.checkpoint.decisions.len()
+                + task.checkpoint.open_issues.len()
+                + usize::from(!task.checkpoint.summary.is_empty())
+        }),
+    }
+}
+
 fn emit<F>(on_event: &mut F, event: AgentEvent<'_>) -> Result<(), WorkflowEngineError>
 where
     F: FnMut(AgentEvent<'_>) -> io::Result<()>,
@@ -1594,10 +2580,30 @@ pub enum WorkflowEngineError {
     Context(#[from] ContextError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error("{source}")]
+    Provider {
+        component: &'static str,
+        #[source]
+        source: ClientError,
+    },
     #[error(transparent)]
     Client(#[from] ClientError),
     #[error(transparent)]
     Facts(#[from] FactsError),
+}
+
+impl WorkflowEngineError {
+    fn provider(component: &'static str, source: ClientError) -> Self {
+        Self::Provider { component, source }
+    }
+
+    pub fn operator_message(&self) -> String {
+        match self {
+            Self::Provider { component, source } => source.operator_message(component),
+            Self::Client(source) => source.operator_message("workflow"),
+            _ => self.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1704,8 +2710,12 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(failed);
-                let WorkflowEngineError::Client(error) = error else {
-                    panic!("expected client error")
+                let WorkflowEngineError::Provider {
+                    component: "facts",
+                    source: error,
+                } = error
+                else {
+                    panic!("expected facts provider error")
                 };
                 assert_eq!(error.usage(), reported_usage);
                 assert_eq!(

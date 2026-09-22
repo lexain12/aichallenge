@@ -20,10 +20,6 @@ use crate::workflow_context::{StageReductionState, facts_candidates};
 use crate::workflow_model::{CheckContext, HandoffPayload, project_handoff};
 
 pub trait WorkflowRepository {
-    fn load_workflow_debug_payload(
-        &self,
-        dialog_id: i64,
-    ) -> Result<WorkflowDebugPayloadSnapshot, StoreError>;
     fn load_workflow_status(&self, dialog_id: i64) -> Result<WorkflowStatusSnapshot, StoreError>;
     fn pause_current_task(&mut self, dialog_id: i64) -> Result<PauseOutcome, StoreError>;
     fn load_processing_context(
@@ -146,6 +142,7 @@ pub trait WorkflowRepository {
         &self,
         stage_run_id: StageRunId,
     ) -> Result<Vec<StageProtocolMessage>, StoreError>;
+    fn count_stage_messages(&self, stage_run_id: StageRunId) -> Result<usize, StoreError>;
     fn load_pending_processing(&self, dialog_id: i64)
     -> Result<Vec<PendingProcessing>, StoreError>;
     fn close_stale_processing(
@@ -331,15 +328,6 @@ pub struct DialogWorkflowSnapshot {
 pub struct WorkflowStatusSnapshot {
     pub current_task: Option<WorkflowTaskState>,
     pub processing: Option<ProcessingStatus>,
-    pub latest_transition_id: Option<i64>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct WorkflowDebugPayloadSnapshot {
-    pub interpreter_output: Option<String>,
-    pub checker_output: Option<String>,
-    pub controller_instruction: Option<String>,
-    pub handoff: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -385,48 +373,6 @@ pub struct ProcessingContext {
 }
 
 impl WorkflowRepository for DialogStore {
-    fn load_workflow_debug_payload(
-        &self,
-        dialog_id: i64,
-    ) -> Result<WorkflowDebugPayloadSnapshot, StoreError> {
-        let tx = self.connection.unchecked_transaction()?;
-        let Some(task) = load_workflow(&tx, dialog_id)?.current_task else {
-            tx.commit()?;
-            return Ok(WorkflowDebugPayloadSnapshot::default());
-        };
-        let latest_input = |source: &str| -> Result<Option<(String, String)>, StoreError> {
-            Ok(tx
-                .query_row(
-                    "SELECT wi.intent_json, m.content
-                     FROM workflow_inputs wi
-                     JOIN messages m ON m.id=wi.message_id
-                     JOIN message_task_stages ms ON ms.message_id=m.id
-                     WHERE wi.dialog_id=?1 AND wi.source=?2 AND ms.workflow_task_id=?3
-                     ORDER BY wi.id DESC LIMIT 1",
-                    params![dialog_id, source, task.id.0],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?)
-        };
-        let human = latest_input("human")?;
-        let controller = latest_input("controller")?;
-        let handoff = tx
-            .query_row(
-                "SELECT handoff_json FROM task_transitions
-                 WHERE workflow_task_id=?1 ORDER BY id DESC LIMIT 1",
-                [task.id.0],
-                |row| row.get(0),
-            )
-            .optional()?;
-        tx.commit()?;
-        Ok(WorkflowDebugPayloadSnapshot {
-            interpreter_output: human.map(|(intent, _)| intent),
-            checker_output: controller.as_ref().map(|(intent, _)| intent.clone()),
-            controller_instruction: controller.map(|(_, instruction)| instruction),
-            handoff,
-        })
-    }
-
     fn load_workflow_status(&self, dialog_id: i64) -> Result<WorkflowStatusSnapshot, StoreError> {
         let tx = self.connection.unchecked_transaction()?;
         let current_task = load_workflow(&tx, dialog_id)?.current_task;
@@ -474,19 +420,10 @@ impl WorkflowRepository for DialogStore {
         } else {
             None
         };
-        let latest_transition_id = match current_task.as_ref() {
-            Some(task) => tx.query_row(
-                "SELECT max(id) FROM task_transitions WHERE workflow_task_id=?1",
-                [task.id.0],
-                |row| row.get(0),
-            )?,
-            None => None,
-        };
         tx.commit()?;
         Ok(WorkflowStatusSnapshot {
             current_task,
             processing,
-            latest_transition_id,
         })
     }
 
@@ -963,6 +900,16 @@ impl WorkflowRepository for DialogStore {
         stage_run_id: StageRunId,
     ) -> Result<Vec<StageProtocolMessage>, StoreError> {
         load_stage_messages(&self.connection, stage_run_id)
+    }
+
+    fn count_stage_messages(&self, stage_run_id: StageRunId) -> Result<usize, StoreError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT count(*) FROM message_task_stages WHERE stage_run_id=?1",
+            [stage_run_id.0],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count)
+            .map_err(|_| StoreError::InvalidWorkflow("invalid stage message count".to_owned()))
     }
 
     fn load_pending_processing(

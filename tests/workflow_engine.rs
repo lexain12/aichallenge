@@ -739,6 +739,8 @@ impl ResponseChecker for ProposedChecker {
                 patch: self.patch.clone(),
                 decision: self.decision.clone(),
                 usage: Some(usage()),
+                raw_output: None,
+                output_chars: 0,
             })
         })
     }

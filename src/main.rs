@@ -57,13 +57,14 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            let message = error.operator_message();
             let ui = TerminalUi::stderr();
             let mut stderr = io::stderr();
             if ui
-                .write_block(&mut stderr, BlockStyle::Error, &format!("error: {error}"))
+                .write_block(&mut stderr, BlockStyle::Error, &format!("error: {message}"))
                 .is_err()
             {
-                eprintln!("error: {error}");
+                eprintln!("error: {message}");
             }
             ExitCode::FAILURE
         }
@@ -640,7 +641,11 @@ async fn run_prompt<W: io::Write, E: io::Write>(
         // Stop on persistence errors: never continue an unsaved session silently.
         Err(error @ AgentError::Store(_)) => Err(error.into()),
         Err(error) => {
-            stderr_ui.write_block(stderr, BlockStyle::Error, &format!("error: {error}"))?;
+            stderr_ui.write_block(
+                stderr,
+                BlockStyle::Error,
+                &format!("error: {}", error.operator_message()),
+            )?;
             Ok(())
         }
     }
@@ -691,6 +696,16 @@ enum AppError {
     Io(#[from] io::Error),
     #[error("interruption handling failed: {0}")]
     Interruption(String),
+}
+
+impl AppError {
+    fn operator_message(&self) -> String {
+        match self {
+            Self::Agent(error) => error.operator_message(),
+            Self::Client(error) => error.operator_message("chat"),
+            _ => self.to_string(),
+        }
+    }
 }
 
 fn memory_address_label(scope: &RequestScope, layer: DurableMemoryScope) -> String {

@@ -64,6 +64,16 @@ fn logging_failure_warns_once_and_disables_future_writes() {
     );
 }
 
+// Break caught: payload capture is meaningful only for an active writer; a
+// configured opt-in without a writer must not trigger raw audit construction.
+#[test]
+fn payload_capture_is_disabled_without_an_active_writer() {
+    let log = DebugLog::new(None, true, "key");
+
+    assert!(!log.is_active());
+    assert!(!log.payloads_enabled());
+}
+
 // Break caught: workflow payloads and controller/model secrets must never be
 // flattened into default diagnostics or escape the opt-in payload envelope.
 #[test]
@@ -73,19 +83,23 @@ fn workflow_payloads_are_metadata_only_by_default_and_nested_when_enabled() {
     let full_path = directory.path().join("workflow-full.jsonl");
     let marker = "WORKFLOW_MARKER_secret-key";
     let metadata = WorkflowDebugMetadata {
-        source: "controller",
-        component: "continuation_checker",
-        model: "checker-model",
-        mode: "advisory",
+        source: "controller".into(),
+        component: "continuation_checker".into(),
+        model: "checker-model".into(),
+        mode: "advisory".into(),
         input_version: 4,
         output_version: Some(5),
-        proposed_event: Some("execution_completed"),
+        proposed_event: Some("execution_completed".into()),
         accepted: false,
+        outcome: "failed".into(),
         autonomous_turn: 2,
         autonomous_tokens: 144,
         stage_run_id: 9,
         transition_id: Some(11),
-        processing_status: "failed",
+        processing_id: Some(13),
+        processing_status: "failed".into(),
+        error_kind: Some("invalid_output".into()),
+        http_status: None,
         usage: Some(TokenUsage {
             prompt_tokens: 10,
             completion_tokens: 4,
@@ -99,14 +113,15 @@ fn workflow_payloads_are_metadata_only_by_default_and_nested_when_enabled() {
         checkpoint_item_count: 1,
     };
     let payload = WorkflowDebugPayload {
-        interpreter_output: Some(marker),
-        checker_output: Some(marker),
-        plan: Some(marker),
-        checkpoint: Some(marker),
-        controller_instruction: Some(marker),
-        handoff: Some(marker),
-        model_prompt: Some(marker),
-        model_output: Some(marker),
+        interpreter_output: Some(marker.into()),
+        checker_output: Some(marker.into()),
+        plan: Some(marker.into()),
+        checkpoint: Some(marker.into()),
+        controller_instruction: Some(marker.into()),
+        handoff: Some(marker.into()),
+        model_prompt: Some(marker.into()),
+        model_output: Some(marker.into()),
+        provider_error: Some(marker.into()),
     };
 
     let mut safe = DebugLog::new(Some(safe_path.clone()), false, "secret-key");

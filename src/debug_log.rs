@@ -38,20 +38,24 @@ impl RequestMetadata {
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct WorkflowDebugMetadata<'a> {
-    pub source: &'a str,
-    pub component: &'a str,
-    pub model: &'a str,
-    pub mode: &'a str,
+pub struct WorkflowDebugMetadata {
+    pub source: String,
+    pub component: String,
+    pub model: String,
+    pub mode: String,
     pub input_version: u64,
     pub output_version: Option<u64>,
-    pub proposed_event: Option<&'a str>,
+    pub proposed_event: Option<String>,
     pub accepted: bool,
+    pub outcome: String,
     pub autonomous_turn: u32,
     pub autonomous_tokens: u64,
     pub stage_run_id: i64,
     pub transition_id: Option<i64>,
-    pub processing_status: &'a str,
+    pub processing_id: Option<i64>,
+    pub processing_status: String,
+    pub error_kind: Option<String>,
+    pub http_status: Option<u16>,
     pub usage: Option<TokenUsage>,
     pub input_chars: usize,
     pub output_chars: usize,
@@ -60,16 +64,23 @@ pub struct WorkflowDebugMetadata<'a> {
     pub checkpoint_item_count: usize,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct WorkflowDebugPayload<'a> {
-    pub interpreter_output: Option<&'a str>,
-    pub checker_output: Option<&'a str>,
-    pub plan: Option<&'a str>,
-    pub checkpoint: Option<&'a str>,
-    pub controller_instruction: Option<&'a str>,
-    pub handoff: Option<&'a str>,
-    pub model_prompt: Option<&'a str>,
-    pub model_output: Option<&'a str>,
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct WorkflowDebugPayload {
+    pub interpreter_output: Option<String>,
+    pub checker_output: Option<String>,
+    pub plan: Option<String>,
+    pub checkpoint: Option<String>,
+    pub controller_instruction: Option<String>,
+    pub handoff: Option<String>,
+    pub model_prompt: Option<String>,
+    pub model_output: Option<String>,
+    pub provider_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkflowDebugEvent {
+    pub metadata: WorkflowDebugMetadata,
+    pub payload: Option<WorkflowDebugPayload>,
 }
 
 pub struct DebugLog {
@@ -80,8 +91,12 @@ pub struct DebugLog {
 }
 
 impl DebugLog {
+    pub fn is_active(&self) -> bool {
+        self.writer.is_some()
+    }
+
     pub fn payloads_enabled(&self) -> bool {
-        self.log_payloads
+        self.is_active() && self.log_payloads
     }
 
     pub fn new(path: Option<PathBuf>, log_payloads: bool, api_key: &str) -> Self {
@@ -120,6 +135,9 @@ impl DebugLog {
         messages: &[Message],
         context: &RequestMetadata,
     ) -> Option<String> {
+        if self.writer.is_none() {
+            return self.pending_warning.take();
+        }
         let metadata: Vec<_> = messages
             .iter()
             .map(|message| {
@@ -154,6 +172,9 @@ impl DebugLog {
     }
 
     pub fn log_event(&mut self, event: &'static str, details: Value) -> Option<String> {
+        if self.writer.is_none() {
+            return self.pending_warning.take();
+        }
         self.write_value(json!({
             "event": event,
             "timestamp_unix_ms": timestamp_unix_ms(),
@@ -163,14 +184,17 @@ impl DebugLog {
 
     pub fn log_workflow(
         &mut self,
-        metadata: &WorkflowDebugMetadata<'_>,
-        payload: Option<&WorkflowDebugPayload<'_>>,
+        metadata: &WorkflowDebugMetadata,
+        payload: Option<&WorkflowDebugPayload>,
     ) -> Option<String> {
+        if self.writer.is_none() {
+            return self.pending_warning.take();
+        }
         let mut details = match serde_json::to_value(metadata) {
             Ok(value) => value,
             Err(error) => return self.disable(format!("serialization failed: {error}")),
         };
-        if self.log_payloads
+        if self.payloads_enabled()
             && let Some(payload) = payload
         {
             details["payload"] = match serde_json::to_value(payload) {
@@ -183,6 +207,28 @@ impl DebugLog {
             "timestamp_unix_ms": timestamp_unix_ms(),
             "details": details,
         }))
+    }
+
+    pub fn log_failure(
+        &mut self,
+        event: &'static str,
+        details: Value,
+        provider_error: Option<&str>,
+    ) -> Option<String> {
+        if self.writer.is_none() {
+            return self.pending_warning.take();
+        }
+        let mut value = json!({
+            "event": event,
+            "timestamp_unix_ms": timestamp_unix_ms(),
+            "details": details,
+        });
+        if self.payloads_enabled()
+            && let Some(provider_error) = provider_error
+        {
+            value["details"]["payload"] = json!({"provider_error": provider_error});
+        }
+        self.write_value(value)
     }
 
     fn write_value(&mut self, value: Value) -> Option<String> {

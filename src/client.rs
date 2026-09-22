@@ -63,6 +63,10 @@ impl DeepSeekClient {
         self
     }
 
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
+
     pub async fn stream_chat<F>(
         &self,
         messages: &[Message],
@@ -402,7 +406,7 @@ pub enum ClientError {
     Endpoint(#[source] url::ParseError),
     #[error("DeepSeek request failed")]
     Request(#[source] reqwest::Error),
-    #[error("DeepSeek API returned HTTP {status}: {body}")]
+    #[error("DeepSeek API returned HTTP {status}")]
     Api { status: StatusCode, body: String },
     #[error("DeepSeek stream failed: {0}")]
     Stream(String),
@@ -421,4 +425,80 @@ impl ClientError {
             _ => None,
         }
     }
+
+    pub fn operator_metadata(&self) -> ProviderErrorMetadata {
+        let error = match self {
+            Self::WithUsage { source, .. } => source.as_ref(),
+            error => error,
+        };
+        match error {
+            Self::Api { status, .. } => ProviderErrorMetadata {
+                kind: "http",
+                status: Some(status.as_u16()),
+            },
+            Self::Request(_) => ProviderErrorMetadata {
+                kind: "request",
+                status: None,
+            },
+            Self::Stream(_) => ProviderErrorMetadata {
+                kind: "stream",
+                status: None,
+            },
+            Self::Json(_) => ProviderErrorMetadata {
+                kind: "invalid_stream",
+                status: None,
+            },
+            Self::IncompleteStream => ProviderErrorMetadata {
+                kind: "incomplete_stream",
+                status: None,
+            },
+            Self::Truncated => ProviderErrorMetadata {
+                kind: "truncated",
+                status: None,
+            },
+            Self::EmptyAnswer => ProviderErrorMetadata {
+                kind: "empty_response",
+                status: None,
+            },
+            Self::Output(_) => ProviderErrorMetadata {
+                kind: "output",
+                status: None,
+            },
+            Self::Build(_) | Self::Endpoint(_) => ProviderErrorMetadata {
+                kind: "configuration",
+                status: None,
+            },
+            Self::WithUsage { .. } => unreachable!("nested usage error was unwrapped"),
+        }
+    }
+
+    pub fn operator_message(&self, component: &str) -> String {
+        let metadata = self.operator_metadata();
+        match metadata.status {
+            Some(status) => format!(
+                "provider failure · component: {component} · kind: {} · status: {status}",
+                metadata.kind
+            ),
+            None => format!(
+                "provider failure · component: {component} · kind: {}",
+                metadata.kind
+            ),
+        }
+    }
+
+    pub fn raw_diagnostic(&self) -> String {
+        match self {
+            Self::WithUsage { source, .. } => source.raw_diagnostic(),
+            Self::Api { status, body } => {
+                format!("DeepSeek API returned HTTP {status}: {body}")
+            }
+            _ => self.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderErrorMetadata {
+    pub kind: &'static str,
+    pub status: Option<u16>,
 }

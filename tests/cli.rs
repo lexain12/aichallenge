@@ -118,6 +118,35 @@ strategy = "summary"
 }
 
 #[cfg(unix)]
+fn write_observed_workflow_config(base_url: &str, log_path: &Path, context: &str) -> NamedTempFile {
+    let mut file = NamedTempFile::new().expect("create temporary workflow config");
+    write!(
+        file,
+        r#"
+api_key = "test-key"
+base_url = "{base_url}"
+model = "ordinary-model"
+timeout_seconds = 30
+
+[workflow]
+enabled = true
+interpreter_model = "interpreter-model"
+checker_model = "checker-model"
+handoff_model = "handoff-model"
+
+[context]
+{context}
+
+[debug]
+log_path = {log_path:?}
+log_payloads = false
+"#,
+    )
+    .unwrap();
+    file
+}
+
+#[cfg(unix)]
 fn send_sigint(child: &std::process::Child) {
     let status = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
@@ -502,6 +531,166 @@ async fn workflow_autonomous_responses_are_separate_and_hide_controller_text() {
     let listed = DialogStore::open(&database).unwrap().list().unwrap();
     assert_eq!(listed.len(), 1);
     assert!(!listed[0].title.contains(marker));
+}
+
+// Break caught: a provider body may echo a hidden controller instruction, but
+// ordinary-turn failures must expose only safe operator metadata.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_ordinary_provider_failure_never_prints_hidden_payload() {
+    let server = MockServer::start().await;
+    let marker = "CTRL_PAYLOAD_ECHO_SECRET";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(
+                [
+                    sse("first visible answer", 2, 1, 3),
+                    sse(
+                        &json!({
+                            "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+                            "decision": {"type":"continue","instruction":marker,"confidence":0.95}
+                        })
+                        .to_string(),
+                        2,
+                        1,
+                        3,
+                    ),
+                    ResponseTemplate::new(400).set_body_string(marker),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        })
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("ordinary-error.sqlite3");
+    let log_path = directory.path().join("ordinary-error.jsonl");
+    let config = write_observed_workflow_config(&server.uri(), &log_path, "strategy = \"summary\"");
+
+    let output = run_cli_args(config.path(), &database, &[], "build it\n/exit\n");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stdout.contains(marker), "{stdout}");
+    assert!(!stderr.contains(marker), "{stderr}");
+    assert!(
+        stderr.contains("provider failure · component: ordinary · kind: http · status: 400"),
+        "{stderr}"
+    );
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(!log.contains(marker), "{log}");
+    assert!(log.lines().any(|line| {
+        let value: Value = serde_json::from_str(line).unwrap();
+        value["event"] == "workflow"
+            && value["details"]["component"] == "ordinary"
+            && value["details"]["outcome"] == "failed"
+            && value["details"]["error_kind"] == "http"
+            && value["details"]["http_status"] == 400
+    }));
+}
+
+// Break caught: advisory compaction warnings use the same safe provider
+// classification as terminal errors and record a failure at the call boundary.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_compaction_provider_failure_never_prints_response_body() {
+    let server = MockServer::start().await;
+    let marker = "COMPACTION_PROVIDER_BODY_SECRET";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(
+                [
+                    sse("visible answer", 8, 1, 9),
+                    ResponseTemplate::new(400).set_body_string(marker),
+                    sse(
+                        &json!({
+                            "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+                            "decision": {"type":"await_user"}
+                        })
+                        .to_string(),
+                        2,
+                        1,
+                        3,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        })
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("compaction-error.sqlite3");
+    let log_path = directory.path().join("compaction-error.jsonl");
+    let config = write_observed_workflow_config(
+        &server.uri(),
+        &log_path,
+        "strategy = \"summary\"\ncompact_after_prompt_tokens = 1\nkeep_last_messages = 1\nsummary_max_tokens = 64",
+    );
+
+    let output = run_cli_args(config.path(), &database, &[], "build it\n/exit\n");
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains(marker), "{stderr}");
+    assert!(
+        stderr.contains("provider failure · component: compaction · kind: http · status: 400"),
+        "{stderr}"
+    );
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(!log.contains(marker), "{log}");
+    assert!(log.lines().any(|line| {
+        let value: Value = serde_json::from_str(line).unwrap();
+        value["event"] == "workflow"
+            && value["details"]["component"] == "compaction"
+            && value["details"]["outcome"] == "failed"
+            && value["details"]["error_kind"] == "http"
+    }));
+}
+
+// Break caught: facts refresh failures may abort the turn, but neither the
+// warning nor the ordinary terminal error may reveal the provider body.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_facts_provider_failure_never_prints_response_body() {
+    let server = MockServer::start().await;
+    let marker = "FACTS_PROVIDER_BODY_SECRET";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(marker))
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("facts-error.sqlite3");
+    let log_path = directory.path().join("facts-error.jsonl");
+    let config = write_observed_workflow_config(
+        &server.uri(),
+        &log_path,
+        "strategy = \"sticky_facts\"\nfacts_max_tokens = 64",
+    );
+
+    let output = run_cli_args(config.path(), &database, &[], "build it\n/exit\n");
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains(marker), "{stderr}");
+    assert!(
+        stderr.contains("provider failure · component: facts · kind: http · status: 400"),
+        "{stderr}"
+    );
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(!log.contains(marker), "{log}");
+    assert!(log.lines().any(|line| {
+        let value: Value = serde_json::from_str(line).unwrap();
+        value["event"] == "workflow"
+            && value["details"]["component"] == "facts"
+            && value["details"]["outcome"] == "failed"
+            && value["details"]["error_kind"] == "http"
+    }));
 }
 
 // Break caught: the CLI must recover before reading the first restored prompt, even when that prompt exits.
@@ -1193,8 +1382,8 @@ async fn clear_and_api_error_leave_cli_ready_for_more_input() {
         "Scope · user: default · task: default\nyou> Conversation cleared.\nyou> assistant> \nyou> Токены · нет данных API\n"
     );
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
-    assert!(stderr.contains("HTTP 500 Internal Server Error"));
-    assert!(stderr.contains("temporary failure"));
+    assert!(stderr.contains("provider failure · component: chat · kind: http · status: 500"));
+    assert!(!stderr.contains("temporary failure"));
     assert!(!stderr.contains("test-key"));
 }
 
