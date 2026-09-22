@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::future::pending;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use deepseek_cli::agent::AgentEvent;
@@ -25,12 +27,12 @@ use deepseek_cli::workflow_model::{
 };
 use deepseek_cli::workflow_store::{
     AcceptedInputEffect, AnswerCommit, ControllerInputCommit, ExpectedCurrentTask, InputCommit,
-    ProcessingLeaseMode, ProcessingStatus, WorkflowRepository,
+    PauseOutcome, ProcessingLeaseMode, ProcessingStatus, WorkflowRepository,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 #[derive(Default)]
 struct FakeModel {
@@ -76,6 +78,48 @@ impl CompletionModel for FakeModel {
             })
         })
     }
+}
+
+#[derive(Default)]
+struct PendingModel {
+    started: AtomicBool,
+}
+
+impl CompletionModel for PendingModel {
+    fn name(&self) -> &str {
+        "pending-service"
+    }
+
+    fn complete(&self, _request: ModelRequest) -> ModelFuture<'_> {
+        self.started.store(true, Ordering::SeqCst);
+        Box::pin(async move {
+            pending::<()>().await;
+            unreachable!("pending model is cancelled by the test")
+        })
+    }
+}
+
+#[derive(Clone)]
+struct StartedResponder {
+    started: Arc<AtomicBool>,
+    response: ResponseTemplate,
+}
+
+impl Respond for StartedResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.started.store(true, Ordering::SeqCst);
+        self.response.clone()
+    }
+}
+
+async fn wait_until_started(started: &AtomicBool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("service call should start");
 }
 
 fn usage() -> TokenUsage {
@@ -329,6 +373,147 @@ fn checked(version: u64, action: Option<&str>, decision: Value) -> Value {
 
 fn continue_decision() -> Value {
     json!({"type":"continue","instruction":"HIDDEN next instruction","confidence":0.95})
+}
+
+// Break caught: dropping any service-boundary future may preserve earlier commits, but no partial effect.
+#[tokio::test]
+async fn cancellation_at_interpreter_handoff_ordinary_and_recovery_boundaries_is_atomic() {
+    {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        let before = f.current().unwrap();
+        let blocker = Arc::new(PendingModel::default());
+        let models = WorkflowModels {
+            interpreter: blocker.clone(),
+            checker: f.checker.clone(),
+            handoff: f.handoff.clone(),
+        };
+        let mut run = Box::pin(f.run_with_models("continue", &models, |_| Ok(())));
+        tokio::select! {
+            result = run.as_mut() => panic!("interpreter unexpectedly completed: {result:?}"),
+            _ = wait_until_started(&blocker.started) => {}
+        }
+        drop(run);
+        assert_eq!(f.current().unwrap(), before);
+        assert_eq!(f.count("messages"), 1);
+        assert_eq!(f.count("workflow_inputs"), 1);
+        let PauseOutcome::Paused(paused) = f.store.pause_current_task(before.dialog_id).unwrap()
+        else {
+            panic!("active task must pause after interpreter cancellation");
+        };
+        assert_eq!(paused.status, TaskStatus::Paused);
+        assert_eq!(paused.version, before.version + 1);
+        assert_eq!(paused.current_stage_run_id, before.current_stage_run_id);
+    }
+
+    {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        let before = f.current().unwrap();
+        f.interpreter.reply(interpretation(json!({
+            "type":"propose_transition",
+            "event":"execution_completed",
+            "evidence":["build green"]
+        })));
+        let blocker = Arc::new(PendingModel::default());
+        let models = WorkflowModels {
+            interpreter: f.interpreter.clone(),
+            checker: f.checker.clone(),
+            handoff: blocker.clone(),
+        };
+        let mut run = Box::pin(f.run_with_models("validate it", &models, |_| Ok(())));
+        tokio::select! {
+            result = run.as_mut() => panic!("handoff unexpectedly completed: {result:?}"),
+            _ = wait_until_started(&blocker.started) => {}
+        }
+        drop(run);
+        assert_eq!(f.current().unwrap(), before);
+        assert_eq!(f.count("messages"), 1);
+        assert_eq!(f.count("task_transitions"), 0);
+        let PauseOutcome::Paused(paused) = f.store.pause_current_task(before.dialog_id).unwrap()
+        else {
+            panic!("active task must pause after handoff cancellation");
+        };
+        assert_eq!(paused.version, before.version + 1);
+        assert_eq!(paused.current_stage_run_id, before.current_stage_run_id);
+    }
+
+    {
+        let mut f = Fixture::new(None, TaskStatus::Active).await;
+        let request_started = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(StartedResponder {
+                started: request_started.clone(),
+                response: ordinary_response("partial", true)
+                    .set_delay(std::time::Duration::from_secs(30)),
+            })
+            .mount(&f.server)
+            .await;
+        let mut run = Box::pin(f.run("first task", |_| Ok(())));
+        tokio::select! {
+            result = run.as_mut() => panic!("ordinary request unexpectedly completed: {result:?}"),
+            _ = wait_until_started(&request_started) => {}
+        }
+        drop(run);
+        let before_pause = f.current().expect("input creates its legitimate task");
+        assert_eq!(f.count("messages"), 1);
+        assert_eq!(f.count("response_processing"), 0);
+        let PauseOutcome::Paused(paused) =
+            f.store.pause_current_task(before_pause.dialog_id).unwrap()
+        else {
+            panic!("active task must pause after ordinary cancellation");
+        };
+        assert_eq!(paused.version, before_pause.version + 1);
+        assert_eq!(
+            paused.current_stage_run_id,
+            before_pause.current_stage_run_id
+        );
+        assert_eq!(f.count("response_processing"), 0);
+    }
+
+    {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        let before = f.current().unwrap();
+        let answer = f.pending_answer();
+        let blocker = Arc::new(PendingModel::default());
+        let models = WorkflowModels {
+            interpreter: f.interpreter.clone(),
+            checker: blocker.clone(),
+            handoff: f.handoff.clone(),
+        };
+        let dialog_id = f.dialog_id.unwrap();
+        let mut engine = WorkflowEngine::new(
+            &f.client,
+            f.config.context(),
+            f.config.workflow(),
+            &models,
+            WorkflowSession {
+                store: &mut f.store,
+                dialog_id: &mut f.dialog_id,
+                scope: &mut f.scope,
+                history: &mut f.history,
+                last_usage: &mut f.last_usage,
+            },
+        );
+        let mut recovery = Box::pin(engine.recover_pending_processing(dialog_id));
+        tokio::select! {
+            result = recovery.as_mut() => panic!("recovery checker unexpectedly completed: {result:?}"),
+            _ = wait_until_started(&blocker.started) => {}
+        }
+        drop(recovery);
+        drop(engine);
+        let processing = f.store.load_pending_processing(dialog_id).unwrap();
+        assert_eq!(processing.len(), 1);
+        assert_eq!(processing[0].id, answer.processing_id);
+        assert_eq!(processing[0].status, ProcessingStatus::Processing);
+        assert_eq!(f.current().unwrap(), before);
+        assert_eq!(f.count("workflow_inputs"), 1);
+        let PauseOutcome::Paused(paused) = f.store.pause_current_task(dialog_id).unwrap() else {
+            panic!("active task must pause after recovery cancellation");
+        };
+        assert_eq!(paused.version, before.version + 1);
+        assert_eq!(paused.current_stage_run_id, before.current_stage_run_id);
+        assert_eq!(f.count("workflow_inputs"), 1);
+    }
 }
 
 // Break caught: ordinary answers must be durable before checker work, and await_user applies one patch.

@@ -11,6 +11,7 @@ use deepseek_cli::config::{Config, ConfigError};
 use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::memory::{DEFAULT_TASK_ID, DEFAULT_USER_ID, DurableMemoryScope, RequestScope};
 use deepseek_cli::terminal::{BlockStyle, TerminalUi};
+use deepseek_cli::workflow_store::PauseOutcome;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -144,7 +145,19 @@ async fn run() -> Result<(), AppError> {
         )?,
     };
     if resume.is_some() {
-        let recovery = agent.recover_workflow_processing().await;
+        let recovery = tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                None
+            }
+            result = agent.recover_workflow_processing() => Some(result),
+        };
+        let Some(recovery) = recovery else {
+            let outcome = agent.pause_current_workflow()?;
+            write_interruption(&stdout_ui, &mut stdout, outcome, true)?;
+            return Ok(());
+        };
         let failed = match recovery {
             Ok(recovered) => recovered.iter().any(|job| {
                 job.stop_reason
@@ -199,7 +212,21 @@ async fn run() -> Result<(), AppError> {
     loop {
         stdout_ui.write_input_prompt(&mut stdout)?;
 
-        let Some(line) = lines.next_line().await? else {
+        let line = tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                None
+            }
+            line = lines.next_line() => Some(line?),
+        };
+        let Some(line) = line else {
+            stdout_ui.finish_empty_prompt(&mut stdout)?;
+            let outcome = agent.pause_current_workflow()?;
+            write_interruption(&stdout_ui, &mut stdout, outcome, false)?;
+            return Ok(());
+        };
+        let Some(line) = line else {
             stdout_ui.finish_empty_prompt(&mut stdout)?;
             if footer_visible {
                 stdout_ui.erase_usage_before_input(&mut stdout, "")?;
@@ -347,112 +374,29 @@ async fn run() -> Result<(), AppError> {
             }
             InputAction::Send(user_message) => {
                 show_usage = true;
-                let mut block = Some(stdout_ui.start_response(&mut stdout)?);
-                let mut deferred_warnings = Vec::new();
-
-                let result = agent
-                    .run_streaming(&user_message, |event| match event {
-                        AgentEvent::Text(fragment) => block
-                            .as_mut()
-                            .expect("compaction starts after ordinary response text")
-                            .write_text(fragment),
-                        AgentEvent::Usage(_) => Ok(()),
-                        AgentEvent::Workflow(_) => Ok(()),
-                        AgentEvent::CompactionStarted {
-                            covered_message_count,
-                            kept_message_count,
-                            ..
-                        } => {
-                            if let Some(response) = block.take() {
-                                response.finish()?;
-                            }
-                            if stderr_ui.is_interactive() {
-                                stderr_ui.write_status(
-                                    &mut stderr,
-                                    &format!(
-                                        "Контекст · сжимаю до {covered_message_count}, оставляю {kept_message_count} сообщений"
-                                    ),
-                                )?;
-                            }
-                            Ok(())
-                        }
-                        AgentEvent::CompactionCompleted {
-                            covered_message_count,
-                            ..
-                        } => {
-                            if stderr_ui.is_interactive() {
-                                stderr_ui.write_status(
-                                    &mut stderr,
-                                    &format!(
-                                        "Контекст · summary обновлено до сообщения {covered_message_count}"
-                                    ),
-                                )?;
-                            }
-                            Ok(())
-                        }
-                        AgentEvent::CompactionFailed { error } => stderr_ui.write_block(
-                            &mut stderr,
-                            BlockStyle::Error,
-                            &format!("context compaction failed: {error}"),
-                        ),
-                        AgentEvent::FactsUpdateStarted {
-                            previous_boundary,
-                            target_boundary,
-                        } => {
-                            if stderr_ui.is_interactive() {
-                                stderr_ui.write_status(
-                                    &mut stderr,
-                                    &format!(
-                                        "Контекст · обновляю facts: {previous_boundary} → {target_boundary}"
-                                    ),
-                                )?;
-                            }
-                            Ok(())
-                        }
-                        AgentEvent::FactsUpdateCompleted {
-                            covered_message_count,
-                            ..
-                        } => {
-                            if stderr_ui.is_interactive() {
-                                stderr_ui.write_status(
-                                    &mut stderr,
-                                    &format!(
-                                        "Контекст · facts обновлены до сообщения {covered_message_count}"
-                                    ),
-                                )?;
-                            }
-                            Ok(())
-                        }
-                        AgentEvent::FactsUpdateFailed { error } => {
-                            deferred_warnings.push(format!("facts update failed: {error}"));
-                            Ok(())
-                        }
-                        AgentEvent::DebugLogFailed { error } => {
-                            if block.is_some() {
-                                deferred_warnings.push(error);
-                                Ok(())
-                            } else {
-                                stderr_ui.write_block(&mut stderr, BlockStyle::Error, &error)
-                            }
-                        }
-                    })
-                    .await;
-                if let Some(response) = block.take() {
-                    response.finish()?;
-                }
-                for warning in deferred_warnings {
-                    stderr_ui.write_block(&mut stderr, BlockStyle::Error, &warning)?;
-                }
-
-                match result {
-                    Ok(_) => {}
-                    // Stop on persistence errors: never continue an unsaved session silently.
-                    Err(error @ AgentError::Store(_)) => return Err(error.into()),
-                    Err(error) => stderr_ui.write_block(
+                let interrupted = tokio::select! {
+                    biased;
+                    signal = tokio::signal::ctrl_c() => {
+                        signal?;
+                        true
+                    }
+                    result = run_prompt(
+                        &mut agent,
+                        &user_message,
+                        stdout_ui,
+                        &mut stdout,
+                        stderr_ui,
                         &mut stderr,
-                        BlockStyle::Error,
-                        &format!("error: {error}"),
-                    )?,
+                    ) => {
+                        result?;
+                        false
+                    }
+                };
+                if interrupted {
+                    stdout_ui.finish_interrupted_response(&mut stdout)?;
+                    let outcome = agent.pause_current_workflow()?;
+                    write_interruption(&stdout_ui, &mut stdout, outcome, true)?;
+                    return Ok(());
                 }
             }
         }
@@ -467,6 +411,145 @@ async fn run() -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+async fn run_prompt<W: io::Write, E: io::Write>(
+    agent: &mut Agent,
+    user_message: &str,
+    stdout_ui: TerminalUi,
+    stdout: &mut W,
+    stderr_ui: TerminalUi,
+    stderr: &mut E,
+) -> Result<(), AppError> {
+    let mut block = Some(stdout_ui.start_response(stdout)?);
+    let mut deferred_warnings = Vec::new();
+    let result = agent
+        .run_streaming(user_message, |event| match event {
+            AgentEvent::Text(fragment) => block
+                .as_mut()
+                .expect("compaction starts after ordinary response text")
+                .write_text(fragment),
+            AgentEvent::Usage(_) => Ok(()),
+            AgentEvent::Workflow(_) => Ok(()),
+            AgentEvent::CompactionStarted {
+                covered_message_count,
+                kept_message_count,
+                ..
+            } => {
+                if let Some(response) = block.take() {
+                    response.finish()?;
+                }
+                if stderr_ui.is_interactive() {
+                    stderr_ui.write_status(
+                        stderr,
+                        &format!(
+                            "Контекст · сжимаю до {covered_message_count}, оставляю {kept_message_count} сообщений"
+                        ),
+                    )?;
+                }
+                Ok(())
+            }
+            AgentEvent::CompactionCompleted {
+                covered_message_count,
+                ..
+            } => {
+                if stderr_ui.is_interactive() {
+                    stderr_ui.write_status(
+                        stderr,
+                        &format!(
+                            "Контекст · summary обновлено до сообщения {covered_message_count}"
+                        ),
+                    )?;
+                }
+                Ok(())
+            }
+            AgentEvent::CompactionFailed { error } => stderr_ui.write_block(
+                stderr,
+                BlockStyle::Error,
+                &format!("context compaction failed: {error}"),
+            ),
+            AgentEvent::FactsUpdateStarted {
+                previous_boundary,
+                target_boundary,
+            } => {
+                if stderr_ui.is_interactive() {
+                    stderr_ui.write_status(
+                        stderr,
+                        &format!(
+                            "Контекст · обновляю facts: {previous_boundary} → {target_boundary}"
+                        ),
+                    )?;
+                }
+                Ok(())
+            }
+            AgentEvent::FactsUpdateCompleted {
+                covered_message_count,
+                ..
+            } => {
+                if stderr_ui.is_interactive() {
+                    stderr_ui.write_status(
+                        stderr,
+                        &format!(
+                            "Контекст · facts обновлены до сообщения {covered_message_count}"
+                        ),
+                    )?;
+                }
+                Ok(())
+            }
+            AgentEvent::FactsUpdateFailed { error } => {
+                deferred_warnings.push(format!("facts update failed: {error}"));
+                Ok(())
+            }
+            AgentEvent::DebugLogFailed { error } => {
+                if block.is_some() {
+                    deferred_warnings.push(error);
+                    Ok(())
+                } else {
+                    stderr_ui.write_block(stderr, BlockStyle::Error, &error)
+                }
+            }
+        })
+        .await;
+    if let Some(response) = block.take() {
+        response.finish()?;
+    }
+    for warning in deferred_warnings {
+        stderr_ui.write_block(stderr, BlockStyle::Error, &warning)?;
+    }
+    match result {
+        Ok(_) => Ok(()),
+        // Stop on persistence errors: never continue an unsaved session silently.
+        Err(error @ AgentError::Store(_)) => Err(error.into()),
+        Err(error) => {
+            stderr_ui.write_block(stderr, BlockStyle::Error, &format!("error: {error}"))?;
+            Ok(())
+        }
+    }
+}
+
+fn write_interruption<W: io::Write>(
+    ui: &TerminalUi,
+    writer: &mut W,
+    outcome: PauseOutcome,
+    discarded_model_result: bool,
+) -> io::Result<()> {
+    let message = match (outcome, discarded_model_result) {
+        (PauseOutcome::Paused(_), true) => "Task paused. The partial model result was discarded.",
+        (PauseOutcome::AlreadyPaused, true) => {
+            "Task remains paused. The partial model result was discarded."
+        }
+        (PauseOutcome::AlreadyDone, true) => {
+            "Task is already complete. The in-flight model result was discarded."
+        }
+        (PauseOutcome::NoTask, true) => {
+            "Interrupted. The partial model result was discarded; no workflow task was created."
+        }
+        (PauseOutcome::Paused(_), false) => "Task paused.",
+        (PauseOutcome::AlreadyPaused, false) => "Task remains paused.",
+        (PauseOutcome::AlreadyDone, false) => "Task is already complete.",
+        (PauseOutcome::NoTask, false) => "Interrupted. No workflow task was created.",
+    };
+    ui.write_block(writer, BlockStyle::System, message)
 }
 
 #[derive(Debug, Error)]

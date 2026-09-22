@@ -22,6 +22,7 @@ use crate::workflow_engine::{
     RecoveredProcessing, WorkflowEngine, WorkflowEngineError, WorkflowModels, WorkflowSession,
 };
 use crate::workflow_model::DeepSeekCompletionModel;
+use crate::workflow_store::{PauseOutcome, WorkflowRepository};
 
 /// An API client and its independent conversation, optionally backed by SQLite.
 pub struct Agent {
@@ -268,6 +269,22 @@ impl Agent {
         )
         .recover_pending_processing(dialog_id)
         .await?)
+    }
+
+    /// Persist a pause only for an already-selected active workflow task.
+    /// This method never creates a dialog, task, stage, or protocol message.
+    pub fn pause_current_workflow(&mut self) -> Result<PauseOutcome, AgentError> {
+        if !self
+            .workflow_config
+            .as_ref()
+            .is_some_and(WorkflowConfig::enabled)
+        {
+            return Ok(PauseOutcome::NoTask);
+        }
+        let (Some(dialog_id), Some(store)) = (self.dialog_id, self.store.as_mut()) else {
+            return Ok(PauseOutcome::NoTask);
+        };
+        Ok(store.pause_current_task(dialog_id)?)
     }
 
     pub async fn run_workflow_streaming<F>(

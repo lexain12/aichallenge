@@ -20,6 +20,7 @@ use crate::workflow_context::{StageReductionState, facts_candidates};
 use crate::workflow_model::{CheckContext, HandoffPayload, project_handoff};
 
 pub trait WorkflowRepository {
+    fn pause_current_task(&mut self, dialog_id: i64) -> Result<PauseOutcome, StoreError>;
     fn load_processing_context(
         &self,
         dialog_id: i64,
@@ -183,6 +184,14 @@ pub struct InputCommit<'a> {
     pub protocol_text: &'a str,
     pub confidence: Option<f32>,
     pub expected_current_task: ExpectedCurrentTask,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PauseOutcome {
+    Paused(WorkflowTaskState),
+    NoTask,
+    AlreadyPaused,
+    AlreadyDone,
 }
 
 /// Snapshot identity used by commands that route through a dialog's selected task.
@@ -356,6 +365,48 @@ pub struct ProcessingContext {
 }
 
 impl WorkflowRepository for DialogStore {
+    fn pause_current_task(&mut self, dialog_id: i64) -> Result<PauseOutcome, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(task) = load_workflow(&tx, dialog_id)?.current_task else {
+            return Ok(PauseOutcome::NoTask);
+        };
+        if task.phase == TaskPhase::Done {
+            return Ok(PauseOutcome::AlreadyDone);
+        }
+        if task.status == TaskStatus::Paused {
+            return Ok(PauseOutcome::AlreadyPaused);
+        }
+        let next = next_version(task.version)?;
+        let changed = tx.execute(
+            "UPDATE workflow_tasks
+             SET status='paused', version=?1,
+                 updated_at=strftime('%Y-%m-%d %H:%M:%f','now')
+             WHERE id=?2 AND dialog_id=?3 AND current_stage_run_id=?4
+               AND version=?5 AND status='active' AND phase<>'done'
+               AND EXISTS (
+                   SELECT 1 FROM dialog_workflow_state d
+                   WHERE d.dialog_id=?3 AND d.current_task_id=workflow_tasks.id
+               )",
+            params![
+                sqlite_version(next)?,
+                task.id.0,
+                dialog_id,
+                task.current_stage_run_id.0,
+                sqlite_version(task.version)?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::WorkflowConflict(dialog_id));
+        }
+        let mut paused = task.pause().map_err(domain_error)?;
+        paused.version = next;
+        paused.validate().map_err(domain_error)?;
+        tx.commit()?;
+        Ok(PauseOutcome::Paused(paused))
+    }
+
     fn load_processing_result(
         &self,
         dialog_id: i64,

@@ -1,13 +1,27 @@
 use std::collections::VecDeque;
+#[cfg(unix)]
+use std::io::Read;
 use std::io::Write;
+#[cfg(unix)]
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+#[cfg(unix)]
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::Duration;
 
 use deepseek_cli::dialog::DialogStore;
 use deepseek_cli::memory::{MemoryRepository, RequestScope};
 use deepseek_cli::profile::ProfileRepository;
+#[cfg(unix)]
+use deepseek_cli::workflow::{TaskPhase, TaskStatus};
 use deepseek_cli::workflow_store::{AnswerCommit, WorkflowRepository};
+#[cfg(unix)]
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
@@ -77,6 +91,109 @@ strategy = "branching"
     )
     .expect("write temporary config");
     file
+}
+
+#[cfg(unix)]
+fn write_workflow_config(base_url: &str) -> NamedTempFile {
+    let mut file = NamedTempFile::new().expect("create temporary workflow config");
+    write!(
+        file,
+        r#"
+api_key = "test-key"
+base_url = "{base_url}"
+model = "test-model"
+timeout_seconds = 30
+
+[workflow]
+enabled = true
+
+[context]
+strategy = "summary"
+"#
+    )
+    .unwrap();
+    file
+}
+
+#[cfg(unix)]
+fn send_sigint(child: &std::process::Child) {
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+fn observe_stdout(
+    mut stdout: std::process::ChildStdout,
+    needle: &'static str,
+) -> (mpsc::Receiver<()>, thread::JoinHandle<Vec<u8>>) {
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 256];
+        let mut reported = false;
+        loop {
+            let read = stdout.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..read]);
+            if !reported && String::from_utf8_lossy(&output).contains(needle) {
+                let _ = seen_tx.send(());
+                reported = true;
+            }
+        }
+        output
+    });
+    (seen_rx, handle)
+}
+
+#[cfg(unix)]
+fn spawn_partial_sse_server() -> (String, mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (release_tx, release_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        let chunk = json!({
+            "choices": [{"delta": {"content": "partial fragment"}, "finish_reason": null}]
+        });
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {chunk}\n\n"
+        )
+        .unwrap();
+        stream.flush().unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+    (format!("http://{address}"), release_tx, handle)
 }
 
 #[derive(Clone)]
@@ -426,6 +543,124 @@ async fn killed_process_preserves_input_while_waiting_for_api() {
     let dialog = store.load(store.latest_id().unwrap().unwrap()).unwrap();
     assert_eq!(dialog.messages.len(), 1);
     assert_eq!(dialog.messages[0].content(), "Do not lose me");
+}
+
+// Break caught: SIGINT must drop the stream before pausing, and pre-task SIGINT must stay taskless.
+#[cfg(unix)]
+#[test]
+fn interrupt_discards_partial_work_pauses_exactly_once_and_never_synthesizes_a_task() {
+    {
+        let (base_url, release, server) = spawn_partial_sse_server();
+        let config = write_workflow_config(&base_url);
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("interrupt.sqlite3");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_deepseek-cli"))
+            .arg("--config")
+            .arg(config.path())
+            .arg("--db")
+            .arg(&database)
+            .env_remove("DEEPSEEK_API_KEY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (partial_seen, stdout_reader) =
+            observe_stdout(child.stdout.take().unwrap(), "partial fragment");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"Do not commit a partial answer\n")
+            .unwrap();
+        partial_seen
+            .recv_timeout(Duration::from_secs(5))
+            .expect("CLI should render the first streamed fragment");
+        send_sigint(&child);
+        let status = child.wait().unwrap();
+        let _ = release.send(());
+        server.join().unwrap();
+        let stdout = String::from_utf8(stdout_reader.join().unwrap()).unwrap();
+        let mut stderr = Vec::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_end(&mut stderr)
+            .unwrap();
+        assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+        assert!(stdout.contains("partial fragment"));
+        assert!(
+            stdout.contains("partial model result was discarded"),
+            "{stdout}"
+        );
+
+        let store = DialogStore::open(&database).unwrap();
+        let id = store.latest_id().unwrap().unwrap();
+        let dialog = store.load(id).unwrap();
+        assert_eq!(dialog.messages.len(), 1);
+        assert_eq!(
+            dialog.messages[0].content(),
+            "Do not commit a partial answer"
+        );
+        let task = store.load_workflow(id).unwrap().current_task.unwrap();
+        assert_eq!(task.phase, TaskPhase::Planning);
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(task.version, 1);
+        assert_eq!(task.current_stage_sequence, 1);
+        assert!(task.checkpoint.summary.is_empty());
+        assert!(store.load_pending_processing(id).unwrap().is_empty());
+        let connection = Connection::open(&database).unwrap();
+        let stages: i64 = connection
+            .query_row("SELECT count(*) FROM task_stage_runs", [], |row| row.get(0))
+            .unwrap();
+        let transitions: i64 = connection
+            .query_row("SELECT count(*) FROM task_transitions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((stages, transitions), (1, 0));
+    }
+
+    {
+        let config = write_workflow_config("http://127.0.0.1:1");
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("no-task.sqlite3");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_deepseek-cli"))
+            .arg("--config")
+            .arg(config.path())
+            .arg("--db")
+            .arg(&database)
+            .env_remove("DEEPSEEK_API_KEY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (prompt_seen, stdout_reader) = observe_stdout(child.stdout.take().unwrap(), "you> ");
+        prompt_seen
+            .recv_timeout(Duration::from_secs(5))
+            .expect("CLI should reach the first input prompt");
+        send_sigint(&child);
+        let status = child.wait().unwrap();
+        let stdout = String::from_utf8(stdout_reader.join().unwrap()).unwrap();
+        let mut stderr = Vec::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_end(&mut stderr)
+            .unwrap();
+        assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+        assert!(stdout.contains("No workflow task was created"), "{stdout}");
+        assert!(
+            DialogStore::open(&database)
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -304,6 +304,16 @@ impl TerminalUi {
         }
     }
 
+    /// Reset a response block whose owning future was cancelled and dropped.
+    pub fn finish_interrupted_response<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        if self.styled {
+            write!(writer, "{RESET}\r\n")?;
+        } else {
+            writeln!(writer)?;
+        }
+        writer.flush()
+    }
+
     pub fn start_block<'a, W: Write>(
         &self,
         writer: &'a mut W,

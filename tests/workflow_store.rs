@@ -18,7 +18,9 @@ use deepseek_cli::workflow_store::{
 use deepseek_cli::workflow_store::{
     ControllerInputCommit, FailProcessingCommit, ProcessingLeaseMode, ProcessingResult,
 };
-use deepseek_cli::workflow_store::{ProcessingStatus, ProtocolSource, WorkflowRepository};
+use deepseek_cli::workflow_store::{
+    PauseOutcome, ProcessingStatus, ProtocolSource, WorkflowRepository,
+};
 use rusqlite::Connection;
 
 // Break caught: recovery must reconstruct the accepted typed input and truncate stage history at its answer.
@@ -3385,6 +3387,141 @@ fn answer_command(version: u64) -> AnswerCommit<'static> {
             completion_tokens_details: None,
         }),
     }
+}
+
+// Break caught: an interrupt may change only activity status, version, and timestamp.
+#[test]
+fn pausing_and_human_resume_preserve_the_complete_stage_projection() {
+    let mut fixture = Fixture::new();
+    fixture
+        .connection
+        .execute_batch(
+            "UPDATE workflow_tasks SET phase='execution', status='active';
+             UPDATE task_stage_runs SET phase='execution';",
+        )
+        .unwrap();
+    let before = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let stage_count = count(&fixture.connection, "task_stage_runs");
+    let transition_count = count(&fixture.connection, "task_transitions");
+
+    let PauseOutcome::Paused(paused) = fixture.store.pause_current_task(1).unwrap() else {
+        panic!("active unfinished task must be paused");
+    };
+    let mut expected = before.clone().pause().unwrap();
+    expected.version += 1;
+    assert_eq!(paused, expected);
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        expected
+    );
+    assert_eq!(count(&fixture.connection, "task_stage_runs"), stage_count);
+    assert_eq!(
+        count(&fixture.connection, "task_transitions"),
+        transition_count
+    );
+
+    let input = human("continue");
+    let resumed = fixture
+        .store
+        .append_input(
+            InputCommit {
+                dialog_id: 1,
+                input: &input,
+                protocol_text: "continue",
+                confidence: Some(0.9),
+                expected_current_task: ExpectedCurrentTask::Present {
+                    task_id: paused.id,
+                    version: paused.version,
+                },
+            },
+            AcceptedInputEffect::ResumeSameStage,
+        )
+        .unwrap()
+        .task
+        .unwrap();
+    assert_eq!(resumed.status, TaskStatus::Active);
+    assert_eq!(resumed.id, before.id);
+    assert_eq!(resumed.current_stage_run_id, before.current_stage_run_id);
+    assert_eq!(resumed.version, before.version + 2);
+    assert_eq!(count(&fixture.connection, "task_stage_runs"), stage_count);
+}
+
+// Break caught: no-task, done, repeated, and ignored updates must never masquerade as a pause.
+#[test]
+fn pausing_returns_typed_non_mutating_outcomes_and_fences_the_update() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("empty.sqlite3");
+    let mut empty = DialogStore::open(&path).unwrap();
+    let dialog_id = empty.start_dialog("System", "legacy").unwrap();
+    assert_eq!(
+        empty.pause_current_task(dialog_id).unwrap(),
+        PauseOutcome::NoTask
+    );
+
+    let mut paused = Fixture::new();
+    let paused_before = paused.store.load_workflow(1).unwrap().current_task.unwrap();
+    assert_eq!(
+        paused.store.pause_current_task(1).unwrap(),
+        PauseOutcome::AlreadyPaused
+    );
+    assert_eq!(
+        paused.store.load_workflow(1).unwrap().current_task.unwrap(),
+        paused_before
+    );
+
+    let mut done = Fixture::new();
+    done.connection
+        .execute_batch(
+            "UPDATE workflow_tasks SET phase='done', status='active';
+             UPDATE task_stage_runs SET phase='done';",
+        )
+        .unwrap();
+    let done_before = done.store.load_workflow(1).unwrap().current_task.unwrap();
+    assert_eq!(
+        done.store.pause_current_task(1).unwrap(),
+        PauseOutcome::AlreadyDone
+    );
+    assert_eq!(
+        done.store.load_workflow(1).unwrap().current_task.unwrap(),
+        done_before
+    );
+
+    let mut ignored = Fixture::new();
+    ignored
+        .connection
+        .execute("UPDATE workflow_tasks SET status='active'", [])
+        .unwrap();
+    ignored
+        .connection
+        .execute_batch(
+            "CREATE TRIGGER ignore_pause BEFORE UPDATE ON workflow_tasks
+             WHEN NEW.status='paused' BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .unwrap();
+    assert!(matches!(
+        ignored.store.pause_current_task(1),
+        Err(StoreError::WorkflowConflict(1))
+    ));
+    let unchanged = ignored
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(
+        (unchanged.status, unchanged.version),
+        (TaskStatus::Active, 3)
+    );
 }
 
 #[test]
