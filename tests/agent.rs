@@ -3,7 +3,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use deepseek_cli::agent::{Agent, AgentError, AgentEvent};
-use deepseek_cli::client::ClientError;
+use deepseek_cli::client::{ClientError, DeepSeekClient};
 use deepseek_cli::config::Config;
 use deepseek_cli::dialog::DialogStore;
 use deepseek_cli::memory::{DurableMemoryScope, RequestScope};
@@ -70,6 +70,35 @@ fn injected_models(service: &Arc<AgentWorkflowModel>) -> WorkflowModels {
 
 fn await_check(version: u64) -> String {
     json!({"patch":{"expected_version":version,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},"decision":{"type":"await_user"}}).to_string()
+}
+
+// Break caught: the workflow diagnostic sink is held across awaits, so its
+// trait-object bounds must not make otherwise Send public Agent futures local.
+#[test]
+fn public_agent_workflow_futures_remain_send() {
+    fn assert_send<T: Send>(_: T) {}
+
+    let config = Config::from_toml(
+        "api_key='test-key'\nbase_url='http://127.0.0.1:9'\n[workflow]\n[context]\nstrategy='summary'",
+        None,
+    )
+    .unwrap();
+    let client = DeepSeekClient::new(&config).unwrap();
+
+    let mut agent = Agent::from_client(client.clone(), "BASE");
+    assert_send(agent.run_with_prompt("test"));
+
+    let mut agent = Agent::from_client(client.clone(), "BASE");
+    assert_send(agent.run_streaming("test", |_| Ok(())));
+
+    let mut agent = Agent::from_client(client.clone(), "BASE");
+    assert_send(agent.run_workflow_streaming("test", |_| Ok(())));
+
+    let mut agent = Agent::from_client(client.clone(), "BASE");
+    assert_send(agent.recover_workflow_processing());
+
+    let mut agent = Agent::from_client(client, "BASE");
+    assert_send(agent.recover_workflow_processing_streaming(|_| Ok(())));
 }
 
 // Break caught: status must observe the committed snapshot plus the newest

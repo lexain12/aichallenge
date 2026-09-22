@@ -306,6 +306,7 @@ impl Agent {
                     {
                         warnings.push(error);
                     }
+                    debug_log.payloads_enabled()
                 };
                 engine
                     .with_diagnostics(&mut log_diagnostic, capture_payloads)
@@ -408,6 +409,7 @@ impl Agent {
                     {
                         warnings.push(error);
                     }
+                    debug_log.payloads_enabled()
                 };
                 engine
                     .with_diagnostics(&mut log_diagnostic, capture_payloads)

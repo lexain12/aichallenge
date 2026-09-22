@@ -903,8 +903,15 @@ pub struct WorkflowEngine<'a> {
 }
 
 struct WorkflowDiagnostics<'a> {
-    emit: &'a mut dyn FnMut(WorkflowDebugEvent),
+    emit: &'a mut (dyn FnMut(WorkflowDebugEvent) -> bool + Send),
     capture_payloads: bool,
+}
+
+impl WorkflowDiagnostics<'_> {
+    fn emit(&mut self, event: WorkflowDebugEvent) {
+        let payloads_still_enabled = (self.emit)(event);
+        self.capture_payloads &= payloads_still_enabled;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1004,7 +1011,7 @@ impl<'a> WorkflowEngine<'a> {
 
     pub fn with_diagnostics(
         mut self,
-        emit: &'a mut dyn FnMut(WorkflowDebugEvent),
+        emit: &'a mut (dyn FnMut(WorkflowDebugEvent) -> bool + Send),
         capture_payloads: bool,
     ) -> Self {
         self.diagnostics = Some(WorkflowDiagnostics {
@@ -1046,7 +1053,7 @@ impl<'a> WorkflowEngine<'a> {
         payload: Option<WorkflowDebugPayload>,
     ) {
         if let Some(diagnostics) = self.diagnostics.as_mut() {
-            (diagnostics.emit)(WorkflowDebugEvent { metadata, payload });
+            diagnostics.emit(WorkflowDebugEvent { metadata, payload });
         }
     }
 
@@ -2848,7 +2855,7 @@ fn record_handoff_diagnostic(
         ),
         stage_message_count,
     );
-    (diagnostics.emit)(WorkflowDebugEvent { metadata, payload });
+    diagnostics.emit(WorkflowDebugEvent { metadata, payload });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2960,10 +2967,167 @@ impl WorkflowEngineError {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::debug_log::DebugLog;
     use crate::workflow_model::DeepSeekCompletionModel;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct FailingWriter {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl io::Write for FailingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("injected debug write failure"))
+        }
+    }
+
+    struct PayloadCaptureSpy {
+        observed: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    impl ResponseChecker for PayloadCaptureSpy {
+        fn name(&self) -> &str {
+            "payload-capture-spy"
+        }
+
+        fn mode(&self) -> CheckerMode {
+            CheckerMode::Advisory
+        }
+
+        fn check<'b>(
+            &'b self,
+            _context: &'b CheckContext,
+            _response: &'b str,
+        ) -> crate::workflow_model::CheckFuture<'b> {
+            panic!("observed checker entry point must carry payload eligibility")
+        }
+
+        fn check_observed<'b>(
+            &'b self,
+            context: &'b CheckContext,
+            _response: &'b str,
+            capture_payloads: bool,
+        ) -> crate::workflow_model::CheckFuture<'b> {
+            self.observed.lock().unwrap().push(capture_payloads);
+            Box::pin(async move {
+                Ok(crate::workflow_model::ContinuationCheckResult {
+                    patch: empty_patch(context.task.version),
+                    decision: ControllerDecision::AwaitUser,
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                        completion_tokens_details: None,
+                    }),
+                    raw_output: capture_payloads.then(|| "CHECKER_RAW".into()),
+                    output_chars: 11,
+                })
+            })
+        }
+    }
+
+    // Break caught: an early debug write failure must disable raw capture at
+    // later provider boundaries, not merely prevent the payload from reaching
+    // a file after it has already been cloned or serialized.
+    #[tokio::test]
+    async fn diagnostic_write_failure_disables_later_payload_construction() {
+        let server = MockServer::start().await;
+        let usage = TokenUsage {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 3,
+            completion_tokens_details: None,
+        };
+        let chunk = json!({
+            "choices":[{"delta":{"content":"ordinary answer"},"finish_reason":"stop"}],
+            "usage": usage
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+            )
+            .mount(&server)
+            .await;
+        let config = Config::from_toml(
+            &format!(
+                "api_key='test-key'\nbase_url='{}'\n[workflow]\n[context]\nstrategy='summary'",
+                server.uri()
+            ),
+            None,
+        )
+        .unwrap();
+        let client = DeepSeekClient::new(&config).unwrap();
+        let model =
+            Arc::new(DeepSeekCompletionModel::new(client.clone(), "service".into()).unwrap());
+        let models = WorkflowModels {
+            interpreter: model.clone(),
+            checker: model.clone(),
+            handoff: model,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = DialogStore::open(&directory.path().join("dynamic-log.sqlite3")).unwrap();
+        let mut dialog_id = None;
+        let mut scope = RequestScope::default();
+        let mut history = ChatHistory::new("BASE".into());
+        let mut last_usage = None;
+        let write_attempts = Arc::new(AtomicUsize::new(0));
+        let mut debug_log = DebugLog::from_writer_for_test(
+            FailingWriter {
+                attempts: write_attempts.clone(),
+            },
+            true,
+            "test-key",
+        );
+        let initially_enabled = debug_log.payloads_enabled();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pipeline = ResponsePipeline::new(vec![Arc::new(PayloadCaptureSpy {
+            observed: observed.clone(),
+        })])
+        .unwrap();
+        let mut warnings = Vec::new();
+        let mut log_diagnostic = |event: WorkflowDebugEvent| {
+            if let Some(warning) = debug_log.log_workflow(&event.metadata, event.payload.as_ref()) {
+                warnings.push(warning);
+            }
+            debug_log.payloads_enabled()
+        };
+
+        let result = WorkflowEngine::new(
+            &client,
+            config.context(),
+            config.workflow(),
+            &models,
+            WorkflowSession {
+                store: &mut store,
+                dialog_id: &mut dialog_id,
+                scope: &mut scope,
+                history: &mut history,
+                last_usage: &mut last_usage,
+            },
+        )
+        .with_pipeline(pipeline)
+        .with_diagnostics(&mut log_diagnostic, initially_enabled)
+        .run_human_input("start task", |_| Ok(()))
+        .await
+        .unwrap();
+
+        assert_eq!(result.stop_reason, AutonomyStopReason::AwaitUser);
+        assert_eq!(write_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(*observed.lock().unwrap(), [false]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("debug log disabled"));
+    }
 
     // Facts failure aborts the turn, so inspect the actual budget at this private boundary.
     #[tokio::test]

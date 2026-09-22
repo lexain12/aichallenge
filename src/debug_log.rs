@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -84,7 +84,7 @@ pub struct WorkflowDebugEvent {
 }
 
 pub struct DebugLog {
-    writer: Option<BufWriter<File>>,
+    writer: Option<BufWriter<Box<dyn Write + Send>>>,
     log_payloads: bool,
     api_key: String,
     pending_warning: Option<String>,
@@ -103,7 +103,10 @@ impl DebugLog {
         let (writer, pending_warning) = match path {
             None => (None, None),
             Some(path) => match OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(file) => (Some(BufWriter::new(file)), None),
+                Ok(file) => (
+                    Some(BufWriter::new(Box::new(file) as Box<dyn Write + Send>)),
+                    None,
+                ),
                 Err(error) => (
                     None,
                     Some(format!(
@@ -127,6 +130,20 @@ impl DebugLog {
             config.log_payloads(),
             api_key,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_writer_for_test(
+        writer: impl Write + Send + 'static,
+        log_payloads: bool,
+        api_key: &str,
+    ) -> Self {
+        Self {
+            writer: Some(BufWriter::new(Box::new(writer))),
+            log_payloads,
+            api_key: api_key.to_owned(),
+            pending_warning: None,
+        }
     }
 
     pub fn log_request(
