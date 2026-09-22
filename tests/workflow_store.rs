@@ -15,7 +15,9 @@ use deepseek_cli::workflow_store::UnmanagedAnswerCommit;
 use deepseek_cli::workflow_store::{
     AcceptedInputEffect, AnswerCommit, ExpectedCurrentTask, InputCommit,
 };
-use deepseek_cli::workflow_store::{ControllerInputCommit, ProcessingLeaseMode, ProcessingResult};
+use deepseek_cli::workflow_store::{
+    ControllerInputCommit, FailProcessingCommit, ProcessingLeaseMode, ProcessingResult,
+};
 use deepseek_cli::workflow_store::{ProcessingStatus, ProtocolSource, WorkflowRepository};
 use rusqlite::Connection;
 
@@ -619,6 +621,7 @@ fn transition_command<'a>(
         accepted_patch: None,
         handoff,
         processing_id: None,
+        processing_attempt: None,
     }
 }
 
@@ -1059,6 +1062,7 @@ fn workflow_branch_deep_copies_history_provenance_processing_and_replay_ids() {
     let payload = handoff();
     let mut command = transition_command(&source, &input, &auth, &payload);
     command.processing_id = Some(processing);
+    command.processing_attempt = Some(1);
     let original = fixture.store.commit_stage_change(command).unwrap();
     let context = r#"{"summary":{"content":"branch summary","covered_message_count":1},"compaction_usage":{"call_count":1,"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,"missing_usage_count":0}}"#;
     fixture
@@ -1152,6 +1156,7 @@ fn workflow_branch_deep_copies_history_provenance_processing_and_replay_ids() {
     }
     let mut replay = transition_command(&copy_source, &copy_input, &auth, &payload);
     replay.processing_id = Some(copied_processing);
+    replay.processing_attempt = Some(1);
     assert_eq!(
         fixture
             .store
@@ -1543,6 +1548,7 @@ fn controller_transition_failure_preserves_leased_answer_patch_and_source() {
         let mut command = transition_command(&source, &input, &auth, &payload);
         command.accepted_patch = Some(&patch);
         command.processing_id = Some(processing);
+        command.processing_attempt = Some(1);
         assert!(fixture.store.commit_stage_change(command).is_err());
         assert_eq!(
             fixture
@@ -1603,6 +1609,7 @@ fn controller_transition_rejects_forged_provenance_and_stale_processing() {
         } else {
             Some(processing)
         };
+        command.processing_attempt = Some(1);
         if corruption == 4 {
             command.confidence = Some(f32::NAN);
         }
@@ -1676,6 +1683,7 @@ fn branch_remaps_same_stage_controller_result_and_pending_processing_independent
             copy.id,
             copy.current_stage_run_id,
             4,
+            1,
             &patch(4),
         )
         .unwrap();
@@ -1743,6 +1751,7 @@ fn patch_and_transition_increment_version_once_and_complete_processing() {
     let payload = handoff();
     let mut command = transition_command(&source, &input, &auth, &payload);
     command.processing_id = Some(processing);
+    command.processing_attempt = Some(1);
     command.accepted_patch = Some(&patch);
     let result = fixture.store.commit_stage_change(command).unwrap();
     assert_eq!(
@@ -1775,6 +1784,7 @@ fn patch_and_transition_increment_version_once_and_complete_processing() {
     );
     let mut command = transition_command(&source, &input, &auth, &payload);
     command.processing_id = Some(processing);
+    command.processing_attempt = Some(1);
     command.accepted_patch = Some(&patch);
     assert_eq!(fixture.store.commit_stage_change(command).unwrap(), result);
     assert_eq!(count(&fixture.connection, "task_transitions"), 1);
@@ -1800,9 +1810,14 @@ fn stale_patch_is_a_workflow_conflict_without_completing_processing() {
         .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
         .unwrap();
     assert!(matches!(
-        fixture
-            .store
-            .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, &patch(2)),
+        fixture.store.commit_await_user(
+            processing,
+            WorkflowTaskId(1),
+            StageRunId(1),
+            3,
+            1,
+            &patch(2)
+        ),
         Err(StoreError::WorkflowConflict(1))
     ));
     assert_eq!(
@@ -1881,12 +1896,523 @@ fn controller_command<'a>(
         stage_run_id: StageRunId(1),
         expected_version: 3,
         checker: "continuation",
+        expected_attempt: 1,
         model: "checker-model",
         triggering_assistant_message_id: assistant,
         instruction: "Do next",
         intent,
         confidence: 0.9,
         accepted_patch: patch,
+    }
+}
+
+fn failure_command(
+    processing: i64,
+    assistant: i64,
+    expected_attempt: u32,
+    diagnostic: &str,
+) -> FailProcessingCommit<'_> {
+    FailProcessingCommit {
+        processing_id: processing,
+        dialog_id: 1,
+        task_id: WorkflowTaskId(1),
+        stage_run_id: StageRunId(1),
+        expected_version: 3,
+        expected_attempt,
+        triggering_assistant_message_id: assistant,
+        checker: "continuation",
+        diagnostic,
+    }
+}
+
+fn processing_record(
+    connection: &Connection,
+    processing: i64,
+) -> (String, u32, Option<String>, Option<String>) {
+    connection
+        .query_row(
+            "SELECT status,attempts,last_error,result_json FROM response_processing WHERE id=?1",
+            [processing],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+}
+
+// Break caught: an attempt-one checker must not complete a job already leased by attempt two.
+#[test]
+fn recovered_lease_fences_stale_await_user_completion() {
+    let (mut fixture, processing, _) = pending_fixture();
+    let first = fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap()
+        .unwrap();
+    let second = fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Recovery)
+        .unwrap()
+        .unwrap();
+    assert_eq!((first.attempts, second.attempts), (1, 2));
+    assert!(
+        fixture
+            .store
+            .commit_await_user(
+                processing,
+                WorkflowTaskId(1),
+                StageRunId(1),
+                3,
+                1,
+                &patch(3)
+            )
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap()
+            .version,
+        3
+    );
+    assert_eq!(
+        processing_record(&fixture.connection, processing),
+        ("processing".into(), 2, None, None)
+    );
+    let result = fixture
+        .store
+        .commit_await_user(
+            processing,
+            WorkflowTaskId(1),
+            StageRunId(1),
+            3,
+            second.attempts,
+            &patch(3),
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .commit_await_user(
+                processing,
+                WorkflowTaskId(1),
+                StageRunId(1),
+                3,
+                first.attempts,
+                &patch(3)
+            )
+            .unwrap(),
+        result
+    );
+}
+
+// Break caught: a recovered processing lease must fence stale controller continuation effects.
+#[test]
+fn recovered_lease_fences_stale_controller_completion() {
+    let (mut fixture, processing, assistant) = pending_fixture();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Recovery)
+        .unwrap();
+    let intent = WorkflowIntent::human_continue("Do next").unwrap();
+    assert!(
+        fixture
+            .store
+            .commit_controller_decision(controller_command(
+                processing,
+                assistant,
+                &intent,
+                &patch(3)
+            ))
+            .is_err()
+    );
+    assert_eq!(count(&fixture.connection, "messages"), 2);
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap()
+            .version,
+        3
+    );
+    assert_eq!(
+        processing_record(&fixture.connection, processing),
+        ("processing".into(), 2, None, None)
+    );
+    let patch = patch(3);
+    let mut current = controller_command(processing, assistant, &intent, &patch);
+    current.expected_attempt = 2;
+    let result = fixture.store.commit_controller_decision(current).unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .commit_controller_decision(controller_command(processing, assistant, &intent, &patch))
+            .unwrap(),
+        result
+    );
+}
+
+// Break caught: a recovered processing lease must fence stale controller stage transitions.
+#[test]
+fn recovered_lease_fences_stale_controller_transition() {
+    let (mut fixture, processing, assistant) = pending_fixture();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Recovery)
+        .unwrap();
+    let source = fixture
+        .store
+        .load_workflow(1)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let mut input = transition_input(TransitionEvent::PlanningCompleted);
+    input.source = WorkflowInputSource::Controller {
+        checker: "continuation".into(),
+        model: "checker-model".into(),
+        triggering_assistant_message_id: assistant,
+    };
+    let auth = authorize(&source, &input, None);
+    let payload = handoff();
+    let mut command = transition_command(&source, &input, &auth, &payload);
+    command.processing_id = Some(processing);
+    command.processing_attempt = Some(1);
+    assert!(fixture.store.commit_stage_change(command).is_err());
+    assert_eq!(count(&fixture.connection, "messages"), 2);
+    assert_eq!(count(&fixture.connection, "task_transitions"), 0);
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        source
+    );
+    assert_eq!(
+        processing_record(&fixture.connection, processing),
+        ("processing".into(), 2, None, None)
+    );
+    let mut current = transition_command(&source, &input, &auth, &payload);
+    current.processing_id = Some(processing);
+    current.processing_attempt = Some(2);
+    let result = fixture.store.commit_stage_change(current).unwrap();
+    let mut replay = transition_command(&source, &input, &auth, &payload);
+    replay.processing_id = Some(processing);
+    replay.processing_attempt = Some(1);
+    assert_eq!(fixture.store.commit_stage_change(replay).unwrap(), result);
+}
+
+// Break caught: failure commands must bind every origin field, including the exact lease attempt.
+#[test]
+fn failure_rejects_forged_origin_and_stale_attempt_without_mutation() {
+    for mismatch in [
+        "processing",
+        "dialog",
+        "task",
+        "stage",
+        "version",
+        "assistant",
+        "checker",
+        "attempt",
+        "recovered",
+    ] {
+        let (mut fixture, processing, assistant) = pending_fixture();
+        fixture
+            .store
+            .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+            .unwrap();
+        if mismatch == "recovered" {
+            fixture
+                .store
+                .lease_processing(processing, 3, ProcessingLeaseMode::Recovery)
+                .unwrap();
+        }
+        let before = processing_record(&fixture.connection, processing);
+        let mut command = failure_command(processing, assistant, 1, "checker rejected");
+        match mismatch {
+            "processing" => command.processing_id += 100,
+            "dialog" => command.dialog_id += 1,
+            "task" => command.task_id = WorkflowTaskId(2),
+            "stage" => command.stage_run_id = StageRunId(2),
+            "version" => command.expected_version += 1,
+            "assistant" => command.triggering_assistant_message_id = 1,
+            "checker" => command.checker = "other checker",
+            "attempt" => command.expected_attempt = 0,
+            "recovered" => {}
+            _ => unreachable!(),
+        }
+        assert!(
+            fixture.store.fail_processing(command).is_err(),
+            "{mismatch}"
+        );
+        assert_eq!(
+            processing_record(&fixture.connection, processing),
+            before,
+            "{mismatch}"
+        );
+        assert_eq!(count(&fixture.connection, "messages"), 2);
+        assert_eq!(
+            fixture
+                .store
+                .load_workflow(1)
+                .unwrap()
+                .current_task
+                .unwrap()
+                .version,
+            3
+        );
+    }
+}
+
+// Break caught: a matching command cannot bypass durable assistant ownership or current-stage checks.
+#[test]
+fn failure_rejects_corrupt_assistant_ownership_and_stale_state() {
+    for mutation in [
+        "UPDATE messages SET role='user' WHERE role='assistant'",
+        "UPDATE messages SET dialog_id=2 WHERE role='assistant'",
+        "DELETE FROM message_task_stages WHERE message_id=(SELECT assistant_message_id FROM response_processing)",
+        "UPDATE message_task_stages SET workflow_task_id=2 WHERE message_id=(SELECT assistant_message_id FROM response_processing)",
+        "UPDATE message_task_stages SET stage_run_id=2 WHERE message_id=(SELECT assistant_message_id FROM response_processing)",
+        "UPDATE workflow_tasks SET version=4 WHERE id=1",
+        "UPDATE workflow_tasks SET status='paused' WHERE id=1",
+        "UPDATE task_stage_runs SET finished_at='9999-01-01' WHERE id=1",
+    ] {
+        let (mut fixture, processing, assistant) = pending_fixture();
+        fixture
+            .store
+            .start_dialog_with_workflow_task(&RequestScope::default(), "system", "unrelated task")
+            .unwrap();
+        fixture
+            .store
+            .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+            .unwrap();
+        fixture.connection.execute_batch(mutation).unwrap();
+        let before = processing_record(&fixture.connection, processing);
+        assert!(
+            fixture
+                .store
+                .fail_processing(failure_command(
+                    processing,
+                    assistant,
+                    1,
+                    "checker rejected"
+                ))
+                .is_err(),
+            "{mutation}"
+        );
+        assert_eq!(
+            processing_record(&fixture.connection, processing),
+            before,
+            "{mutation}"
+        );
+        assert_eq!(count(&fixture.connection, "messages"), 3);
+    }
+}
+
+// Break caught: a completed AwaitUser result must not authenticate a different checker patch.
+#[test]
+fn await_user_replay_rejects_a_different_patch() {
+    let (mut fixture, processing, _) = pending_fixture();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    fixture
+        .store
+        .commit_await_user(
+            processing,
+            WorkflowTaskId(1),
+            StageRunId(1),
+            3,
+            1,
+            &patch(3),
+        )
+        .unwrap();
+    let mut changed = patch(3);
+    changed.expected_action = Some("different accepted action".into());
+    assert!(
+        fixture
+            .store
+            .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, 1, &changed)
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(1)
+            .unwrap()
+            .current_task
+            .unwrap()
+            .expected_action
+            .as_deref(),
+        Some("Next action")
+    );
+}
+
+// Break caught: the immutable AwaitUser patch binding must survive branch copying unchanged.
+#[test]
+fn await_user_branch_preserves_exact_patch_replay_identity() {
+    let (mut fixture, processing, _) = pending_fixture();
+    fixture
+        .store
+        .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+        .unwrap();
+    let accepted = patch(3);
+    let result = fixture
+        .store
+        .commit_await_user(
+            processing,
+            WorkflowTaskId(1),
+            StageRunId(1),
+            3,
+            1,
+            &accepted,
+        )
+        .unwrap();
+    let ProcessingResult::AwaitUser {
+        patch_fingerprint, ..
+    } = &result
+    else {
+        panic!("not AwaitUser")
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(patch_fingerprint).unwrap(),
+        serde_json::json!({
+            "expected_version":3,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],
+            "current_step_id":null,"expected_action":"Next action","checkpoint":null,
+        })
+    );
+    let branch = fixture.store.fork_dialog(1, 2).unwrap().new_dialog_id;
+    let task = fixture
+        .store
+        .load_workflow(branch)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let (copy_processing, copied_json): (i64, String) = fixture.connection.query_row("SELECT p.id,p.result_json FROM response_processing p JOIN messages m ON m.id=p.assistant_message_id WHERE m.dialog_id=?1", [branch], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_ne!(copy_processing, processing);
+    assert_eq!(
+        serde_json::from_str::<ProcessingResult>(&copied_json).unwrap(),
+        result
+    );
+    assert_eq!(
+        fixture
+            .store
+            .commit_await_user(
+                copy_processing,
+                task.id,
+                task.current_stage_run_id,
+                3,
+                1,
+                &accepted
+            )
+            .unwrap(),
+        result
+    );
+    let mut changed = accepted;
+    changed.checkpoint = Some(deepseek_cli::workflow::StageCheckpoint {
+        summary: "different replay patch".into(),
+        decisions: vec![],
+        open_issues: vec![],
+    });
+    assert!(
+        fixture
+            .store
+            .commit_await_user(
+                copy_processing,
+                task.id,
+                task.current_stage_run_id,
+                3,
+                1,
+                &changed
+            )
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .load_workflow(branch)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        task
+    );
+}
+
+// Break caught: legacy or corrupt completion JSON must never authorize unbound patch replay.
+#[test]
+fn await_user_replay_rejects_missing_or_invalid_patch_binding() {
+    for binding in [None, Some("{}"), Some("not JSON")] {
+        let (mut fixture, processing, _) = pending_fixture();
+        fixture
+            .store
+            .lease_processing(processing, 3, ProcessingLeaseMode::Normal)
+            .unwrap();
+        fixture
+            .store
+            .commit_await_user(
+                processing,
+                WorkflowTaskId(1),
+                StageRunId(1),
+                3,
+                1,
+                &patch(3),
+            )
+            .unwrap();
+        let (_, _, _, raw) = processing_record(&fixture.connection, processing);
+        let mut raw: serde_json::Value = serde_json::from_str(&raw.unwrap()).unwrap();
+        match binding {
+            Some(value) => {
+                raw["patch_fingerprint"] = value.into();
+            }
+            None => {
+                raw.as_object_mut().unwrap().remove("patch_fingerprint");
+            }
+        }
+        fixture
+            .connection
+            .execute(
+                "UPDATE response_processing SET result_json=?1 WHERE id=?2",
+                rusqlite::params![raw.to_string(), processing],
+            )
+            .unwrap();
+        let before = processing_record(&fixture.connection, processing);
+        assert!(
+            fixture
+                .store
+                .commit_await_user(
+                    processing,
+                    WorkflowTaskId(1),
+                    StageRunId(1),
+                    3,
+                    1,
+                    &patch(3)
+                )
+                .is_err()
+        );
+        assert_eq!(processing_record(&fixture.connection, processing), before);
+        assert_eq!(
+            fixture
+                .store
+                .load_workflow(1)
+                .unwrap()
+                .current_task
+                .unwrap()
+                .version,
+            4
+        );
     }
 }
 
@@ -1933,7 +2459,12 @@ fn leases_distinguish_normal_processing_from_crash_recovery_and_bound_attempts()
             .is_none()
     );
     other
-        .fail_processing(processing, 3, "checker unavailable")
+        .fail_processing(failure_command(
+            processing,
+            assistant,
+            2,
+            "checker unavailable",
+        ))
         .unwrap();
     assert!(
         fixture
@@ -1956,11 +2487,11 @@ fn leases_distinguish_normal_processing_from_crash_recovery_and_bound_attempts()
 
 #[test]
 fn failure_preserves_answer_and_task_and_allows_one_retry() {
-    let (mut fixture, processing, _) = pending_fixture();
+    let (mut fixture, processing, assistant) = pending_fixture();
     assert!(
         fixture
             .store
-            .fail_processing(processing, 3, "error")
+            .fail_processing(failure_command(processing, assistant, 1, "error"))
             .is_err()
     );
     fixture
@@ -1971,13 +2502,18 @@ fn failure_preserves_answer_and_task_and_allows_one_retry() {
         assert!(
             fixture
                 .store
-                .fail_processing(processing, 3, &invalid)
+                .fail_processing(failure_command(processing, assistant, 1, &invalid))
                 .is_err()
         );
     }
     fixture
         .store
-        .fail_processing(processing, 3, "checker unavailable")
+        .fail_processing(failure_command(
+            processing,
+            assistant,
+            1,
+            "checker unavailable",
+        ))
         .unwrap();
     let pending = fixture.store.load_pending_processing(1).unwrap();
     assert_eq!(pending[0].status, ProcessingStatus::Failed);
@@ -2009,12 +2545,12 @@ fn failure_preserves_answer_and_task_and_allows_one_retry() {
 
 #[test]
 fn await_user_validates_patch_and_completes_idempotently() {
-    let (mut fixture, processing, _) = pending_fixture();
+    let (mut fixture, processing, assistant) = pending_fixture();
     let mut patch = patch(3);
     assert!(
         fixture
             .store
-            .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, &patch)
+            .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, 1, &patch)
             .is_err()
     );
     fixture
@@ -2029,32 +2565,34 @@ fn await_user_validates_patch_and_completes_idempotently() {
     assert!(
         fixture
             .store
-            .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, &patch)
+            .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, 1, &patch)
             .is_err()
     );
     patch.step_updates.clear();
     let result = fixture
         .store
-        .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, &patch)
+        .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, 1, &patch)
         .unwrap();
-    assert_eq!(result, ProcessingResult::AwaitUser { task_version: 4 });
+    assert!(
+        matches!(&result, ProcessingResult::AwaitUser { task_version: 4, patch_fingerprint } if !patch_fingerprint.is_empty())
+    );
     assert_eq!(
         fixture
             .store
-            .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, &patch)
+            .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, 1, &patch)
             .unwrap(),
         result
     );
     assert!(
         fixture
             .store
-            .commit_await_user(processing, WorkflowTaskId(2), StageRunId(1), 3, &patch)
+            .commit_await_user(processing, WorkflowTaskId(2), StageRunId(1), 3, 1, &patch)
             .is_err()
     );
     assert!(
         fixture
             .store
-            .fail_processing(processing, 3, "late failure")
+            .fail_processing(failure_command(processing, assistant, 1, "late failure"))
             .is_err()
     );
     assert!(
@@ -2096,7 +2634,14 @@ fn await_user_empty_patch_preserves_version_and_failure_rolls_back_patch() {
     assert!(
         fixture
             .store
-            .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, &patch(3))
+            .commit_await_user(
+                processing,
+                WorkflowTaskId(1),
+                StageRunId(1),
+                3,
+                1,
+                &patch(3)
+            )
             .is_err()
     );
     assert_eq!(
@@ -2115,13 +2660,16 @@ fn await_user_empty_patch_preserves_version_and_failure_rolls_back_patch() {
         .unwrap();
     let mut patch = patch(3);
     patch.expected_action = None;
-    assert_eq!(
+    assert!(matches!(
         fixture
             .store
-            .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, &patch)
+            .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, 1, &patch)
             .unwrap(),
-        ProcessingResult::AwaitUser { task_version: 3 }
-    );
+        ProcessingResult::AwaitUser {
+            task_version: 3,
+            ..
+        }
+    ));
     assert_eq!(
         fixture
             .store
@@ -2150,7 +2698,14 @@ fn stale_processing_and_closed_or_paused_stages_cannot_apply_effects() {
         assert!(
             fixture
                 .store
-                .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, &patch(3))
+                .commit_await_user(
+                    processing,
+                    WorkflowTaskId(1),
+                    StageRunId(1),
+                    3,
+                    1,
+                    &patch(3)
+                )
                 .is_err()
         );
         assert!(
@@ -2229,7 +2784,7 @@ fn controller_completion_is_hidden_atomic_idempotent_and_single_version_incremen
         assert!(
             fixture
                 .store
-                .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, &patch)
+                .commit_await_user(processing, WorkflowTaskId(1), StageRunId(1), 3, 1, &patch)
                 .is_err()
         );
         let mut changed = controller_command(processing, assistant, &intent, &patch);

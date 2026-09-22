@@ -286,6 +286,7 @@ async fn restored_managed_dialog_with_hidden_controller_input_can_branch() {
     store
         .commit_controller_decision(ControllerInputCommit {
             processing_id: processing.id,
+            expected_attempt: 1,
             task_id: task.id,
             stage_run_id: task.current_stage_run_id,
             expected_version: task.version,

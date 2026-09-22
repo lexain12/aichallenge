@@ -62,19 +62,14 @@ pub trait WorkflowRepository {
         task_id: WorkflowTaskId,
         stage_run_id: StageRunId,
         expected_version: u64,
+        expected_attempt: u32,
         patch: &TaskStatePatch,
     ) -> Result<ProcessingResult, StoreError>;
     fn commit_controller_decision(
         &mut self,
         command: ControllerInputCommit<'_>,
     ) -> Result<ProcessingResult, StoreError>;
-    /// `sanitized_error` must be a safe diagnostic, never a raw provider response or payload.
-    fn fail_processing(
-        &mut self,
-        processing_id: i64,
-        expected_version: u64,
-        sanitized_error: &str,
-    ) -> Result<(), StoreError>;
+    fn fail_processing(&mut self, command: FailProcessingCommit<'_>) -> Result<(), StoreError>;
     fn append_input(
         &mut self,
         command: InputCommit<'_>,
@@ -125,6 +120,7 @@ pub struct TransitionCommit<'a> {
     pub accepted_patch: Option<&'a TaskStatePatch>,
     pub handoff: &'a HandoffPayload,
     pub processing_id: Option<i64>,
+    pub processing_attempt: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -236,6 +232,7 @@ pub enum ProcessingResult {
     },
     AwaitUser {
         task_version: u64,
+        patch_fingerprint: String,
     },
     ControllerInput {
         message_id: i64,
@@ -249,6 +246,7 @@ pub struct ControllerInputCommit<'a> {
     pub task_id: WorkflowTaskId,
     pub stage_run_id: StageRunId,
     pub expected_version: u64,
+    pub expected_attempt: u32,
     pub checker: &'a str,
     pub model: &'a str,
     pub triggering_assistant_message_id: i64,
@@ -256,6 +254,19 @@ pub struct ControllerInputCommit<'a> {
     pub intent: &'a WorkflowIntent,
     pub confidence: f32,
     pub accepted_patch: &'a TaskStatePatch,
+}
+
+pub struct FailProcessingCommit<'a> {
+    pub processing_id: i64,
+    pub dialog_id: i64,
+    pub task_id: WorkflowTaskId,
+    pub stage_run_id: StageRunId,
+    pub expected_version: u64,
+    pub expected_attempt: u32,
+    pub triggering_assistant_message_id: i64,
+    pub checker: &'a str,
+    /// A safe diagnostic category, never a raw provider response or payload.
+    pub diagnostic: &'a str,
 }
 
 #[derive(Clone, Debug)]
@@ -444,6 +455,7 @@ impl WorkflowRepository for DialogStore {
         task_id: WorkflowTaskId,
         stage_run_id: StageRunId,
         expected_version: u64,
+        expected_attempt: u32,
         patch: &TaskStatePatch,
     ) -> Result<ProcessingResult, StoreError> {
         let tx = self
@@ -454,13 +466,15 @@ impl WorkflowRepository for DialogStore {
         if patch.expected_version != expected_version {
             return Err(StoreError::WorkflowConflict(processing.dialog_id));
         }
+        let patch_fingerprint = serde_json::to_string(patch)?;
         if let Some(result) = processing.completed_result()? {
-            if !matches!(result, ProcessingResult::AwaitUser { .. }) {
+            if !matches!(&result, ProcessingResult::AwaitUser { patch_fingerprint: stored, .. } if stored == &patch_fingerprint)
+            {
                 return Err(StoreError::WorkflowConflict(processing.dialog_id));
             }
             return Ok(result);
         }
-        processing.require_leased()?;
+        processing.require_leased(expected_attempt)?;
         let task = processing.current_task(&tx)?;
         let projected = task
             .apply_patch(patch, PatchContext::Normal)
@@ -469,8 +483,9 @@ impl WorkflowRepository for DialogStore {
             .map_err(|error| workflow_conflict(error, task.dialog_id))?;
         let result = ProcessingResult::AwaitUser {
             task_version: projected.version,
+            patch_fingerprint,
         };
-        complete_processing(&tx, &processing, &result)?;
+        complete_processing(&tx, &processing, expected_attempt, &result)?;
         tx.commit()?;
         Ok(result)
     }
@@ -489,32 +504,34 @@ impl WorkflowRepository for DialogStore {
         Ok(result)
     }
 
-    fn fail_processing(
-        &mut self,
-        processing_id: i64,
-        expected_version: u64,
-        sanitized_error: &str,
-    ) -> Result<(), StoreError> {
+    fn fail_processing(&mut self, command: FailProcessingCommit<'_>) -> Result<(), StoreError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_protocol_text(sanitized_error)?;
-        let processing = processing_row(&tx, processing_id)?;
+        validate_protocol_text(command.diagnostic)?;
+        let processing = processing_row(&tx, command.processing_id)?;
         processing.check_identity(
-            processing.task_id,
-            processing.stage_run_id,
-            expected_version,
+            command.task_id,
+            command.stage_run_id,
+            command.expected_version,
         )?;
-        processing.require_leased()?;
+        if processing.dialog_id != command.dialog_id
+            || processing.assistant_message_id != command.triggering_assistant_message_id
+            || processing.checker != command.checker
+        {
+            return Err(StoreError::WorkflowConflict(command.dialog_id));
+        }
+        processing.require_leased(command.expected_attempt)?;
         processing.current_task(&tx)?;
         let changed = tx.execute(
             "UPDATE response_processing SET status = 'failed', last_error = ?1,
                     updated_at = strftime('%Y-%m-%d %H:%M:%f','now')
-             WHERE id = ?2 AND status = 'processing' AND expected_version = ?3",
+             WHERE id = ?2 AND status = 'processing' AND expected_version = ?3 AND attempts = ?4",
             params![
-                sanitized_error,
-                processing_id,
-                sqlite_version(expected_version)?
+                command.diagnostic,
+                command.processing_id,
+                sqlite_version(command.expected_version)?,
+                command.expected_attempt
             ],
         )?;
         if changed != 1 {
@@ -1254,7 +1271,10 @@ fn commit_stage_change(
     }
     let (source_name, checker, model, assistant) = match &command.triggering_input.source {
         WorkflowInputSource::Human => {
-            if command.processing_id.is_some() || command.accepted_patch.is_some() {
+            if command.processing_id.is_some()
+                || command.processing_attempt.is_some()
+                || command.accepted_patch.is_some()
+            {
                 return invalid("human stage changes cannot carry processing or checker patches");
             }
             ("human", None, None, None)
@@ -1264,7 +1284,7 @@ fn commit_stage_change(
             model,
             triggering_assistant_message_id,
         } => {
-            if command.processing_id.is_none() {
+            if command.processing_id.is_none() || command.processing_attempt.is_none() {
                 return invalid("controller stage changes require processing");
             }
             active_task(source)?;
@@ -1388,7 +1408,11 @@ fn commit_stage_change(
     }
     target = transition_projection(command, &current)?;
     if let Some(processing) = &processing {
-        processing.require_leased()?;
+        processing.require_leased(
+            command
+                .processing_attempt
+                .expect("validated processing attempt"),
+        )?;
         processing.current_task(connection)?;
     }
     let input_message_id =
@@ -1433,6 +1457,9 @@ fn commit_stage_change(
         complete_processing(
             connection,
             processing,
+            command
+                .processing_attempt
+                .expect("validated processing attempt"),
             &ProcessingResult::Transition {
                 transition_id,
                 input_message_id,
@@ -1561,8 +1588,11 @@ impl ProcessingRow {
         Ok(task)
     }
 
-    fn require_leased(&self) -> Result<(), StoreError> {
-        if self.status != ProcessingStatus::Processing || !(1..=2).contains(&self.attempts) {
+    fn require_leased(&self, expected_attempt: u32) -> Result<(), StoreError> {
+        if self.status != ProcessingStatus::Processing
+            || !(1..=2).contains(&self.attempts)
+            || self.attempts != expected_attempt
+        {
             return Err(StoreError::WorkflowConflict(self.dialog_id));
         }
         Ok(())
@@ -1594,7 +1624,16 @@ impl ProcessingRow {
                     return invalid("invalid transition completion");
                 }
             }
-            ProcessingResult::AwaitUser { task_version } => {
+            ProcessingResult::AwaitUser {
+                task_version,
+                patch_fingerprint,
+            } => {
+                let patch: TaskStatePatch = json(patch_fingerprint)?;
+                if patch.expected_version != self.expected_version
+                    || serde_json::to_string(&patch)? != *patch_fingerprint
+                {
+                    return invalid("invalid completion patch binding");
+                }
                 if *task_version != self.expected_version
                     && *task_version != next_version(self.expected_version)?
                 {
@@ -1658,16 +1697,18 @@ fn processing_row(connection: &Connection, id: i64) -> Result<ProcessingRow, Sto
 fn complete_processing(
     connection: &Connection,
     processing: &ProcessingRow,
+    expected_attempt: u32,
     result: &ProcessingResult,
 ) -> Result<(), StoreError> {
     let changed = connection.execute(
         "UPDATE response_processing SET status = 'completed', result_json = ?1, last_error = NULL,
                 updated_at = strftime('%Y-%m-%d %H:%M:%f','now')
-         WHERE id = ?2 AND status = 'processing' AND expected_version = ?3",
+         WHERE id = ?2 AND status = 'processing' AND expected_version = ?3 AND attempts = ?4",
         params![
             serde_json::to_string(result)?,
             processing.id,
-            sqlite_version(processing.expected_version)?
+            sqlite_version(processing.expected_version)?,
+            expected_attempt
         ],
     )?;
     if changed != 1 {
@@ -1746,7 +1787,7 @@ fn commit_controller(
         }
         return Ok(result);
     }
-    processing.require_leased()?;
+    processing.require_leased(command.expected_attempt)?;
     let task = processing.current_task(connection)?;
     let mut projected = task
         .preview_patch(command.accepted_patch, PatchContext::Normal)
@@ -1776,7 +1817,7 @@ fn commit_controller(
         workflow_input_id,
         task_version: projected.version,
     };
-    complete_processing(connection, processing, &result)?;
+    complete_processing(connection, processing, command.expected_attempt, &result)?;
     touch_dialog(connection, task.dialog_id, message_id)?;
     Ok(result)
 }

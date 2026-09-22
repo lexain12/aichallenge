@@ -6,22 +6,23 @@ use deepseek_cli::chat::ChatHistory;
 use deepseek_cli::client::{ClientError, DeepSeekClient, TokenUsage};
 use deepseek_cli::config::Config;
 use deepseek_cli::context::ContextSummary;
-use deepseek_cli::dialog::DialogStore;
+use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::memory::{DurableMemoryScope, MemoryRepository, RequestScope};
 use deepseek_cli::profile::ProfileRepository;
 use deepseek_cli::workflow::{
-    TaskPhase, TaskStatePatch, TaskStatus, TransitionEvent, WorkflowInput, WorkflowInputSource,
-    WorkflowIntent, WorkflowTaskState,
+    PlanStepStatus, StepStatusUpdate, TaskPhase, TaskStatePatch, TaskStatus, TransitionEvent,
+    WorkflowInput, WorkflowInputSource, WorkflowIntent, WorkflowTaskState,
 };
 use deepseek_cli::workflow_engine::{
-    InputHandlingContext, RoutingOutcome, WorkflowEngine, WorkflowInputHandler, WorkflowModels,
-    WorkflowSession, WorkflowTurnEvent,
+    InputHandlingContext, RoutingOutcome, WorkflowEngine, WorkflowEngineError,
+    WorkflowInputHandler, WorkflowModels, WorkflowSession, WorkflowTurnEvent,
 };
 use deepseek_cli::workflow_model::{
     CompletionModel, HandoffBuilder, ModelError, ModelFuture, ModelRequest, ModelResponse,
 };
 use deepseek_cli::workflow_store::{
-    AnswerCommit, ControllerInputCommit, ProcessingLeaseMode, ProcessingStatus, WorkflowRepository,
+    AcceptedInputEffect, AnswerCommit, ControllerInputCommit, ExpectedCurrentTask, InputCommit,
+    ProcessingLeaseMode, ProcessingStatus, WorkflowRepository,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -637,6 +638,116 @@ fn empty_patch(version: u64) -> TaskStatePatch {
     }
 }
 
+// Break caught: a replayed controller message must never be paired with a newer task snapshot.
+async fn assert_controller_continue_rejects_stale_route(historical_replay: bool) {
+    let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+    let task = f.current().unwrap();
+    let snapshot = f.store.load_workflow(task.dialog_id).unwrap();
+    let answer = f
+        .store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: task.dialog_id,
+            task_id: task.id,
+            stage_run_id: task.current_stage_run_id,
+            expected_version: task.version,
+            content: "completed work",
+            usage: None,
+        })
+        .unwrap();
+    f.store
+        .lease_processing(
+            answer.processing_id,
+            task.version,
+            ProcessingLeaseMode::Normal,
+        )
+        .unwrap();
+    let patch = empty_patch(task.version);
+    let input = WorkflowInput {
+        source: WorkflowInputSource::Controller {
+            checker: "continuation".into(),
+            model: "checker".into(),
+            triggering_assistant_message_id: answer.message_id,
+        },
+        intent: WorkflowIntent::human_continue("hidden follow-up").unwrap(),
+    };
+    if historical_replay {
+        f.store
+            .commit_controller_decision(ControllerInputCommit {
+                processing_id: answer.processing_id,
+                expected_attempt: 1,
+                task_id: task.id,
+                stage_run_id: task.current_stage_run_id,
+                expected_version: task.version,
+                checker: "continuation",
+                model: "checker",
+                triggering_assistant_message_id: answer.message_id,
+                instruction: "hidden follow-up",
+                intent: &input.intent,
+                confidence: 0.95,
+                accepted_patch: &patch,
+            })
+            .unwrap();
+        let newer = WorkflowInput {
+            source: WorkflowInputSource::Human,
+            intent: WorkflowIntent::human_continue("new human instruction").unwrap(),
+        };
+        f.store
+            .append_input(
+                InputCommit {
+                    dialog_id: task.dialog_id,
+                    input: &newer,
+                    protocol_text: "new human instruction",
+                    confidence: None,
+                    expected_current_task: ExpectedCurrentTask::Present {
+                        task_id: task.id,
+                        version: task.version + 1,
+                    },
+                },
+                AcceptedInputEffect::ContinueSameStage,
+            )
+            .unwrap();
+    } else {
+        // Mutate at the durable completion boundary, before the handler reloads the task.
+        f.connection.execute_batch("CREATE TRIGGER interleaved_task_change AFTER UPDATE OF status ON response_processing WHEN NEW.status='completed' BEGIN UPDATE workflow_tasks SET version=version+1; END;").unwrap();
+    }
+    let builder = HandoffBuilder::new(f.handoff.clone(), f.config.workflow());
+    let result = WorkflowInputHandler {
+        store: &mut f.store,
+        handoff_builder: &builder,
+    }
+    .handle(
+        task.dialog_id,
+        snapshot,
+        input,
+        "hidden follow-up",
+        Some(0.95),
+        InputHandlingContext {
+            processing_id: Some(answer.processing_id),
+            processing_attempt: Some(1),
+            accepted_patch: Some(&patch),
+        },
+    )
+    .await;
+    assert!(
+        matches!(result, Err(WorkflowEngineError::Store(StoreError::WorkflowConflict(id))) if id == task.dialog_id),
+        "historical={historical_replay}: {result:?}"
+    );
+    assert_eq!(f.current().unwrap().version, task.version + 2);
+    assert_eq!(f.count("messages"), if historical_replay { 4 } else { 3 });
+    assert_eq!(f.count("response_processing"), 1);
+    assert!(f.server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn controller_continue_rejects_historical_replay() {
+    assert_controller_continue_rejects_stale_route(true).await;
+}
+
+#[tokio::test]
+async fn controller_continue_rejects_interleaving_mutation() {
+    assert_controller_continue_rejects_stale_route(false).await;
+}
+
 // Break caught: accepted controller routes must bind checker provenance and atomically finish its job.
 #[tokio::test]
 async fn controller_continue_and_transition_share_guarded_routing_and_hide_the_input() {
@@ -694,6 +805,7 @@ async fn controller_continue_and_transition_share_guarded_routing_and_hide_the_i
             Some(0.95),
             InputHandlingContext {
                 processing_id: Some(answer.processing_id),
+                processing_attempt: Some(1),
                 accepted_patch: Some(&patch),
             },
         )
@@ -835,6 +947,7 @@ async fn stage_facts_refresh_excludes_controller_and_dialog_wide_reductions() {
     f.store
         .commit_controller_decision(ControllerInputCommit {
             processing_id: answer.processing_id,
+            expected_attempt: 1,
             task_id: task.id,
             stage_run_id: task.current_stage_run_id,
             expected_version: task.version,
@@ -1154,6 +1267,7 @@ async fn controller_requires_active_task_and_explicit_matching_processing_patch(
             Some(0.95),
             InputHandlingContext {
                 processing_id: Some(1),
+                processing_attempt: Some(1),
                 accepted_patch: if missing_patch { None } else { Some(&patch) },
             },
         )
@@ -1165,6 +1279,171 @@ async fn controller_requires_active_task_and_explicit_matching_processing_patch(
         assert_eq!(f.current().unwrap(), task);
         assert_eq!(f.count("messages"), 1);
         assert_eq!(f.handoff.calls(), 0);
+    }
+}
+
+// Break caught: every human context field must be absent, and every controller context field present.
+#[tokio::test]
+async fn input_context_requires_complete_controller_lease_and_no_human_lease() {
+    for (human, has_id, has_attempt, has_patch) in [
+        (true, true, false, false),
+        (true, false, true, false),
+        (true, false, false, true),
+        (false, false, true, true),
+        (false, true, false, true),
+        (false, true, true, false),
+    ] {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        let task = f.current().unwrap();
+        let patch = empty_patch(task.version);
+        let builder = HandoffBuilder::new(f.handoff.clone(), f.config.workflow());
+        let snapshot = f.store.load_workflow(task.dialog_id).unwrap();
+        let result = WorkflowInputHandler {
+            store: &mut f.store,
+            handoff_builder: &builder,
+        }
+        .handle(
+            task.dialog_id,
+            snapshot,
+            WorkflowInput {
+                source: if human {
+                    WorkflowInputSource::Human
+                } else {
+                    WorkflowInputSource::Controller {
+                        checker: "continuation".into(),
+                        model: "checker".into(),
+                        triggering_assistant_message_id: 1,
+                    }
+                },
+                intent: WorkflowIntent::human_continue("continue").unwrap(),
+            },
+            "continue",
+            Some(0.95),
+            InputHandlingContext {
+                processing_id: has_id.then_some(1),
+                processing_attempt: has_attempt.then_some(1),
+                accepted_patch: has_patch.then_some(&patch),
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(WorkflowEngineError::InvalidInputContext(_))
+        ));
+        assert_eq!(f.current().unwrap(), task);
+        assert_eq!(f.count("messages"), 1);
+        assert_eq!(f.handoff.calls(), 0);
+    }
+}
+
+// Break caught: the handler must forward the captured attempt, never default to or reload an attempt.
+#[tokio::test]
+async fn controller_handler_fences_and_forwards_the_exact_leased_attempt() {
+    for route in ["continue", "transition", "reject"] {
+        let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+        let task = f.current().unwrap();
+        let answer = f
+            .store
+            .append_answer_for_processing(AnswerCommit {
+                dialog_id: task.dialog_id,
+                task_id: task.id,
+                stage_run_id: task.current_stage_run_id,
+                expected_version: task.version,
+                content: "saved answer",
+                usage: None,
+            })
+            .unwrap();
+        f.store
+            .lease_processing(
+                answer.processing_id,
+                task.version,
+                ProcessingLeaseMode::Normal,
+            )
+            .unwrap();
+        f.store
+            .lease_processing(
+                answer.processing_id,
+                task.version,
+                ProcessingLeaseMode::Recovery,
+            )
+            .unwrap();
+        let input = WorkflowInput {
+            source: WorkflowInputSource::Controller {
+                checker: "continuation".into(),
+                model: "checker".into(),
+                triggering_assistant_message_id: answer.message_id,
+            },
+            intent: match route {
+                "continue" => WorkflowIntent::human_continue("hidden instruction").unwrap(),
+                "transition" => WorkflowIntent::ProposeTransition {
+                    event: TransitionEvent::ExecutionCompleted,
+                    evidence: vec![],
+                },
+                "reject" => WorkflowIntent::ProposeTransition {
+                    event: TransitionEvent::ValidationPassed,
+                    evidence: vec![],
+                },
+                _ => unreachable!(),
+            },
+        };
+        let patch = empty_patch(task.version);
+        f.handoff.reply(handoff());
+        f.handoff.reply(handoff());
+        let builder = HandoffBuilder::new(f.handoff.clone(), f.config.workflow());
+        for attempt in [1, 2] {
+            let snapshot = f.store.load_workflow(task.dialog_id).unwrap();
+            let result = WorkflowInputHandler {
+                store: &mut f.store,
+                handoff_builder: &builder,
+            }
+            .handle(
+                task.dialog_id,
+                snapshot,
+                input.clone(),
+                "hidden instruction",
+                Some(0.95),
+                InputHandlingContext {
+                    processing_id: Some(answer.processing_id),
+                    processing_attempt: Some(attempt),
+                    accepted_patch: Some(&patch),
+                },
+            )
+            .await;
+            if attempt == 1 {
+                assert!(
+                    matches!(
+                        result,
+                        Err(WorkflowEngineError::Store(StoreError::WorkflowConflict(_)))
+                    ),
+                    "{route}: {result:?}"
+                );
+                assert_eq!(f.current().unwrap(), task);
+                assert_eq!(f.count("messages"), 2);
+            } else {
+                assert!(
+                    matches!(result, Ok(RoutingOutcome::Managed { .. }))
+                        || (route == "reject"
+                            && matches!(result, Ok(RoutingOutcome::Rejected { .. })))
+                );
+            }
+        }
+        let (status, attempts): (String, u32) = f
+            .connection
+            .query_row(
+                "SELECT status,attempts FROM response_processing WHERE id=?1",
+                [answer.processing_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            status,
+            if route == "reject" {
+                "failed"
+            } else {
+                "completed"
+            }
+        );
+        assert_eq!(attempts, 2);
     }
 }
 
@@ -1217,6 +1496,7 @@ async fn controller_handoff_failure_preserves_answer_and_fails_processing() {
         Some(0.95),
         InputHandlingContext {
             processing_id: Some(answer.processing_id),
+            processing_attempt: Some(1),
             accepted_patch: Some(&patch),
         },
     )
@@ -1230,6 +1510,304 @@ async fn controller_handoff_failure_preserves_answer_and_fails_processing() {
         f.store.load_pending_processing(task.dialog_id).unwrap()[0].status,
         ProcessingStatus::Failed
     );
+}
+
+// Break caught: rejecting input from one dialog must not fail an unrelated dialog's leased job.
+#[tokio::test]
+async fn controller_rejection_cannot_fail_another_dialogs_processing() {
+    let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+    let source = f.current().unwrap();
+    let other = f
+        .store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "unrelated task")
+        .unwrap();
+    let answer = f
+        .store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: other.dialog_id,
+            task_id: other.task.id,
+            stage_run_id: other.stage_run_id,
+            expected_version: other.task.version,
+            content: "unrelated answer",
+            usage: None,
+        })
+        .unwrap();
+    f.store
+        .lease_processing(
+            answer.processing_id,
+            other.task.version,
+            ProcessingLeaseMode::Normal,
+        )
+        .unwrap();
+    let snapshot = f.store.load_workflow(source.dialog_id).unwrap();
+    let builder = HandoffBuilder::new(f.handoff.clone(), f.config.workflow());
+    let patch = empty_patch(source.version);
+    let result = WorkflowInputHandler {
+        store: &mut f.store,
+        handoff_builder: &builder,
+    }
+    .handle(
+        source.dialog_id,
+        snapshot,
+        WorkflowInput {
+            source: WorkflowInputSource::Controller {
+                checker: "continuation".into(),
+                model: "checker".into(),
+                triggering_assistant_message_id: answer.message_id,
+            },
+            intent: WorkflowIntent::ProposeTransition {
+                event: TransitionEvent::ValidationPassed,
+                evidence: vec![],
+            },
+        },
+        "invalid transition",
+        Some(0.95),
+        InputHandlingContext {
+            processing_id: Some(answer.processing_id),
+            processing_attempt: Some(1),
+            accepted_patch: Some(&patch),
+        },
+    )
+    .await;
+    assert!(result.is_err(), "{result:?}");
+    let job = f
+        .store
+        .load_pending_processing(other.dialog_id)
+        .unwrap()
+        .remove(0);
+    assert_eq!(job.status, ProcessingStatus::Processing);
+    assert!(job.last_error.is_none());
+    assert_eq!(f.current().unwrap(), source);
+    assert_eq!(f.count("messages"), 3);
+    assert_eq!(f.handoff.calls(), 0);
+}
+
+// Break caught: FSM and handoff errors may contain sensitive input, which must stay out of diagnostics.
+async fn assert_human_rejection_diagnostic_is_sanitized(failure: &str) {
+    const SECRET: &str = "SECRET_HUMAN_PAYLOAD_5fe8";
+    let mut f = Fixture::new(
+        Some(if failure == "handoff" {
+            TaskPhase::Execution
+        } else {
+            TaskPhase::Validation
+        }),
+        TaskStatus::Active,
+    )
+    .await;
+    if failure == "criterion" {
+        let mut plan = f.current().unwrap().plan;
+        plan.acceptance_criteria.push(SECRET.into());
+        f.connection
+            .execute(
+                "UPDATE workflow_tasks SET plan_json=?1",
+                [serde_json::to_string(&plan).unwrap()],
+            )
+            .unwrap();
+    }
+    let evidence = if failure == "evidence" {
+        vec![SECRET]
+    } else {
+        vec!["tests pass => observed pass"]
+    };
+    let event = if failure == "handoff" {
+        "execution_completed"
+    } else {
+        "validation_passed"
+    };
+    f.interpreter.reply(interpretation(
+        json!({"type":"propose_transition","event":event,"evidence":evidence}),
+    ));
+    f.handoff.reply(json!({SECRET: SECRET}));
+    let mut events = vec![];
+    let result = f
+        .run(SECRET, |event| {
+            if let AgentEvent::Workflow(WorkflowTurnEvent::InputRejected { reason }) = event {
+                events.push(reason.clone());
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let RoutingOutcome::Rejected { reason, .. } = result.routing else {
+        panic!("expected rejection")
+    };
+    assert!(!reason.contains(SECRET), "{failure}: {reason}");
+    assert!(reason.len() <= 80);
+    assert_eq!(events, vec![reason.clone()]);
+    let stored: String = f
+        .connection
+        .query_row(
+            "SELECT rejection_reason FROM workflow_inputs ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, reason);
+    if failure == "evidence" {
+        let audit: String = f
+            .connection
+            .query_row(
+                "SELECT intent_json FROM workflow_inputs ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            audit.contains(SECRET),
+            "typed intent remains the explicit audit payload"
+        );
+    }
+    assert!(f.server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn human_rejection_diagnostics_hide_criterion() {
+    assert_human_rejection_diagnostic_is_sanitized("criterion").await;
+}
+
+#[tokio::test]
+async fn human_rejection_diagnostics_hide_evidence() {
+    assert_human_rejection_diagnostic_is_sanitized("evidence").await;
+}
+
+#[tokio::test]
+async fn human_rejection_diagnostics_hide_handoff_fields() {
+    assert_human_rejection_diagnostic_is_sanitized("handoff").await;
+}
+
+// Break caught: controller guard/patch/handoff failures must store only a bounded diagnostic category.
+async fn assert_controller_rejection_diagnostic_is_sanitized(failure: &str) {
+    const SECRET: &str = "SECRET_CONTROLLER_PAYLOAD_2f85";
+    let mut f = Fixture::new(
+        Some(if failure == "handoff" {
+            TaskPhase::Execution
+        } else {
+            TaskPhase::Validation
+        }),
+        TaskStatus::Active,
+    )
+    .await;
+    if failure == "criterion" {
+        let mut plan = f.current().unwrap().plan;
+        plan.acceptance_criteria.push(SECRET.into());
+        f.connection
+            .execute(
+                "UPDATE workflow_tasks SET plan_json=?1",
+                [serde_json::to_string(&plan).unwrap()],
+            )
+            .unwrap();
+    }
+    let task = f.current().unwrap();
+    let answer = f
+        .store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: task.dialog_id,
+            task_id: task.id,
+            stage_run_id: task.current_stage_run_id,
+            expected_version: task.version,
+            content: "saved answer",
+            usage: None,
+        })
+        .unwrap();
+    f.store
+        .lease_processing(
+            answer.processing_id,
+            task.version,
+            ProcessingLeaseMode::Normal,
+        )
+        .unwrap();
+    let mut patch = empty_patch(task.version);
+    if failure == "patch" || failure == "continue_patch" {
+        patch.step_updates.push(StepStatusUpdate {
+            step_id: SECRET.into(),
+            status: PlanStepStatus::Completed,
+            evidence: vec![SECRET.into()],
+        });
+    }
+    let input = WorkflowInput {
+        source: WorkflowInputSource::Controller {
+            checker: "continuation".into(),
+            model: "checker".into(),
+            triggering_assistant_message_id: answer.message_id,
+        },
+        intent: if failure == "continue_patch" {
+            WorkflowIntent::human_continue(SECRET).unwrap()
+        } else {
+            WorkflowIntent::ProposeTransition {
+                event: if failure == "handoff" {
+                    TransitionEvent::ExecutionCompleted
+                } else {
+                    TransitionEvent::ValidationPassed
+                },
+                evidence: if failure == "evidence" {
+                    vec![SECRET.into()]
+                } else {
+                    vec!["tests pass => observed pass".into()]
+                },
+            }
+        },
+    };
+    f.handoff.reply(json!({SECRET: SECRET}));
+    let snapshot = f.store.load_workflow(task.dialog_id).unwrap();
+    let builder = HandoffBuilder::new(f.handoff.clone(), f.config.workflow());
+    let route = WorkflowInputHandler {
+        store: &mut f.store,
+        handoff_builder: &builder,
+    }
+    .handle(
+        task.dialog_id,
+        snapshot,
+        input,
+        SECRET,
+        Some(0.95),
+        InputHandlingContext {
+            processing_id: Some(answer.processing_id),
+            processing_attempt: Some(1),
+            accepted_patch: Some(&patch),
+        },
+    )
+    .await
+    .unwrap();
+    let RoutingOutcome::Rejected { reason, .. } = route else {
+        panic!("expected rejection")
+    };
+    assert!(!reason.contains(SECRET), "{failure}: {reason}");
+    assert!(reason.len() <= 80);
+    let job = f
+        .store
+        .load_pending_processing(task.dialog_id)
+        .unwrap()
+        .remove(0);
+    assert_eq!(job.status, ProcessingStatus::Failed);
+    assert_eq!(job.last_error.as_deref(), Some(reason.as_str()));
+    assert_eq!(f.count("messages"), 2);
+    assert_eq!(f.count("workflow_inputs"), 1);
+    assert_eq!(f.current().unwrap(), task);
+}
+
+#[tokio::test]
+async fn controller_rejection_diagnostics_hide_criterion() {
+    assert_controller_rejection_diagnostic_is_sanitized("criterion").await;
+}
+
+#[tokio::test]
+async fn controller_rejection_diagnostics_hide_evidence() {
+    assert_controller_rejection_diagnostic_is_sanitized("evidence").await;
+}
+
+#[tokio::test]
+async fn controller_rejection_diagnostics_hide_patch_payload() {
+    assert_controller_rejection_diagnostic_is_sanitized("patch").await;
+}
+
+#[tokio::test]
+async fn controller_rejection_diagnostics_hide_continue_patch_payload() {
+    assert_controller_rejection_diagnostic_is_sanitized("continue_patch").await;
+}
+
+#[tokio::test]
+async fn controller_rejection_diagnostics_hide_handoff_fields() {
+    assert_controller_rejection_diagnostic_is_sanitized("handoff").await;
 }
 
 // Break caught: blank input, input-write failure, and answer-job failure may not leave partial durable effects.

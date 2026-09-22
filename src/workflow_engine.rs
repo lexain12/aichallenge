@@ -29,8 +29,8 @@ use crate::workflow_model::{
 };
 use crate::workflow_store::{
     AcceptedInputEffect, AnswerCommit, ControllerInputCommit, DialogWorkflowSnapshot,
-    ExpectedCurrentTask, InputCommit, PersistedAnswer, ProcessingResult, StageProtocolMessage,
-    TransitionCommit, UnmanagedAnswerCommit, WorkflowRepository,
+    ExpectedCurrentTask, FailProcessingCommit, InputCommit, PersistedAnswer, ProcessingResult,
+    StageProtocolMessage, TransitionCommit, UnmanagedAnswerCommit, WorkflowRepository,
 };
 
 #[derive(Clone)]
@@ -58,6 +58,7 @@ pub enum RoutingOutcome {
 #[derive(Clone, Copy, Default)]
 pub struct InputHandlingContext<'a> {
     pub processing_id: Option<i64>,
+    pub processing_attempt: Option<u32>,
     pub accepted_patch: Option<&'a TaskStatePatch>,
 }
 
@@ -80,7 +81,7 @@ impl WorkflowInputHandler<'_> {
         if let Err(error) = StateMachine::validate_source(&input.source, &input.intent) {
             if input.source != WorkflowInputSource::Human {
                 return Ok(RoutingOutcome::Rejected {
-                    reason: error.to_string(),
+                    reason: "workflow input source rejected".into(),
                     state: snapshot.current_task,
                 });
             }
@@ -99,7 +100,10 @@ impl WorkflowInputHandler<'_> {
         }
         let human = input.source == WorkflowInputSource::Human;
         if human {
-            if context.processing_id.is_some() || context.accepted_patch.is_some() {
+            if context.processing_id.is_some()
+                || context.processing_attempt.is_some()
+                || context.accepted_patch.is_some()
+            {
                 return Err(WorkflowEngineError::InvalidInputContext(
                     "human input cannot carry checker processing",
                 ));
@@ -122,7 +126,10 @@ impl WorkflowInputHandler<'_> {
                     "controller input requires an accepted checker patch",
                 ));
             };
-            if context.processing_id.is_none() || confidence.is_none() {
+            if context.processing_id.is_none()
+                || context.processing_attempt.is_none()
+                || confidence.is_none()
+            {
                 return Err(WorkflowEngineError::InvalidInputContext(
                     "controller input requires processing and confidence",
                 ));
@@ -139,10 +146,36 @@ impl WorkflowInputHandler<'_> {
             confidence,
             expected_current_task: expected,
         };
+        let preview = if let (Some(task), Some(patch)) = (source, context.accepted_patch) {
+            let patch_context = if matches!(
+                input.intent,
+                WorkflowIntent::ProposeTransition {
+                    event: TransitionEvent::ValidationFailed,
+                    ..
+                }
+            ) {
+                PatchContext::ValidationRepair
+            } else {
+                PatchContext::Normal
+            };
+            match task.preview_patch(patch, patch_context) {
+                Ok(preview) => Some(preview),
+                Err(_) => {
+                    return self.reject(
+                        command,
+                        source,
+                        context,
+                        "workflow checker patch rejected",
+                    );
+                }
+            }
+        } else {
+            None
+        };
         match &input.intent {
             WorkflowIntent::StartNewTask { goal } => {
-                if let Err(error) = StateMachine::validate_new_task(source) {
-                    return self.reject(command, source, context, &error.to_string());
+                if StateMachine::validate_new_task(source).is_err() {
+                    return self.reject(command, source, context, "workflow task start rejected");
                 }
                 let started = self.store.create_task_with_human_input(
                     dialog_id,
@@ -198,6 +231,9 @@ impl WorkflowInputHandler<'_> {
                             task_id: task.id,
                             stage_run_id: task.current_stage_run_id,
                             expected_version: task.version,
+                            expected_attempt: context
+                                .processing_attempt
+                                .expect("validated processing attempt"),
                             checker,
                             model,
                             triggering_assistant_message_id: *triggering_assistant_message_id,
@@ -208,7 +244,12 @@ impl WorkflowInputHandler<'_> {
                                 .accepted_patch
                                 .expect("validated controller patch"),
                         })?;
-                    let ProcessingResult::ControllerInput { message_id, .. } = result else {
+                    let ProcessingResult::ControllerInput {
+                        message_id,
+                        task_version,
+                        ..
+                    } = result
+                    else {
                         return Err(WorkflowEngineError::InvalidInputContext(
                             "unexpected controller processing result",
                         ));
@@ -218,6 +259,12 @@ impl WorkflowInputHandler<'_> {
                         .load_workflow(dialog_id)?
                         .current_task
                         .ok_or(StoreError::WorkflowConflict(dialog_id))?;
+                    if state.id != task.id
+                        || state.current_stage_run_id != task.current_stage_run_id
+                        || state.version != task_version
+                    {
+                        return Err(StoreError::WorkflowConflict(dialog_id).into());
+                    }
                     Ok(RoutingOutcome::Managed {
                         input_message_id: message_id,
                         state,
@@ -233,30 +280,15 @@ impl WorkflowInputHandler<'_> {
                         "no workflow task to change stage",
                     );
                 };
-                let preview = if let Some(patch) = context.accepted_patch {
-                    let patch_context = if matches!(
-                        input.intent,
-                        WorkflowIntent::ProposeTransition {
-                            event: TransitionEvent::ValidationFailed,
-                            ..
-                        }
-                    ) {
-                        PatchContext::ValidationRepair
-                    } else {
-                        PatchContext::Normal
-                    };
-                    task.preview_patch(patch, patch_context)?
-                } else {
-                    task.clone()
-                };
+                let preview = preview.as_ref().unwrap_or(task);
                 let authorization = match &input.intent {
                     WorkflowIntent::ProposeTransition { event, evidence } => {
-                        StateMachine::authorize(&preview, *event, evidence)
+                        StateMachine::authorize(preview, *event, evidence)
                             .map(StageChangeAuthorization::Transition)
                     }
                     WorkflowIntent::ReplanCurrent { change_request } => {
                         StateMachine::authorize_replan(
-                            &preview,
+                            preview,
                             &input.source,
                             change_request.clone(),
                         )
@@ -266,7 +298,14 @@ impl WorkflowInputHandler<'_> {
                 };
                 let authorization = match authorization {
                     Ok(authorization) => authorization,
-                    Err(error) => return self.reject(command, source, context, &error.to_string()),
+                    Err(_) => {
+                        return self.reject(
+                            command,
+                            source,
+                            context,
+                            "workflow stage change rejected",
+                        );
+                    }
                 };
                 let messages = self
                     .store
@@ -276,7 +315,7 @@ impl WorkflowInputHandler<'_> {
                     .collect::<Vec<_>>();
                 let handoff = match self
                     .handoff_builder
-                    .build(&authorization, &preview, &messages, &input)
+                    .build(&authorization, preview, &messages, &input)
                     .await
                 {
                     Ok(handoff) => handoff,
@@ -294,6 +333,7 @@ impl WorkflowInputHandler<'_> {
                     accepted_patch: context.accepted_patch,
                     handoff: &handoff.payload,
                     processing_id: context.processing_id,
+                    processing_attempt: context.processing_attempt,
                 })?;
                 Ok(RoutingOutcome::Managed {
                     input_message_id: saved.input_message_id,
@@ -308,7 +348,7 @@ impl WorkflowInputHandler<'_> {
         command: InputCommit<'_>,
         source: Option<&WorkflowTaskState>,
         context: InputHandlingContext<'_>,
-        reason: &str,
+        reason: &'static str,
     ) -> Result<RoutingOutcome, WorkflowEngineError> {
         if command.input.source == WorkflowInputSource::Human {
             self.store.append_input(
@@ -318,8 +358,27 @@ impl WorkflowInputHandler<'_> {
                 },
             )?;
         } else if let (Some(processing), Some(task)) = (context.processing_id, source) {
-            self.store
-                .fail_processing(processing, task.version, reason)?;
+            let WorkflowInputSource::Controller {
+                checker,
+                triggering_assistant_message_id,
+                ..
+            } = &command.input.source
+            else {
+                unreachable!()
+            };
+            self.store.fail_processing(FailProcessingCommit {
+                processing_id: processing,
+                dialog_id: command.dialog_id,
+                task_id: task.id,
+                stage_run_id: task.current_stage_run_id,
+                expected_version: task.version,
+                expected_attempt: context
+                    .processing_attempt
+                    .expect("validated processing attempt"),
+                triggering_assistant_message_id: *triggering_assistant_message_id,
+                checker,
+                diagnostic: reason,
+            })?;
         }
         Ok(RoutingOutcome::Rejected {
             reason: reason.to_owned(),
