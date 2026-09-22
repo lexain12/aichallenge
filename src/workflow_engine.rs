@@ -957,7 +957,7 @@ pub struct RecoveredProcessing {
 #[derive(Debug)]
 pub enum ProcessingOutcome {
     Stop(AutonomyStopReason),
-    Controller(RoutingOutcome),
+    Controller(Box<RoutingOutcome>),
     Completed(ProcessingResult),
 }
 
@@ -1517,7 +1517,7 @@ impl<'a> WorkflowEngine<'a> {
                     );
                 }
                 ProcessingOutcome::Controller(next) => {
-                    routing = next;
+                    routing = *next;
                     if let RoutingOutcome::Managed { state, .. } = &routing {
                         if state.phase == TaskPhase::Done {
                             return self.finish(
@@ -2000,7 +2000,7 @@ impl<'a> WorkflowEngine<'a> {
                     stage_message_count,
                     budget,
                 );
-                Ok(ProcessingOutcome::Controller(route))
+                Ok(ProcessingOutcome::Controller(Box::new(route)))
             }
             Err(WorkflowEngineError::AutonomyStopped(reason)) => {
                 let result = match self.complete_as_await(&task, &lease, &patch, mode, reason) {

@@ -23,6 +23,36 @@ use deepseek_cli::workflow_store::{
 };
 use rusqlite::Connection;
 
+// Break caught: moving the large state behind indirection must still decode
+// existing audit JSON and replay it with exactly the same serialized shape.
+#[test]
+fn transition_processing_result_preserves_existing_json_shape() {
+    let stored = serde_json::json!({
+        "decision":"transition", "transition_id":7,"input_message_id":8,"workflow_input_id":9,
+        "target_state": {
+            "id":1,"dialog_id":2,"ordinal":1,"phase":"execution","status":"active",
+            "goal":"Build parser", "plan":{"revision":1,"steps":[{"id":"build","description":"Build parser","status":"pending"}],"acceptance_criteria":["tests pass"]},
+            "current_step_id":"build","expected_action":"Implement parser",
+            "checkpoint":{"summary":"Design accepted","decisions":[],"open_issues":[]},
+            "current_stage_run_id":4,"current_stage_sequence":2,"incoming_handoff_id":7,"version":3
+        }
+    });
+    let result: ProcessingResult = serde_json::from_value(stored.clone()).unwrap();
+    let ProcessingResult::Transition {
+        ref target_state,
+        transition_id,
+        ..
+    } = result
+    else {
+        panic!("stored transition must decode to a typed replay result");
+    };
+    assert_eq!(transition_id, 7);
+    assert_eq!(target_state.phase, TaskPhase::Execution);
+    assert_eq!(target_state.current_stage_run_id, StageRunId(4));
+    assert_eq!(target_state.version, 3);
+    assert_eq!(serde_json::to_value(result).unwrap(), stored);
+}
+
 // Break caught: recovery must reconstruct the accepted typed input and truncate stage history at its answer.
 #[test]
 fn processing_context_is_bound_to_dialog_and_original_answer() {
@@ -1296,7 +1326,7 @@ fn workflow_branch_deep_copies_history_provenance_processing_and_replay_ids() {
     else {
         panic!("transition result")
     };
-    assert_eq!(target_state, copy);
+    assert_eq!(*target_state, copy);
     assert_eq!(Some(transition_id), copy.incoming_handoff_id);
     assert_ne!(input_message_id, original.input_message_id);
     let linked: (i64, i64, i64, i64) = fixture.connection.query_row("SELECT i.message_id,i.processing_id,i.triggering_assistant_message_id,i.dialog_id FROM workflow_inputs i WHERE i.id=?1", [workflow_input_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
@@ -3414,7 +3444,7 @@ fn pausing_and_human_resume_preserve_the_complete_stage_projection() {
     };
     let mut expected = before.clone().pause().unwrap();
     expected.version += 1;
-    assert_eq!(paused, expected);
+    assert_eq!(*paused, expected);
     assert_eq!(
         fixture
             .store

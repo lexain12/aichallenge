@@ -334,6 +334,514 @@ fn run_cli_args(config_path: &Path, database: &Path, args: &[&str], input: &str)
     child.wait_with_output().expect("wait for deepseek-cli")
 }
 
+#[cfg(unix)]
+fn workflow_patch(version: u64) -> Value {
+    json!({"expected_version":version,"plan_append":{"steps":[],"acceptance_criteria":[]},
+        "step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null})
+}
+
+#[cfg(unix)]
+fn workflow_check(patch: Value, decision: Value) -> ResponseTemplate {
+    sse(
+        &json!({"patch":patch,"decision":decision}).to_string(),
+        2,
+        1,
+        3,
+    )
+}
+
+#[cfg(unix)]
+fn workflow_interpret(intent: Value) -> ResponseTemplate {
+    sse(
+        &json!({"confidence":0.95,"intent":intent}).to_string(),
+        2,
+        1,
+        3,
+    )
+}
+
+#[cfg(unix)]
+fn workflow_handoff(summary: &str, next: Option<&str>) -> Value {
+    json!({"summary":summary,"completed_step_ids":[],"next_step_id":next,
+        "expected_action":"Perform the current stage","plan_changes":[],"decisions":[],"open_issues":[]})
+}
+
+#[cfg(unix)]
+fn workflow_service(value: Value) -> ResponseTemplate {
+    sse(&value.to_string(), 2, 1, 3)
+}
+
+#[cfg(unix)]
+fn transition_decision(event: &str, evidence: &[&str]) -> Value {
+    json!({"type":"emit_transition","event":event,"evidence":evidence,"confidence":0.95})
+}
+
+#[cfg(unix)]
+fn transition_intent(event: &str) -> Value {
+    json!({"type":"propose_transition","event":event,"evidence":[]})
+}
+
+#[cfg(unix)]
+fn completed_step_patch(version: u64, step: &str) -> Value {
+    let mut patch = workflow_patch(version);
+    patch["step_updates"] = json!([{"step_id":step,"status":"completed","evidence":["Observed passing targeted test"]}]);
+    patch
+}
+
+// Break caught: skipping a guard, reusing a repaired stage, replacing the ledger,
+// leaking prior-stage protocol, or replaying synthetic text corrupts the persisted lifecycle.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_acceptance_complete_lifecycle_is_durable_ordered_and_stage_isolated() {
+    let server = MockServer::start().await;
+    let mut plan = workflow_patch(0);
+    plan["plan_append"] = json!({"steps":[{"id":"build","description":"Implement parser","status":"pending"}],"acceptance_criteria":["parser tests pass"]});
+    plan["current_step_id"] = json!("build");
+    let mut repair = workflow_handoff("Repair checkpoint", Some("repair"));
+    repair["plan_changes"] =
+        json!([{"id":"repair","description":"Fix empty input","status":"pending"}]);
+    let responses = Arc::new(Mutex::new(VecDeque::from([
+        sse("PLAN_RAW_12", 2, 1, 3),
+        workflow_check(plan, json!({"type":"await_user"})),
+        workflow_interpret(transition_intent("planning_completed")),
+        workflow_service(workflow_handoff("Planning checkpoint", Some("build"))),
+        sse("EXECUTION_ONE_RAW_12", 2, 1, 3),
+        workflow_check(
+            workflow_patch(2),
+            json!({"type":"continue","instruction":"CONTROLLER_ONLY_12","confidence":0.95}),
+        ),
+        sse("EXECUTION_TWO_RAW_12", 2, 1, 3),
+        workflow_check(
+            completed_step_patch(3, "build"),
+            transition_decision("execution_completed", &[]),
+        ),
+        workflow_service(workflow_handoff("Implementation checkpoint", None)),
+        sse("VALIDATION_FAILED_RAW_12", 2, 1, 3),
+        workflow_check(
+            workflow_patch(4),
+            transition_decision("validation_failed", &["Empty input test fails"]),
+        ),
+        workflow_service(repair),
+        sse("REPAIR_RAW_12", 2, 1, 3),
+        workflow_check(
+            completed_step_patch(5, "repair"),
+            json!({"type":"await_user"}),
+        ),
+        workflow_interpret(transition_intent("execution_completed")),
+        workflow_service(workflow_handoff("Repair completed checkpoint", None)),
+        sse("VALIDATION_PASSED_RAW_12", 2, 1, 3),
+        workflow_check(
+            workflow_patch(7),
+            transition_decision(
+                "validation_passed",
+                &["parser tests pass => all 12 cases passed"],
+            ),
+        ),
+        workflow_service(workflow_handoff("Final checkpoint", None)),
+    ])));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: responses.clone(),
+        })
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("lifecycle.sqlite3");
+    let config = write_observed_workflow_config(
+        &server.uri(),
+        &directory.path().join("events.jsonl"),
+        "strategy = 'summary'",
+    );
+    let first = run_cli_args(config.path(), &database, &[], "design the parser\n/exit\n");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let store = DialogStore::open(&database).unwrap();
+    let id = store.list().unwrap()[0].id;
+    let planned = store.load_workflow(id).unwrap().current_task.unwrap();
+    assert_eq!(planned.phase, TaskPhase::Planning);
+    assert_eq!(planned.version, 1);
+    let connection = Connection::open(&database).unwrap();
+    // The complete immutable row is retained across the last human transition.
+    let ledger = || -> Vec<(i64, i64, i64, String, String)> {
+        connection
+            .prepare(
+                "SELECT id,from_stage_run_id,to_stage_run_id,event,
+            json_object('task',workflow_task_id,'input',workflow_input_id,'version',source_version,
+                        'handoff',handoff_json,'source',source_fingerprint,'created_at',created_at)
+            FROM task_transitions ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert!(ledger().is_empty());
+    let middle = run_cli_args(
+        config.path(),
+        &database,
+        &["--resume-last"],
+        "plan approved; execute\n/exit\n",
+    );
+    assert!(
+        middle.status.success(),
+        "{}",
+        String::from_utf8_lossy(&middle.stderr)
+    );
+    let repaired = store.load_workflow(id).unwrap().current_task.unwrap();
+    assert_eq!(repaired.phase, TaskPhase::Execution);
+    assert_eq!(repaired.current_stage_sequence, 4);
+    assert_eq!(repaired.version, 6);
+    let prefix = ledger();
+    assert_eq!(prefix.len(), 3);
+    let finish = run_cli_args(
+        config.path(),
+        &database,
+        &["--resume-last"],
+        "repair complete; validate\n/task\n/exit\n",
+    );
+    assert!(
+        finish.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finish.stderr)
+    );
+    let done = store.load_workflow(id).unwrap().current_task.unwrap();
+    assert_eq!(done.phase, TaskPhase::Done);
+    assert_eq!(done.version, 8);
+    assert_eq!(done.id, planned.id);
+    let final_ledger = ledger();
+    assert_eq!(&final_ledger[..3], prefix.as_slice());
+    assert_eq!(
+        final_ledger
+            .iter()
+            .map(|row| row.3.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "planning_completed",
+            "execution_completed",
+            "validation_failed",
+            "execution_completed",
+            "validation_passed"
+        ]
+    );
+    assert!(
+        final_ledger
+            .windows(2)
+            .all(|rows| rows[0].0 < rows[1].0 && rows[0].2 == rows[1].1)
+    );
+    let stages: Vec<(i64, String, u32)> = connection
+        .prepare("SELECT id,phase,sequence FROM task_stage_runs ORDER BY sequence")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        stages
+            .iter()
+            .map(|row| (row.1.as_str(), row.2))
+            .collect::<Vec<_>>(),
+        [
+            ("planning", 1),
+            ("execution", 2),
+            ("validation", 3),
+            ("execution", 4),
+            ("validation", 5),
+            ("done", 6)
+        ]
+    );
+    assert_ne!(stages[1].0, stages[3].0);
+    let requests = server.received_requests().await.unwrap();
+    let ordinary: Vec<Value> = requests
+        .iter()
+        .map(|r| r.body_json::<Value>().unwrap())
+        .filter(|body| body["model"] == "ordinary-model")
+        .collect();
+    assert_eq!(ordinary.len(), 6);
+    let protocol: Vec<Vec<&str>> = ordinary
+        .iter()
+        .map(|body| {
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] != "system")
+                .map(|message| message["content"].as_str().unwrap())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        protocol,
+        [
+            vec!["design the parser"],
+            vec!["plan approved; execute"],
+            vec![
+                "plan approved; execute",
+                "EXECUTION_ONE_RAW_12",
+                "CONTROLLER_ONLY_12"
+            ],
+            vec!["Apply the approved workflow stage transition."],
+            vec!["Apply the approved workflow stage transition."],
+            vec!["repair complete; validate"],
+        ]
+    );
+    let raw_markers = [
+        "PLAN_RAW_12",
+        "EXECUTION_ONE_RAW_12",
+        "EXECUTION_TWO_RAW_12",
+        "VALIDATION_FAILED_RAW_12",
+        "REPAIR_RAW_12",
+    ];
+    for (index, body) in ordinary.iter().enumerate() {
+        let text = body["messages"].to_string();
+        for marker in raw_markers {
+            assert_eq!(
+                text.contains(marker),
+                index == 2 && marker == "EXECUTION_ONE_RAW_12",
+                "request {index}: {text}"
+            );
+        }
+    }
+    let replay = run_cli_args(config.path(), &database, &["--resume-last"], "/exit\n");
+    assert!(replay.status.success());
+    for output in [&first, &middle, &finish, &replay] {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!text.contains("CONTROLLER_ONLY_12"));
+        assert!(!text.contains("Apply the approved workflow stage transition."));
+    }
+    let replay = String::from_utf8(replay.stdout).unwrap();
+    for marker in raw_markers {
+        assert!(replay.contains(marker), "{replay}");
+    }
+    assert!(responses.lock().unwrap().is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), 19);
+}
+
+// Break caught: crossing task/stage boundaries must not reintroduce raw history,
+// full audit handoffs, old reductions, or controller text as user-fact evidence.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_acceptance_two_tasks_keep_only_current_stage_and_projected_checkpoint() {
+    let server = MockServer::start().await;
+    let plan_patch = |step: &str| {
+        let mut patch = workflow_patch(0);
+        patch["plan_append"] = json!({"steps":[{"id":step,"description":"Build result","status":"pending"}],"acceptance_criteria":["tests pass"]});
+        patch["current_step_id"] = json!(step);
+        patch
+    };
+    let mut projected = workflow_handoff("TASK2_ACCEPTED_CHECKPOINT", Some("second"));
+    projected["decisions"] = json!(["TASK2_ACCEPTED_DECISION"]);
+    projected["open_issues"] = json!(["TASK2_ACCEPTED_ISSUE"]);
+    let responses = Arc::new(Mutex::new(VecDeque::from([
+        workflow_service(json!({"old":"TASK1_FACTS_MARKER"})),
+        sse("TASK1_PLANNING_RAW", 2, 1, 3),
+        workflow_check(
+            plan_patch("first"),
+            transition_decision("planning_completed", &[]),
+        ),
+        workflow_service(workflow_handoff("TASK1_FULL_HANDOFF_MARKER", Some("first"))),
+        sse("TASK1_EXECUTION_RAW", 2, 1, 3),
+        workflow_check(
+            completed_step_patch(1, "first"),
+            transition_decision("execution_completed", &[]),
+        ),
+        workflow_service(workflow_handoff("Task one implementation checkpoint", None)),
+        sse("TASK1_VALIDATION_RAW", 2, 1, 3),
+        workflow_check(
+            workflow_patch(2),
+            transition_decision(
+                "validation_passed",
+                &["tests pass => observed all cases passing"],
+            ),
+        ),
+        workflow_service(workflow_handoff("Task one final checkpoint", None)),
+        workflow_interpret(json!({"type":"start_new_task","goal":"TASK2_CURRENT_GOAL"})),
+        workflow_service(json!({"old":"TASK2_PLANNING_FACTS_MARKER"})),
+        sse("TASK2_PLANNING_RAW", 2, 1, 3),
+        workflow_check(plan_patch("second"), json!({"type":"await_user"})),
+        workflow_interpret(transition_intent("planning_completed")),
+        workflow_service(projected.clone()),
+        workflow_service(json!({"current":"TASK2_EXECUTION_FACT"})),
+        sse("TASK2_EXECUTION_ONE", 2, 1, 3),
+        workflow_check(
+            workflow_patch(2),
+            json!({"type":"continue","instruction":"CONTROLLER_FACTS_EXCLUDED","confidence":0.95}),
+        ),
+        sse("TASK2_EXECUTION_TWO", 2, 1, 3),
+        workflow_check(workflow_patch(3), json!({"type":"await_user"})),
+        workflow_interpret(json!({"type":"continue","instruction":"TASK2_CURRENT_HUMAN"})),
+        workflow_service(json!({"current":"TASK2_EXECUTION_FACT"})),
+        sse("TASK2_EXECUTION_THREE", 2, 1, 3),
+        workflow_check(workflow_patch(4), json!({"type":"await_user"})),
+    ])));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: responses.clone(),
+        })
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("two-tasks.sqlite3");
+    let config = write_observed_workflow_config(
+        &server.uri(),
+        &directory.path().join("events.jsonl"),
+        "strategy = 'sticky_facts'\nkeep_last_messages = 20",
+    );
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &[],
+        "/profile set PROFILE_MARKER\n/remember user preference USER_MEMORY_MARKER\n/remember task design MEMORY_TASK_MARKER\ndesign task one\nstart second task\nTASK2_EXECUTE_HUMAN\nTASK2_CURRENT_HUMAN\n/exit\n",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = DialogStore::open(&database).unwrap();
+    let id = store.list().unwrap()[0].id;
+    let task = store.load_workflow(id).unwrap().current_task.unwrap();
+    assert_eq!(task.ordinal, 2);
+    assert_eq!(task.phase, TaskPhase::Execution);
+    assert_eq!(task.current_stage_sequence, 2);
+    assert_eq!(task.checkpoint.summary, "TASK2_ACCEPTED_CHECKPOINT");
+    let requests = server.received_requests().await.unwrap();
+    let bodies: Vec<Value> = requests.iter().map(|r| r.body_json().unwrap()).collect();
+    let target = bodies
+        .iter()
+        .rev()
+        .find(|body| {
+            body["model"] == "ordinary-model"
+                && !body["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Update the key-value memory")
+        })
+        .unwrap();
+    let messages = target["messages"].as_array().unwrap();
+    let text = target["messages"].to_string();
+    assert_eq!(
+        messages[0]["content"],
+        store.load(id).unwrap().system_prompt
+    );
+    for (index, marker) in [
+        (1, "PROFILE_MARKER"),
+        (2, "USER_MEMORY_MARKER"),
+        (3, "MEMORY_TASK_MARKER"),
+        (4, "TASK2_CURRENT_GOAL"),
+        (5, "TASK2_EXECUTION_FACT"),
+    ] {
+        assert_eq!(messages[index]["role"], "system");
+        assert!(
+            messages[index]["content"]
+                .as_str()
+                .unwrap()
+                .contains(marker),
+            "{text}"
+        );
+    }
+    for marker in [
+        "TASK1_PLANNING_RAW",
+        "TASK1_EXECUTION_RAW",
+        "TASK1_VALIDATION_RAW",
+        "TASK1_FULL_HANDOFF_MARKER",
+        "TASK1_FACTS_MARKER",
+        "TASK2_PLANNING_RAW",
+        "TASK2_PLANNING_FACTS_MARKER",
+        "completed_step_ids",
+        "plan_changes",
+    ] {
+        assert!(!text.contains(marker), "leaked {marker}: {text}");
+    }
+    for marker in [
+        "TASK2_ACCEPTED_CHECKPOINT",
+        "TASK2_ACCEPTED_DECISION",
+        "TASK2_ACCEPTED_ISSUE",
+    ] {
+        assert!(messages[4]["content"].as_str().unwrap().contains(marker));
+    }
+    assert_eq!(
+        messages[6..]
+            .iter()
+            .map(|m| (m["role"].as_str().unwrap(), m["content"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        [
+            ("user", "TASK2_EXECUTE_HUMAN"),
+            ("assistant", "TASK2_EXECUTION_ONE"),
+            ("user", "CONTROLLER_FACTS_EXCLUDED"),
+            ("assistant", "TASK2_EXECUTION_TWO"),
+            ("user", "TASK2_CURRENT_HUMAN"),
+        ]
+    );
+    let facts: Vec<_> = bodies
+        .iter()
+        .filter(|body| {
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Update the key-value memory")
+        })
+        .collect();
+    assert_eq!(facts.len(), 4);
+    for body in &facts {
+        let text = body["messages"].to_string();
+        for marker in [
+            "CONTROLLER_FACTS_EXCLUDED",
+            "PROFILE_MARKER",
+            "USER_MEMORY_MARKER",
+            "MEMORY_TASK_MARKER",
+        ] {
+            assert!(!text.contains(marker), "facts leaked {marker}: {text}");
+        }
+    }
+    assert!(
+        facts.last().unwrap()["messages"]
+            .to_string()
+            .contains("TASK2_CURRENT_HUMAN")
+    );
+    assert!(
+        !facts.last().unwrap()["messages"]
+            .to_string()
+            .contains("TASK2_PLANNING")
+    );
+    let connection = Connection::open(&database).unwrap();
+    let audit: Vec<String> = connection
+        .prepare("SELECT handoff_json FROM task_transitions ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|raw| raw.contains("TASK1_FULL_HANDOFF_MARKER"))
+    );
+    assert!(
+        audit
+            .iter()
+            .any(|raw| serde_json::from_str::<Value>(raw).unwrap() == projected)
+    );
+    assert!(responses.lock().unwrap().is_empty());
+}
+
 // Break caught: workflow status is a read-only local command and must not
 // manufacture a dialog or call the provider when no workflow task exists.
 #[cfg(unix)]
@@ -892,7 +1400,7 @@ async fn resumed_paused_dialog_waits_for_human_and_preserves_task_and_stage() {
             .unwrap()
             .current_task
             .unwrap(),
-        paused
+        *paused
     );
 
     Mock::given(method("POST"))
@@ -1472,18 +1980,15 @@ fn interrupt_discards_partial_work_pauses_exactly_once_and_never_synthesizes_a_t
         partial_seen
             .recv_timeout(Duration::from_secs(5))
             .expect("CLI should render the first streamed fragment");
+        let stdin = child.stdin.take().unwrap();
+        let mut stderr_pipe = child.stderr.take().unwrap();
         send_sigint(&child);
-        let status = child.wait().unwrap();
+        let status = wait_for_exit_while_stdin_is_open(child, stdin);
         let _ = release.send(());
         server.join().unwrap();
         let stdout = String::from_utf8(stdout_reader.join().unwrap()).unwrap();
         let mut stderr = Vec::new();
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_end(&mut stderr)
-            .unwrap();
+        stderr_pipe.read_to_end(&mut stderr).unwrap();
         assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
         assert!(stdout.contains("partial fragment"));
         assert!(
@@ -1537,16 +2042,14 @@ fn interrupt_discards_partial_work_pauses_exactly_once_and_never_synthesizes_a_t
         prompt_seen
             .recv_timeout(Duration::from_secs(5))
             .expect("CLI should reach the first input prompt");
+        // Child::wait closes its owned stdin: keep it open so EOF cannot race SIGINT.
+        let stdin = child.stdin.take().unwrap();
+        let mut stderr_pipe = child.stderr.take().unwrap();
         send_sigint(&child);
-        let status = child.wait().unwrap();
+        let status = wait_for_exit_while_stdin_is_open(child, stdin);
         let stdout = String::from_utf8(stdout_reader.join().unwrap()).unwrap();
         let mut stderr = Vec::new();
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_end(&mut stderr)
-            .unwrap();
+        stderr_pipe.read_to_end(&mut stderr).unwrap();
         assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
         assert!(stdout.contains("No workflow task was created"), "{stdout}");
         assert!(

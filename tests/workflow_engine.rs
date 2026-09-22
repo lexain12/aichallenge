@@ -375,6 +375,35 @@ fn continue_decision() -> Value {
     json!({"type":"continue","instruction":"HIDDEN next instruction","confidence":0.95})
 }
 
+// Break caught: typed but illegal phase proposals must never schedule handoff or ordinary work.
+#[tokio::test]
+async fn acceptance_forbidden_phase_skips_preserve_the_exact_committed_state() {
+    for (phase, event) in [
+        (TaskPhase::Planning, "execution_completed"),
+        (TaskPhase::Execution, "validation_passed"),
+        (TaskPhase::Done, "validation_failed"),
+    ] {
+        let mut f = Fixture::new(Some(phase), TaskStatus::Active).await;
+        let before = f.current().unwrap();
+        f.interpreter.reply(interpretation(
+            json!({"type":"propose_transition", "event":event,
+            "evidence":["tests pass => observed all green"]}),
+        ));
+        let result = f.run("propose a skipped phase", |_| Ok(())).await.unwrap();
+        assert!(
+            matches!(result.routing, RoutingOutcome::Rejected { .. }),
+            "{phase:?}"
+        );
+        assert_eq!(f.current().unwrap(), before);
+        assert_eq!(f.count("task_stage_runs"), 1);
+        assert_eq!(f.count("task_transitions"), 0);
+        assert_eq!(f.count("response_processing"), 0);
+        assert_eq!(f.handoff.calls(), 0);
+        assert_eq!(f.checker.calls(), 0);
+        assert!(f.server.received_requests().await.unwrap().is_empty());
+    }
+}
+
 // Break caught: dropping any service-boundary future may preserve earlier commits, but no partial effect.
 #[tokio::test]
 async fn cancellation_at_interpreter_handoff_ordinary_and_recovery_boundaries_is_atomic() {

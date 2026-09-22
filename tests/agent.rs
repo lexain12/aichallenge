@@ -37,6 +37,7 @@ fn managed_config(server: &MockServer) -> Config {
 struct AgentWorkflowModel {
     responses: Mutex<VecDeque<String>>,
     requests: Mutex<Vec<ModelRequest>>,
+    usage: Option<deepseek_cli::client::TokenUsage>,
 }
 
 impl CompletionModel for AgentWorkflowModel {
@@ -51,12 +52,8 @@ impl CompletionModel for AgentWorkflowModel {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| "unavailable checker".into());
-        Box::pin(async move {
-            Ok(ModelResponse {
-                content,
-                usage: None,
-            })
-        })
+        let usage = self.usage;
+        Box::pin(async move { Ok(ModelResponse { content, usage }) })
     }
 }
 
@@ -1068,6 +1065,197 @@ async fn compaction_diagnostic_precedes_summary_persistence_failure() {
 }
 
 // Break caught: restoring an Agent must expose advisory recovery without running the ordinary model.
+struct InterruptedAcceptanceChecker {
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl CompletionModel for InterruptedAcceptanceChecker {
+    fn name(&self) -> &str {
+        "interrupted-acceptance-checker"
+    }
+
+    fn complete(&self, _request: ModelRequest) -> ModelFuture<'_> {
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(std::future::pending())
+    }
+}
+
+// Break caught: a crash after the durable answer must neither duplicate that
+// answer/job nor autonomously resume; later human continue must retain the plan and step.
+#[tokio::test]
+async fn acceptance_restart_recovers_once_then_human_continues_the_stored_execution_step() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            sse("PLANNING_RAW_BEFORE_CRASH", 2, 1, 3),
+            sse("DURABLE_EXECUTION_ANSWER", 2, 1, 3),
+            sse("RESUMED_EXECUTION_ANSWER", 2, 1, 3),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("restart-acceptance.sqlite3");
+    let config = managed_config(&server);
+    let service = Arc::new(AgentWorkflowModel::default());
+    let mut plan: Value = serde_json::from_str(&await_check(0)).unwrap();
+    plan["patch"]["plan_append"] = json!({"steps":[{"id":"stored-build-step","description":"Implement persisted design","status":"pending"}],"acceptance_criteria":["tests pass"]});
+    plan["patch"]["current_step_id"] = json!("stored-build-step");
+    service.responses.lock().unwrap().extend([
+        plan.to_string(),
+        json!({"confidence":0.95,"intent":{"type":"propose_transition","event":"planning_completed","evidence":[]}}).to_string(),
+        json!({"summary":"STORED_DESIGN_CHECKPOINT","completed_step_ids":[],"next_step_id":"stored-build-step","expected_action":"Implement persisted design","plan_changes":[],"decisions":[],"open_issues":[]}).to_string(),
+    ]);
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap())
+        .unwrap()
+        .with_workflow_models(injected_models(&service));
+    agent.run_with_prompt("design a parser").await.unwrap();
+    let id = agent.dialog_id().unwrap();
+    let blocker = Arc::new(InterruptedAcceptanceChecker {
+        started: false.into(),
+    });
+    agent = agent.with_workflow_models(WorkflowModels {
+        interpreter: service.clone(),
+        checker: blocker.clone(),
+        handoff: service.clone(),
+    });
+    let mut turn = Box::pin(agent.run_with_prompt("plan accepted; execute"));
+    tokio::select! {
+        result = turn.as_mut() => panic!("checker must still be pending: {result:?}"),
+        _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !blocker.started.load(std::sync::atomic::Ordering::SeqCst) { tokio::task::yield_now().await; }
+        }) => assert!(blocker.started.load(std::sync::atomic::Ordering::SeqCst)),
+    }
+    drop(turn);
+    drop(agent);
+    let store = DialogStore::open(&database).unwrap();
+    let before = store.load_workflow(id).unwrap().current_task.unwrap();
+    assert_eq!(before.phase, TaskPhase::Execution);
+    assert_eq!(before.current_step_id.as_deref(), Some("stored-build-step"));
+    assert_eq!(before.version, 2);
+    let pending = store.load_pending_processing(id).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].status, ProcessingStatus::Processing);
+    assert_eq!(pending[0].attempts, 1);
+    assert_eq!(
+        store
+            .load(id)
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m.content() == "DURABLE_EXECUTION_ANSWER")
+            .count(),
+        1
+    );
+
+    let recovery = Arc::new(AgentWorkflowModel {
+        usage: Some(deepseek_cli::client::TokenUsage {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 3,
+            completion_tokens_details: None,
+        }),
+        ..Default::default()
+    });
+    let mut proposed: Value = serde_json::from_str(&await_check(2)).unwrap();
+    proposed["patch"]["expected_action"] = json!("Resume stored build");
+    proposed["decision"] =
+        json!({"type":"continue","instruction":"MUST_NOT_AUTONOMOUSLY_RESUME","confidence":0.95});
+    recovery.responses.lock().unwrap().extend([
+        proposed.to_string(),
+        json!({"confidence":0.95,"intent":{"type":"continue","instruction":"continue"}})
+            .to_string(),
+        await_check(4),
+    ]);
+    let mut resumed = Agent::from_dialog(&config, store, id)
+        .unwrap()
+        .with_workflow_models(injected_models(&recovery));
+    assert_eq!(recovery.requests.lock().unwrap().len(), 0);
+    let results = resumed.recover_workflow_processing().await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].stop_reason,
+        AutonomyStopReason::AwaitUserAfterRestart
+    );
+    assert!(
+        resumed
+            .recover_workflow_processing()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(recovery.requests.lock().unwrap().len(), 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    let store = DialogStore::open(&database).unwrap();
+    let recovered = store.load_workflow(id).unwrap().current_task.unwrap();
+    assert_eq!(recovered.current_stage_run_id, before.current_stage_run_id);
+    assert_eq!(recovered.plan, before.plan);
+    assert_eq!(recovered.version, 3);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM workflow_inputs WHERE source='controller'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT attempts FROM response_processing WHERE id=?1",
+                [pending[0].id],
+                |row| row.get::<_, u32>(0)
+            )
+            .unwrap(),
+        2
+    );
+
+    assert_eq!(
+        resumed.run_with_prompt("continue").await.unwrap(),
+        "RESUMED_EXECUTION_ANSWER"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let body: Value = requests[2].body_json().unwrap();
+    let text = body["messages"].to_string();
+    for marker in [
+        "stored-build-step",
+        "Implement persisted design",
+        "STORED_DESIGN_CHECKPOINT",
+        "Resume stored build",
+        "DURABLE_EXECUTION_ANSWER",
+    ] {
+        assert!(text.contains(marker), "{text}");
+    }
+    assert!(!text.contains("PLANNING_RAW_BEFORE_CRASH"));
+    assert!(!text.contains("MUST_NOT_AUTONOMOUSLY_RESUME"));
+    assert_eq!(
+        body["messages"].as_array().unwrap().last().unwrap()["content"],
+        "continue"
+    );
+    let after = store.load_workflow(id).unwrap().current_task.unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.plan, before.plan);
+    assert_eq!(after.current_stage_run_id, before.current_stage_run_id);
+    assert_eq!(after.current_step_id, before.current_step_id);
+    assert_eq!(after.version, 4);
+    assert_eq!(recovery.requests.lock().unwrap().len(), 3);
+    assert_eq!(
+        store
+            .load(id)
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m.content() == "DURABLE_EXECUTION_ANSWER")
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn resumed_agent_recovers_advisory_work_without_autonomous_resume() {
     let server = MockServer::start().await;
@@ -1152,15 +1340,17 @@ async fn managed_agent_persists_task_and_uses_injected_interpreter_before_the_ne
         0
     );
     agent.run_with_prompt("continue plan").await.unwrap();
-    let requests = service.requests.lock().unwrap();
-    assert_eq!(
-        requests.len(),
-        3,
-        "checker, next human interpreter, checker"
-    );
-    let interpreted: Value = serde_json::from_str(requests[1].messages[1].content()).unwrap();
-    assert_eq!(interpreted["human_text"], "continue plan");
-    assert!(!requests[1].messages[1].content().contains("first answer"));
+    {
+        let requests = service.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "checker, next human interpreter, checker"
+        );
+        let interpreted: Value = serde_json::from_str(requests[1].messages[1].content()).unwrap();
+        assert_eq!(interpreted["human_text"], "continue plan");
+        assert!(!requests[1].messages[1].content().contains("first answer"));
+    }
     let task = observer
         .load_workflow(first.dialog_id)
         .unwrap()

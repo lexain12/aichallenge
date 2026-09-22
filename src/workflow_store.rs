@@ -190,7 +190,7 @@ pub struct InputCommit<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PauseOutcome {
-    Paused(WorkflowTaskState),
+    Paused(Box<WorkflowTaskState>),
     NoTask,
     AlreadyPaused,
     AlreadyDone,
@@ -278,7 +278,7 @@ pub enum ProcessingResult {
         transition_id: i64,
         input_message_id: i64,
         workflow_input_id: i64,
-        target_state: WorkflowTaskState,
+        target_state: Box<WorkflowTaskState>,
     },
     AwaitUser {
         task_version: u64,
@@ -466,7 +466,7 @@ impl WorkflowRepository for DialogStore {
         paused.version = next;
         paused.validate().map_err(domain_error)?;
         tx.commit()?;
-        Ok(PauseOutcome::Paused(paused))
+        Ok(PauseOutcome::Paused(Box::new(paused)))
     }
 
     fn load_processing_result(
@@ -1592,10 +1592,10 @@ fn commit_stage_change(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    if let Some((_, _, _, fingerprint)) = &prior {
-        if fingerprint.as_deref() != Some(source_fingerprint(source)?.as_str()) {
-            return Err(StoreError::WorkflowConflict(command.dialog_id));
-        }
+    if let Some((_, _, _, fingerprint)) = &prior
+        && fingerprint.as_deref() != Some(source_fingerprint(source)?.as_str())
+    {
+        return Err(StoreError::WorkflowConflict(command.dialog_id));
     }
     let mut target = transition_projection(command, source)?;
     if let Some((transition_id, workflow_input_id, stage_id, _)) = prior {
@@ -1650,7 +1650,7 @@ fn commit_stage_change(
                     transition_id,
                     input_message_id,
                     workflow_input_id,
-                    target_state: target.clone(),
+                    target_state: Box::new(target.clone()),
                 })
         {
             return Err(StoreError::WorkflowConflict(command.dialog_id));
@@ -1732,7 +1732,7 @@ fn commit_stage_change(
                 transition_id,
                 input_message_id,
                 workflow_input_id,
-                target_state: target.clone(),
+                target_state: Box::new(target.clone()),
             },
         )?;
     }
