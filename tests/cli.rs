@@ -19,6 +19,8 @@ use deepseek_cli::memory::{MemoryRepository, RequestScope};
 use deepseek_cli::profile::ProfileRepository;
 #[cfg(unix)]
 use deepseek_cli::workflow::{TaskPhase, TaskStatus};
+#[cfg(unix)]
+use deepseek_cli::workflow_store::PauseOutcome;
 use deepseek_cli::workflow_store::{AnswerCommit, WorkflowRepository};
 #[cfg(unix)]
 use rusqlite::Connection;
@@ -148,6 +150,57 @@ fn observe_stdout(
         output
     });
     (seen_rx, handle)
+}
+
+#[cfg(unix)]
+fn observe_and_close_stdout(
+    mut stdout: std::process::ChildStdout,
+    needle: &'static str,
+) -> (mpsc::Receiver<()>, thread::JoinHandle<Vec<u8>>) {
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 256];
+        loop {
+            let read = stdout.read(&mut buffer).unwrap();
+            if read == 0 {
+                panic!("stdout closed before rendering {needle:?}");
+            }
+            output.extend_from_slice(&buffer[..read]);
+            if String::from_utf8_lossy(&output).contains(needle) {
+                seen_tx.send(()).unwrap();
+                return output;
+            }
+        }
+    });
+    (seen_rx, handle)
+}
+
+#[cfg(unix)]
+fn wait_for_exit_while_stdin_is_open(
+    mut child: std::process::Child,
+    _stdin: std::process::ChildStdin,
+) -> std::process::ExitStatus {
+    let pid = child.id();
+    let (status_tx, status_rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let _ = status_tx.send(child.wait());
+    });
+    let status = match status_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(status) => status.expect("wait for deepseek-cli"),
+        Err(error) => {
+            let killed = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status()
+                .expect("kill stuck deepseek-cli");
+            assert!(killed.success());
+            let _ = status_rx.recv_timeout(Duration::from_secs(5));
+            waiter.join().unwrap();
+            panic!("deepseek-cli did not exit while stdin remained open: {error}");
+        }
+    };
+    waiter.join().unwrap();
+    status
 }
 
 #[cfg(unix)]
@@ -321,6 +374,158 @@ async fn resumed_cli_recovers_pending_work_before_prompt_and_warns_on_failure() 
             }
         );
     }
+}
+
+// Break caught: restoring a paused dialog is inert until a human continuation is accepted.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_paused_dialog_waits_for_human_and_preserves_task_and_stage() {
+    let server = MockServer::start().await;
+    let config = write_workflow_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("paused-resume.sqlite3");
+    let mut store = DialogStore::open(&database).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "saved goal")
+        .unwrap();
+    let PauseOutcome::Paused(paused) = store.pause_current_task(started.dialog_id).unwrap() else {
+        panic!("active task should pause");
+    };
+    let id = started.dialog_id.to_string();
+
+    let restored = run_cli_args(config.path(), &database, &["--resume", &id], "/exit\n");
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        0,
+        "restore must not call any provider before human input"
+    );
+    assert_eq!(
+        store
+            .load_workflow(started.dialog_id)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        paused
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(
+                [
+                    sse(
+                        &json!({"confidence":0.95,"intent":{"type":"continue","instruction":"continue"}}).to_string(),
+                        2,
+                        1,
+                        3,
+                    ),
+                    sse("resumed answer", 2, 1, 3),
+                    sse(
+                        &json!({"patch":{"expected_version":2,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},"decision":{"type":"await_user"}}).to_string(),
+                        2,
+                        1,
+                        3,
+                    ),
+                    sse(
+                        &json!({"confidence":0.95,"intent":{"type":"start_new_task","goal":"other goal"}}).to_string(),
+                        2,
+                        1,
+                        3,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        })
+        .mount(&server)
+        .await;
+
+    let accepted = run_cli_args(
+        config.path(),
+        &database,
+        &["--resume", &id],
+        "continue\n/exit\n",
+    );
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "interpreter, ordinary, then checker");
+    let interpreter_body: Value = requests[0].body_json().unwrap();
+    let interpreter_context = interpreter_body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        interpreter_context.contains("\"status\":\"paused\""),
+        "{interpreter_context}"
+    );
+    let ordinary_body: Value = requests[1].body_json().unwrap();
+    let ordinary_context = ordinary_body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        ordinary_context.contains("\"status\": \"active\""),
+        "{ordinary_context}"
+    );
+    assert!(
+        !ordinary_context.contains("\"status\": \"paused\""),
+        "{ordinary_context}"
+    );
+    let resumed = store
+        .load_workflow(started.dialog_id)
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(resumed.id, started.task.id);
+    assert_eq!(resumed.current_stage_run_id, started.stage_run_id);
+    assert_eq!(resumed.status, TaskStatus::Active);
+    assert_eq!(resumed.version, 2);
+
+    let PauseOutcome::Paused(repaused) = store.pause_current_task(started.dialog_id).unwrap()
+    else {
+        panic!("resumed task should pause again");
+    };
+    assert_eq!(repaused.version, 3);
+    let rejected = run_cli_args(
+        config.path(),
+        &database,
+        &["--resume", &id],
+        "start another task\n/exit\n",
+    );
+    assert!(
+        rejected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        4,
+        "rejected new-task interpretation must not reach the ordinary model"
+    );
+    let after_rejection = store
+        .load_workflow(started.dialog_id)
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(after_rejection.id, started.task.id);
+    assert_eq!(after_rejection.current_stage_run_id, started.stage_run_id);
+    assert_eq!(after_rejection.status, TaskStatus::Paused);
+    assert_eq!(after_rejection.version, 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -661,6 +866,113 @@ fn interrupt_discards_partial_work_pauses_exactly_once_and_never_synthesizes_a_t
                 .is_empty()
         );
     }
+}
+
+// Break caught: Tokio's blocking stdin reader must not hold runtime shutdown open after SIGINT.
+#[cfg(unix)]
+#[test]
+fn interrupt_at_idle_prompt_exits_while_stdin_remains_open() {
+    let config = write_workflow_config("http://127.0.0.1:1");
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("idle-interrupt.sqlite3");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_deepseek-cli"))
+        .arg("--config")
+        .arg(config.path())
+        .arg("--db")
+        .arg(&database)
+        .env_remove("DEEPSEEK_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let (prompt_seen, stdout_reader) = observe_stdout(child.stdout.take().unwrap(), "you> ");
+    prompt_seen
+        .recv_timeout(Duration::from_secs(5))
+        .expect("CLI should reach the first input prompt");
+
+    send_sigint(&child);
+    let status = wait_for_exit_while_stdin_is_open(child, stdin);
+    let stdout = String::from_utf8(stdout_reader.join().unwrap()).unwrap();
+    let mut stderr_output = Vec::new();
+    stderr.read_to_end(&mut stderr_output).unwrap();
+    assert!(
+        status.success(),
+        "{}",
+        String::from_utf8_lossy(&stderr_output)
+    );
+    assert!(stdout.contains("No workflow task was created"), "{stdout}");
+    assert!(
+        DialogStore::open(&database)
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// Break caught: terminal cleanup failures must not bypass the durable pause transaction.
+#[cfg(unix)]
+#[test]
+fn interrupt_with_closed_stdout_still_pauses_the_active_task() {
+    let (base_url, release, server) = spawn_partial_sse_server();
+    let config = write_workflow_config(&base_url);
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("closed-stdout-interrupt.sqlite3");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_deepseek-cli"))
+        .arg("--config")
+        .arg(config.path())
+        .arg("--db")
+        .arg(&database)
+        .env_remove("DEEPSEEK_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let (partial_seen, stdout_reader) =
+        observe_and_close_stdout(child.stdout.take().unwrap(), "partial fragment");
+    stdin
+        .write_all(b"Pause even if output is closed\n")
+        .unwrap();
+    partial_seen
+        .recv_timeout(Duration::from_secs(5))
+        .expect("CLI should render the first streamed fragment");
+    let rendered = String::from_utf8(stdout_reader.join().unwrap()).unwrap();
+    assert!(rendered.contains("partial fragment"));
+
+    send_sigint(&child);
+    let status = wait_for_exit_while_stdin_is_open(child, stdin);
+    let _ = release.send(());
+    server.join().unwrap();
+    let mut stderr_output = Vec::new();
+    stderr.read_to_end(&mut stderr_output).unwrap();
+    assert!(
+        !status.success(),
+        "closed stdout should still report the terminal cleanup error"
+    );
+    assert!(
+        String::from_utf8_lossy(&stderr_output).contains("terminal I/O failed"),
+        "{}",
+        String::from_utf8_lossy(&stderr_output)
+    );
+
+    let store = DialogStore::open(&database).unwrap();
+    let id = store.latest_id().unwrap().unwrap();
+    let dialog = store.load(id).unwrap();
+    assert_eq!(dialog.messages.len(), 1);
+    assert_eq!(
+        dialog.messages[0].content(),
+        "Pause even if output is closed"
+    );
+    let task = store.load_workflow(id).unwrap().current_task.unwrap();
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.version, 1);
+    assert!(store.load_pending_processing(id).unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

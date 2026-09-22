@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, BufRead};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -13,7 +13,7 @@ use deepseek_cli::memory::{DEFAULT_TASK_ID, DEFAULT_USER_ID, DurableMemoryScope,
 use deepseek_cli::terminal::{BlockStyle, TerminalUi};
 use deepseek_cli::workflow_store::PauseOutcome;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -154,8 +154,13 @@ async fn run() -> Result<(), AppError> {
             result = agent.recover_workflow_processing() => Some(result),
         };
         let Some(recovery) = recovery else {
-            let outcome = agent.pause_current_workflow()?;
-            write_interruption(&stdout_ui, &mut stdout, outcome, true)?;
+            finish_interruption(
+                &mut agent,
+                &stdout_ui,
+                &mut stdout,
+                InterruptionCleanup::None,
+                true,
+            )?;
             return Ok(());
         };
         let failed = match recovery {
@@ -200,7 +205,7 @@ async fn run() -> Result<(), AppError> {
         }
     }
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = stdin_lines()?;
     let mut stderr = io::stderr();
     let stderr_ui = TerminalUi::stderr();
     let mut show_usage = resume.is_some();
@@ -218,12 +223,16 @@ async fn run() -> Result<(), AppError> {
                 signal?;
                 None
             }
-            line = lines.next_line() => Some(line?),
+            line = lines.recv() => Some(line.transpose()?),
         };
         let Some(line) = line else {
-            stdout_ui.finish_empty_prompt(&mut stdout)?;
-            let outcome = agent.pause_current_workflow()?;
-            write_interruption(&stdout_ui, &mut stdout, outcome, false)?;
+            finish_interruption(
+                &mut agent,
+                &stdout_ui,
+                &mut stdout,
+                InterruptionCleanup::EmptyPrompt,
+                false,
+            )?;
             return Ok(());
         };
         let Some(line) = line else {
@@ -393,9 +402,13 @@ async fn run() -> Result<(), AppError> {
                     }
                 };
                 if interrupted {
-                    stdout_ui.finish_interrupted_response(&mut stdout)?;
-                    let outcome = agent.pause_current_workflow()?;
-                    write_interruption(&stdout_ui, &mut stdout, outcome, true)?;
+                    finish_interruption(
+                        &mut agent,
+                        &stdout_ui,
+                        &mut stdout,
+                        InterruptionCleanup::Response,
+                        true,
+                    )?;
                     return Ok(());
                 }
             }
@@ -411,6 +424,66 @@ async fn run() -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+fn stdin_lines() -> io::Result<mpsc::Receiver<io::Result<String>>> {
+    let (sender, receiver) = mpsc::channel(1);
+    std::thread::Builder::new()
+        .name("deepseek-cli-stdin".to_owned())
+        .spawn(move || {
+            let stdin = io::stdin();
+            for line in stdin.lock().lines() {
+                let is_error = line.is_err();
+                if sender.blocking_send(line).is_err() || is_error {
+                    break;
+                }
+            }
+        })?;
+    Ok(receiver)
+}
+
+#[derive(Clone, Copy)]
+enum InterruptionCleanup {
+    None,
+    EmptyPrompt,
+    Response,
+}
+
+fn finish_interruption<W: io::Write>(
+    agent: &mut Agent,
+    ui: &TerminalUi,
+    writer: &mut W,
+    cleanup: InterruptionCleanup,
+    discarded_model_result: bool,
+) -> Result<(), AppError> {
+    let cleanup_result = match cleanup {
+        InterruptionCleanup::None => Ok(()),
+        InterruptionCleanup::EmptyPrompt => ui.finish_empty_prompt(writer),
+        InterruptionCleanup::Response => ui.finish_interrupted_response(writer),
+    };
+    let mut errors = Vec::new();
+    if let Err(error) = cleanup_result {
+        errors.push(format!(
+            "terminal I/O failed during interrupt cleanup: {error}"
+        ));
+    }
+
+    match agent.pause_current_workflow() {
+        Ok(outcome) => {
+            if let Err(error) = write_interruption(ui, writer, outcome, discarded_model_result) {
+                errors.push(format!(
+                    "terminal I/O failed while reporting interruption: {error}"
+                ));
+            }
+        }
+        Err(error) => errors.push(format!("workflow pause failed: {error}")),
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Interruption(errors.join("; ")))
+    }
 }
 
 async fn run_prompt<W: io::Write, E: io::Write>(
@@ -570,6 +643,8 @@ enum AppError {
     Client(#[from] ClientError),
     #[error("terminal I/O failed: {0}")]
     Io(#[from] io::Error),
+    #[error("interruption handling failed: {0}")]
+    Interruption(String),
 }
 
 fn memory_address_label(scope: &RequestScope, layer: DurableMemoryScope) -> String {
