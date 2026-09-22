@@ -629,6 +629,7 @@ async fn workflow_acceptance_complete_lifecycle_is_durable_ordered_and_stage_iso
     for marker in raw_markers {
         assert!(replay.contains(marker), "{replay}");
     }
+    assert!(replay.contains("VALIDATION_PASSED_RAW_12"), "{replay}");
     assert!(responses.lock().unwrap().is_empty());
     assert_eq!(server.received_requests().await.unwrap().len(), 19);
 }
