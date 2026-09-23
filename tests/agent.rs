@@ -6,6 +6,7 @@ use deepseek_cli::agent::{Agent, AgentError, AgentEvent};
 use deepseek_cli::client::{ClientError, DeepSeekClient};
 use deepseek_cli::config::Config;
 use deepseek_cli::dialog::DialogStore;
+use deepseek_cli::invariants::InvariantRepository;
 use deepseek_cli::memory::{DurableMemoryScope, RequestScope};
 use deepseek_cli::workflow::{TaskPhase, TaskStatus};
 use deepseek_cli::workflow_engine::{
@@ -27,6 +28,105 @@ fn config(server: &MockServer) -> Config {
     )
     .unwrap();
     Config::load(file.path(), None).unwrap()
+}
+
+#[test]
+fn config_invariants_override_scoped_rules_without_copying_them_to_sqlite() {
+    let config = Config::from_toml(
+        "api_key='key'\n[context]\nstrategy='summary'\n[[invariants]]\nid='STACK'\ntext='Use Rust only'",
+        None,
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let scope = RequestScope::new("alice", "parser").unwrap();
+    let mut store = DialogStore::open(&path).unwrap();
+    store
+        .upsert_invariant(&scope, "STACK", "Use Go only")
+        .unwrap();
+    store
+        .upsert_invariant(&scope, "ARCH", "Keep the monolith")
+        .unwrap();
+    let mut agent = Agent::with_store_for_scope(&config, store, scope.clone()).unwrap();
+    let rules = agent.invariants().unwrap();
+    assert_eq!(rules.rules().len(), 2);
+    assert_eq!(rules.rule("STACK").unwrap().text, "Use Rust only");
+    assert_eq!(rules.rule("ARCH").unwrap().text, "Keep the monolith");
+    assert!(agent.upsert_invariant("STACK", "Use Go only").is_err());
+    assert!(agent.delete_invariant("STACK").is_err());
+    drop(agent);
+    let store = DialogStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .load_invariants(&scope)
+            .unwrap()
+            .rule("STACK")
+            .unwrap()
+            .text,
+        "Use Go only"
+    );
+}
+
+#[tokio::test]
+async fn config_only_invariant_blocks_new_task_before_ordinary_generation() {
+    let server = MockServer::start().await;
+    let config = Config::from_toml(
+        &format!(
+            "api_key='key'\nbase_url='{}'\n[context]\nstrategy='summary'\n[[invariants]]\nid='STACK'\ntext='Use Rust only'",
+            server.uri()
+        ),
+        None,
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();
+    let service = Arc::new(AgentWorkflowModel::default());
+    service.responses.lock().unwrap().push_back(
+        json!({"type":"deny","violations":[{"id":"STACK","reason":"Go conflicts with Rust"}]})
+            .to_string(),
+    );
+    let mut agent = Agent::with_store(&config, store)
+        .unwrap()
+        .with_workflow_models(injected_models(&service));
+    let answer = agent
+        .run_with_prompt("Build the backend in Go")
+        .await
+        .unwrap();
+    assert!(answer.contains("STACK"));
+    assert!(answer.contains("Use Rust only"));
+    assert!(agent.dialog_id().is_none());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn config_invariants_cannot_be_bypassed_by_in_memory_agent() {
+    let config = Config::from_toml(
+        "api_key='key'\n[context]\nstrategy='summary'\n[[invariants]]\nid='STACK'\ntext='Use Rust only'",
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::new(&config).unwrap();
+    assert!(matches!(
+        agent.run_with_prompt("Use Go").await,
+        Err(AgentError::InvariantRequiresStore)
+    ));
+}
+
+// Break caught: disabling workflow must not silently bypass durable project rules.
+#[tokio::test]
+async fn legacy_persistent_mode_refuses_to_run_with_invariants() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();
+    store
+        .upsert_invariant(&RequestScope::default(), "STACK", "Use Rust only")
+        .unwrap();
+    let mut agent = Agent::with_store(&config(&server), store).unwrap();
+    assert!(matches!(
+        agent.run_with_prompt("use Go").await,
+        Err(AgentError::InvariantsRequireWorkflow)
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 fn managed_config(server: &MockServer) -> Config {

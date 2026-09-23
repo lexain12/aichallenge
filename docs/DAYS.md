@@ -17,10 +17,11 @@
 | `Day-10` | Переключаемые стратегии context: summary, sliding window, sticky facts и branching | `cargo run` |
 | `Day-11` | Явные conversation/task/user memory layers и защита от compaction | `cargo run -- --user alice --task telegram-bot` |
 | `Day-12` | Свободный Markdown-профиль пользователя, автоматически подключаемый к запросам | `cargo run -- --user alice --task mobile-app` |
-| `Day-13` | Workflow state machine, изоляция этапов, pause/resume и controller audit | `cargo run -- --user alice --task parser-project` |
+| `day-13` | Workflow state machine, изоляция этапов, pause/resume и controller audit | `cargo run -- --user alice --task parser-project` |
+| `Day-14` | Хранимые отдельно инварианты и блокирующая проверка ответа/replan | `cargo run -- --user alice --task parser-project` |
 
 ```bash
-git switch Day-13
+git switch Day-14
 cargo run -- --user alice --task parser-project
 ```
 
@@ -33,7 +34,8 @@ cargo run -- --user alice --task parser-project
 Day 4 продолжает Day 3, Day 5 продолжает Day 4, Day 6 продолжает Day 5,
 Day 7 продолжает Day 6, Day 8 продолжает Day 7, Day 9 продолжает Day 8,
 Day 10 продолжает Day 9, Day 11 продолжает Day 10, Day 12 продолжает Day 11,
-Day 13 продолжает Day 12. [Результаты и проверочные сценарии Day 13](day13-results.md).
+Day 13 продолжает Day 12, Day 14 продолжает Day 13.
+[Результаты Day 13](day13-results.md), [результаты Day 14](day14-results.md).
 Поздние дни могут сохранять режимы предыдущих дней, но соответствующая ветка
 фиксирует свой этап.
 

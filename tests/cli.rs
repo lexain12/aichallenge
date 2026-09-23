@@ -334,6 +334,28 @@ fn run_cli_args(config_path: &Path, database: &Path, args: &[&str], input: &str)
     child.wait_with_output().expect("wait for deepseek-cli")
 }
 
+#[tokio::test]
+async fn configured_invariant_cannot_be_changed_from_cli_and_session_stays_open() {
+    let server = MockServer::start().await;
+    let mut config = NamedTempFile::new().unwrap();
+    write!(
+        config,
+        "api_key='key'\nbase_url='{}'\n[context]\nstrategy='summary'\n[[invariants]]\nid='STACK'\ntext='Use Rust only'",
+        server.uri()
+    )
+    .unwrap();
+    let output = run_cli(
+        config.path(),
+        "/invariant add STACK Use Go only\n/invariant remove STACK\n/invariant list\n/exit\n",
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("STACK · Use Rust only"), "{stdout}");
+    assert!(stderr.contains("defined in config"), "{stderr}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
 #[cfg(unix)]
 fn workflow_patch(version: u64) -> Value {
     json!({"expected_version":version,"plan_append":{"steps":[],"acceptance_criteria":[]},

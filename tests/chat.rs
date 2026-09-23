@@ -1,4 +1,6 @@
-use deepseek_cli::chat::{ChatHistory, InputAction, ProfileAction, Role, parse_input};
+use deepseek_cli::chat::{
+    ChatHistory, InputAction, InvariantAction, ProfileAction, Role, parse_input,
+};
 use deepseek_cli::memory::DurableMemoryScope;
 
 #[test]
@@ -89,6 +91,45 @@ fn parses_explicit_profile_commands_without_losing_free_form_text() {
         parse_input("/profile clear"),
         InputAction::Profile(ProfileAction::Clear)
     );
+}
+
+#[test]
+fn parses_local_invariant_commands() {
+    assert_eq!(
+        parse_input("/invariant list"),
+        InputAction::Invariant(InvariantAction::List)
+    );
+    assert_eq!(
+        parse_input("/invariant add STACK Use Rust only"),
+        InputAction::Invariant(InvariantAction::Add {
+            id: "STACK".into(),
+            text: "Use Rust only".into()
+        })
+    );
+    assert_eq!(
+        parse_input("/invariant remove STACK"),
+        InputAction::Invariant(InvariantAction::Remove { id: "STACK".into() })
+    );
+    assert!(matches!(
+        parse_input("/invariant add STACK"),
+        InputAction::InvalidCommand(_)
+    ));
+    assert!(matches!(
+        parse_input("/invariant remove STACK extra"),
+        InputAction::InvalidCommand(_)
+    ));
+    assert!(matches!(
+        parse_input("/invariant add bad.id Use Rust only"),
+        InputAction::InvalidCommand(_)
+    ));
+    assert!(matches!(
+        parse_input("/invariant remove bad.id"),
+        InputAction::InvalidCommand(_)
+    ));
+    assert!(matches!(
+        parse_input(&format!("/invariant add STACK {}", "x".repeat(4097))),
+        InputAction::InvalidCommand(_)
+    ));
 }
 
 #[test]

@@ -9,6 +9,7 @@ use deepseek_cli::client::{ClientError, DeepSeekClient, TokenUsage};
 use deepseek_cli::config::Config;
 use deepseek_cli::context::ContextSummary;
 use deepseek_cli::dialog::{DialogStore, StoreError};
+use deepseek_cli::invariants::{InvariantRepository, InvariantViolation};
 use deepseek_cli::memory::{DurableMemoryScope, MemoryRepository, RequestScope};
 use deepseek_cli::profile::ProfileRepository;
 use deepseek_cli::workflow::{
@@ -865,18 +866,188 @@ async fn pipeline_collects_all_proposals_on_one_snapshot_and_rejects_conflicts()
 }
 
 #[tokio::test]
-async fn blocking_checker_is_rejected_before_streaming_can_start() {
+async fn blocking_checker_runs_first_and_stops_advisory_checkers() {
+    let seen: Arc<Mutex<Vec<WorkflowTaskState>>> = Arc::default();
     let checker = ProposedChecker {
         name: "blocking",
         mode: CheckerMode::Blocking,
         patch: empty_patch(0),
-        decision: ControllerDecision::AwaitUser,
-        seen: Arc::default(),
+        decision: ControllerDecision::Block {
+            violations: vec![InvariantViolation {
+                id: "STACK".into(),
+                reason: "Go conflicts with Rust".into(),
+            }],
+        },
+        seen: seen.clone(),
     };
+    let advisory_seen: Arc<Mutex<Vec<WorkflowTaskState>>> = Arc::default();
+    let advisory = ProposedChecker {
+        name: "continuation",
+        mode: CheckerMode::Advisory,
+        patch: empty_patch(0),
+        decision: ControllerDecision::AwaitUser,
+        seen: advisory_seen.clone(),
+    };
+    let pipeline = ResponsePipeline::new(vec![Arc::new(checker), Arc::new(advisory)]).unwrap();
+    let f = Fixture::new(Some(TaskPhase::Planning), TaskStatus::Active).await;
+    let context = CheckContext {
+        task: f.current().unwrap(),
+        stage_messages: vec![],
+        triggering_input: WorkflowInput {
+            source: WorkflowInputSource::Human,
+            intent: WorkflowIntent::human_continue("use Go").unwrap(),
+        },
+    };
+    let mut budget = AutonomyBudget::new(f.config.workflow());
     assert!(matches!(
-        ResponsePipeline::new(vec![Arc::new(checker)]),
-        Err(WorkflowEngineError::BlockingCheckerRequiresBufferedDelivery)
+        pipeline
+            .check_blocking(&context, "use Go", &mut budget)
+            .await,
+        deepseek_cli::workflow_engine::BlockingOutcome::Denied { .. }
     ));
+    assert_eq!(budget.tokens(), usage().total_tokens);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(advisory_seen.lock().unwrap().is_empty());
+}
+
+// Break caught: a streamed candidate cannot be retracted after a blocking denial.
+#[tokio::test]
+async fn denied_candidate_never_reaches_output_or_assistant_storage() {
+    let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+    f.store
+        .upsert_invariant(&f.scope, "STACK", "Use Rust only")
+        .unwrap();
+    f.interpreter.reply(interpretation(
+        json!({"type":"continue","instruction":"use Go"}),
+    ));
+    f.checker.reply(
+        json!({"type":"deny","violations":[{"id":"STACK","reason":"Go is a different language"}]}),
+    );
+    f.ordinary(ordinary_response("Implement it in Go", true))
+        .await;
+    let mut visible = String::new();
+    let result = f
+        .run("use Go", |event| {
+            if let AgentEvent::Text(text) = event {
+                visible.push_str(text);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(!visible.contains("Implement it in Go"));
+    assert!(visible.contains("STACK"));
+    assert!(result.answer.unwrap().contains("Use Rust only"));
+    assert_eq!(f.count("response_processing"), 0);
+    assert_eq!(f.count("messages"), 2);
+}
+
+// Break caught: human replan currently commits before response checkers run.
+#[tokio::test]
+async fn denied_replan_preserves_exact_task_projection_and_skips_ordinary_model() {
+    let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+    f.store
+        .upsert_invariant(&f.scope, "STACK", "Use Rust only")
+        .unwrap();
+    let before = f.current().unwrap();
+    f.interpreter.reply(interpretation(
+        json!({"type":"replan_current","change_request":"rewrite backend in Go"}),
+    ));
+    f.checker.reply(
+        json!({"type":"deny","violations":[{"id":"STACK","reason":"Go conflicts with Rust"}]}),
+    );
+    let result = f.run("replan in Go", |_| Ok(())).await.unwrap();
+    assert!(result.answer.unwrap().contains("STACK"));
+    assert_eq!(f.current().unwrap(), before);
+    assert_eq!(f.count("task_stage_runs"), 1);
+    assert!(f.server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn denied_new_task_is_not_created() {
+    let mut f = Fixture::new(None, TaskStatus::Active).await;
+    f.store
+        .upsert_invariant(&f.scope, "STACK", "Use Rust only")
+        .unwrap();
+    f.checker.reply(
+        json!({"type":"deny","violations":[{"id":"STACK","reason":"Go conflicts with Rust"}]}),
+    );
+    let result = f.run("Build the backend in Go", |_| Ok(())).await.unwrap();
+    assert!(result.answer.unwrap().contains("STACK"));
+    assert!(f.current().is_none());
+    assert_eq!(f.count("workflow_tasks"), 0);
+    assert!(f.server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn malformed_invariant_verdict_withholds_candidate_and_reports_unavailable_check() {
+    let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+    f.store
+        .upsert_invariant(&f.scope, "STACK", "Use Rust only")
+        .unwrap();
+    f.interpreter.reply(interpretation(
+        json!({"type":"continue","instruction":"continue"}),
+    ));
+    f.checker.reply(json!({"type":"allow","extra":"invalid"}));
+    f.ordinary(ordinary_response("Unverified candidate", true))
+        .await;
+    let mut visible = String::new();
+    let result = f
+        .run("continue", |event| {
+            if let AgentEvent::Text(text) = event {
+                visible.push_str(text);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(!visible.contains("Unverified candidate"));
+    assert!(visible.contains("проверка инвариантов недоступна"));
+    assert!(
+        result
+            .answer
+            .unwrap()
+            .contains("проверка инвариантов недоступна")
+    );
+    assert_eq!(f.count("response_processing"), 0);
+}
+
+#[tokio::test]
+async fn allowed_candidate_is_released_once_before_advisory_processing() {
+    let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
+    f.store
+        .upsert_invariant(&f.scope, "STACK", "Use Rust only")
+        .unwrap();
+    f.interpreter.reply(interpretation(
+        json!({"type":"continue","instruction":"continue"}),
+    ));
+    f.checker.reply(json!({"type":"allow"}));
+    f.checker
+        .reply(checked(1, None, json!({"type":"await_user"})));
+    f.ordinary(ordinary_response("Implement it in Rust", true))
+        .await;
+    let mut visible = String::new();
+    let result = f
+        .run("continue", |event| {
+            if let AgentEvent::Text(text) = event {
+                visible.push_str(text);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(visible, "Implement it in Rust");
+    assert_eq!(result.answer.as_deref(), Some("Implement it in Rust"));
+    assert_eq!(f.count("response_processing"), 1);
+    let requests = f.server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: Value = requests[0].body_json().unwrap();
+    assert!(
+        body["messages"]
+            .to_string()
+            .contains("Mandatory project invariants")
+    );
+    assert!(body["messages"].to_string().contains("Use Rust only"));
 }
 
 #[tokio::test]

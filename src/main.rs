@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use deepseek_cli::agent::{Agent, AgentError, AgentEvent};
-use deepseek_cli::chat::{InputAction, ProfileAction, Role, parse_input};
+use deepseek_cli::chat::{InputAction, InvariantAction, ProfileAction, Role, parse_input};
 use deepseek_cli::client::ClientError;
 use deepseek_cli::config::{Config, ConfigError};
 use deepseek_cli::dialog::{DialogStore, StoreError};
@@ -360,6 +360,47 @@ async fn run() -> Result<(), AppError> {
                     };
                     stdout_ui.write_block(&mut stdout, BlockStyle::System, &message)?;
                 }
+            },
+            InputAction::Invariant(action) => match action {
+                InvariantAction::List => {
+                    let snapshot = agent.invariants()?;
+                    let message = if snapshot.is_empty() {
+                        "Invariants · empty".to_owned()
+                    } else {
+                        snapshot
+                            .rules()
+                            .iter()
+                            .map(|rule| format!("{} · {}", rule.id, rule.text))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    stdout_ui.write_block(&mut stdout, BlockStyle::System, &message)?;
+                }
+                InvariantAction::Add { id, text } => match agent.upsert_invariant(&id, &text) {
+                    Ok(()) => stdout_ui.write_block(
+                        &mut stdout,
+                        BlockStyle::System,
+                        &format!("Saved invariant · {id}"),
+                    )?,
+                    Err(error @ AgentError::Store(StoreError::ConfiguredInvariant(_))) => {
+                        stderr_ui.write_block(&mut stderr, BlockStyle::Error, &error.to_string())?
+                    }
+                    Err(error) => return Err(error.into()),
+                },
+                InvariantAction::Remove { id } => match agent.delete_invariant(&id) {
+                    Ok(removed) => {
+                        let message = if removed {
+                            format!("Removed invariant · {id}")
+                        } else {
+                            format!("No invariant named {id}")
+                        };
+                        stdout_ui.write_block(&mut stdout, BlockStyle::System, &message)?;
+                    }
+                    Err(error @ AgentError::Store(StoreError::ConfiguredInvariant(_))) => {
+                        stderr_ui.write_block(&mut stderr, BlockStyle::Error, &error.to_string())?
+                    }
+                    Err(error) => return Err(error.into()),
+                },
             },
             InputAction::Branch => match agent.branch_dialog() {
                 Ok(fork) => stdout_ui.write_block(

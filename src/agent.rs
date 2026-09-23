@@ -12,6 +12,7 @@ use crate::context::{
 use crate::debug_log::{DebugLog, RequestMetadata, WorkflowDebugEvent};
 use crate::dialog::{BranchInfo, DialogStore, ForkResult, StoreError};
 use crate::facts::{FactsState, parse_facts_json, plan_facts_update};
+use crate::invariants::{InvariantRepository, InvariantSet};
 use crate::memory::{
     ContextError, ContextProvider, DurableMemoryScope, MemoryRepository, MemorySnapshot,
     RequestScope,
@@ -55,6 +56,7 @@ pub struct Agent {
     debug_log: DebugLog,
     workflow_config: Option<WorkflowConfig>,
     workflow_models: Option<WorkflowModels>,
+    requires_invariant_store: bool,
 }
 
 impl Agent {
@@ -66,10 +68,11 @@ impl Agent {
     /// Start a fresh persistent dialog within the addressed user and task.
     pub fn with_store_for_scope(
         config: &Config,
-        store: DialogStore,
+        mut store: DialogStore,
         scope: RequestScope,
     ) -> Result<Self, ClientError> {
         let mut agent = Self::new(config)?;
+        store.set_config_invariants(config.invariants().to_vec());
         agent.store = Some(store);
         agent.scope = scope.with_dialog_id(None);
         Ok(agent)
@@ -152,6 +155,30 @@ impl Agent {
             .delete_profile(self.scope.user_id())?)
     }
 
+    pub fn invariants(&self) -> Result<InvariantSet, AgentError> {
+        Ok(self
+            .store
+            .as_ref()
+            .ok_or(AgentError::InvariantRequiresStore)?
+            .load_invariants(&self.scope)?)
+    }
+
+    pub fn upsert_invariant(&mut self, id: &str, text: &str) -> Result<(), AgentError> {
+        self.store
+            .as_mut()
+            .ok_or(AgentError::InvariantRequiresStore)?
+            .upsert_invariant(&self.scope, id, text)?;
+        Ok(())
+    }
+
+    pub fn delete_invariant(&mut self, id: &str) -> Result<bool, AgentError> {
+        Ok(self
+            .store
+            .as_mut()
+            .ok_or(AgentError::InvariantRequiresStore)?
+            .delete_invariant(&self.scope, id)?)
+    }
+
     /// Statistics for the latest request, not a sum over the conversation.
     pub fn last_usage(&self) -> Option<TokenUsage> {
         self.last_usage
@@ -186,6 +213,7 @@ impl Agent {
             debug_log: DebugLog::from_config(config.debug(), config.api_key()),
             workflow_config: Some(config.workflow().clone()),
             workflow_models: Some(workflow_models),
+            requires_invariant_store: !config.invariants().is_empty(),
         })
     }
 
@@ -207,6 +235,7 @@ impl Agent {
             debug_log: DebugLog::new(None, false, ""),
             workflow_config: None,
             workflow_models: None,
+            requires_invariant_store: false,
         }
     }
 
@@ -243,6 +272,18 @@ impl Agent {
     where
         F: FnMut(AgentEvent<'_>) -> io::Result<()>,
     {
+        if self.store.is_none() && self.requires_invariant_store {
+            return Err(AgentError::InvariantRequiresStore);
+        }
+        if self.store.is_some()
+            && !self
+                .workflow_config
+                .as_ref()
+                .is_some_and(WorkflowConfig::enabled)
+            && !self.invariants()?.is_empty()
+        {
+            return Err(AgentError::InvariantsRequireWorkflow);
+        }
         if self.store.is_some()
             && self
                 .workflow_config
@@ -1000,6 +1041,10 @@ pub enum AgentError {
     MemoryRequiresStore,
     #[error("user profiles require a persistent store")]
     ProfileRequiresStore,
+    #[error("invariants require a persistent store")]
+    InvariantRequiresStore,
+    #[error("project invariants require workflow.enabled = true")]
+    InvariantsRequireWorkflow,
     #[error(transparent)]
     Context(#[from] ContextError),
     #[error(transparent)]

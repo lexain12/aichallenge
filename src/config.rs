@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -5,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
+
+use crate::invariants::{InvariantRule, invariant_id, invariant_text};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
@@ -76,6 +79,13 @@ struct RawWorkflowConfig {
     max_autonomous_tokens: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInvariantConfig {
+    id: String,
+    text: String,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -96,6 +106,8 @@ struct RawConfig {
     debug: RawDebugConfig,
     #[serde(default)]
     workflow: RawWorkflowConfig,
+    #[serde(default)]
+    invariants: Vec<RawInvariantConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -316,6 +328,7 @@ pub struct Config {
     context: ContextConfig,
     debug: DebugConfig,
     workflow: WorkflowConfig,
+    invariants: Vec<InvariantRule>,
 }
 
 impl Config {
@@ -457,6 +470,28 @@ impl Config {
             });
         }
         let workflow = WorkflowConfig::from_raw(raw.workflow, &model)?;
+        let mut invariant_ids = HashSet::new();
+        let mut invariants = Vec::with_capacity(raw.invariants.len());
+        for rule in raw.invariants {
+            let id = invariant_id(&rule.id).map_err(|_| ConfigError::InvalidField {
+                field: "invariants.id",
+                reason: "must contain 1..64 ASCII letters, digits, hyphens or underscores",
+            })?;
+            let text = invariant_text(&rule.text).map_err(|_| ConfigError::InvalidField {
+                field: "invariants.text",
+                reason: "must contain 1..4096 characters",
+            })?;
+            if !invariant_ids.insert(id.to_owned()) {
+                return Err(ConfigError::InvalidField {
+                    field: "invariants.id",
+                    reason: "IDs must be unique",
+                });
+            }
+            invariants.push(InvariantRule {
+                id: id.to_owned(),
+                text: text.to_owned(),
+            });
+        }
         Ok(Self {
             top_p: raw.top_p,
             stop,
@@ -483,6 +518,7 @@ impl Config {
                 log_payloads: raw.debug.log_payloads.unwrap_or(false),
             },
             workflow,
+            invariants,
         })
     }
 
@@ -509,6 +545,10 @@ impl Config {
 
     pub fn workflow(&self) -> &WorkflowConfig {
         &self.workflow
+    }
+
+    pub fn invariants(&self) -> &[InvariantRule] {
+        &self.invariants
     }
 
     pub fn api_key(&self) -> &str {
@@ -565,6 +605,7 @@ impl fmt::Debug for Config {
             .field("context", &self.context)
             .field("debug", &self.debug)
             .field("workflow", &self.workflow)
+            .field("invariants", &self.invariants)
             .finish()
     }
 }

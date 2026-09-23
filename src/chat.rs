@@ -1,4 +1,5 @@
 use crate::client::TokenUsage;
+use crate::invariants::{invariant_id, invariant_text};
 use crate::memory::DurableMemoryScope;
 use serde::Serialize;
 
@@ -73,6 +74,7 @@ pub enum InputAction {
     },
     Memory(Option<DurableMemoryScope>),
     Profile(ProfileAction),
+    Invariant(InvariantAction),
     InvalidCommand(String),
     Send(String),
 }
@@ -85,10 +87,45 @@ pub enum ProfileAction {
     Clear,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum InvariantAction {
+    List,
+    Add { id: String, text: String },
+    Remove { id: String },
+}
+
 pub fn parse_input(input: &str) -> InputAction {
     let input = input.trim();
     let mut parts = input.split_whitespace();
     match parts.next() {
+        Some("/invariant") => {
+            let action = match parts.next() {
+                Some("list") if parts.next().is_none() => Some(InvariantAction::List),
+                Some("add") => {
+                    let id = parts.next();
+                    let text = parts.collect::<Vec<_>>().join(" ");
+                    id.filter(|id| invariant_id(id).is_ok() && invariant_text(&text).is_ok())
+                        .map(|id| InvariantAction::Add {
+                            id: id.to_owned(),
+                            text,
+                        })
+                }
+                Some("remove") => {
+                    let id = parts.next();
+                    id.filter(|id| invariant_id(id).is_ok() && parts.next().is_none())
+                        .map(|id| InvariantAction::Remove { id: id.to_owned() })
+                }
+                _ => None,
+            };
+            return action.map_or_else(
+                || {
+                    InputAction::InvalidCommand(
+                        "usage: /invariant <list|add <id> <text>|remove <id>>".to_owned(),
+                    )
+                },
+                InputAction::Invariant,
+            );
+        }
         Some("/profile") => {
             let arguments = input
                 .strip_prefix("/profile")

@@ -27,6 +27,38 @@ fn applies_defaults_and_reads_file_key() {
 }
 
 #[test]
+fn accepts_app_wide_invariants_in_toml() {
+    let config = Config::from_toml(
+        "api_key='key'\n[context]\nstrategy='summary'\n[[invariants]]\nid='STACK'\ntext='Use Rust only'",
+        None,
+    );
+    assert!(
+        config.is_ok(),
+        "configured invariants should be accepted: {config:?}"
+    );
+    let rules = config.unwrap().invariants().to_vec();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id, "STACK");
+    assert_eq!(rules[0].text, "Use Rust only");
+}
+
+#[test]
+fn rejects_invalid_and_duplicate_configured_invariants() {
+    for invariants in [
+        "[[invariants]]\nid='bad.id'\ntext='Use Rust'",
+        "[[invariants]]\nid='STACK'\ntext='   '",
+        "[[invariants]]\nid='STACK'\ntext='Use Rust'\n[[invariants]]\nid='STACK'\ntext='Use Go'",
+    ] {
+        let error = Config::from_toml(
+            &format!("api_key='key'\n[context]\nstrategy='summary'\n{invariants}"),
+            None,
+        )
+        .expect_err("invalid invariant must fail config load");
+        assert!(error.to_string().contains("invariants"), "{error}");
+    }
+}
+
+#[test]
 fn accepts_all_supported_overrides() {
     let file = write_config(
         r#"

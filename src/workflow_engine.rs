@@ -14,6 +14,9 @@ use crate::context::{ContextState, ContextSummary, prepare_request};
 use crate::debug_log::{WorkflowDebugEvent, WorkflowDebugMetadata, WorkflowDebugPayload};
 use crate::dialog::{DialogStore, StoreError};
 use crate::facts::{FactsError, parse_facts_json, plan_facts_update};
+use crate::invariants::{
+    InvariantRepository, InvariantVerdict, InvariantViolation, render_invariant_refusal,
+};
 use crate::memory::{ContextError, ContextProvider, MemoryRepository, RequestScope};
 use crate::profile::ProfileRepository;
 use crate::system_context::SystemBlock;
@@ -29,8 +32,8 @@ use crate::workflow_context::{
 use crate::workflow_model::{
     CheckContext, CheckError, CheckerMode, CompletionModel, ContinuationChecker,
     ControllerDecision, HandoffBuildResult, HandoffBuilder, HumanInputInterpreter,
-    HumanInterpretation, ModelPolicyError, ResponseChecker, parse_continuation_check,
-    project_handoff,
+    HumanInterpretation, InvariantChecker, ModelPolicyError, ResponseChecker,
+    parse_continuation_check, project_handoff,
 };
 use crate::workflow_store::{
     AcceptedInputEffect, AnswerCommit, ControllerInputCommit, DialogWorkflowSnapshot,
@@ -146,6 +149,13 @@ pub struct ResponsePipeline {
     checkers: Vec<Arc<dyn ResponseChecker>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockingOutcome {
+    Allowed,
+    Denied { violations: Vec<InvariantViolation> },
+    Unavailable,
+}
+
 #[derive(Debug)]
 pub enum PipelineOutcome {
     AwaitUser {
@@ -193,13 +203,53 @@ struct CheckerObservation {
 
 impl ResponsePipeline {
     pub fn new(checkers: Vec<Arc<dyn ResponseChecker>>) -> Result<Self, WorkflowEngineError> {
-        if checkers
-            .iter()
-            .any(|checker| checker.mode() == CheckerMode::Blocking)
-        {
-            return Err(WorkflowEngineError::BlockingCheckerRequiresBufferedDelivery);
+        let mut advisory_seen = false;
+        for checker in &checkers {
+            match checker.mode() {
+                CheckerMode::Advisory => advisory_seen = true,
+                CheckerMode::Blocking if advisory_seen => {
+                    return Err(WorkflowEngineError::BlockingCheckerAfterAdvisory);
+                }
+                CheckerMode::Blocking => {}
+            }
         }
         Ok(Self { checkers })
+    }
+
+    pub fn has_blocking(&self) -> bool {
+        self.checkers
+            .first()
+            .is_some_and(|checker| checker.mode() == CheckerMode::Blocking)
+    }
+
+    pub async fn check_blocking(
+        &self,
+        context: &CheckContext,
+        response: &str,
+        budget: &mut AutonomyBudget,
+    ) -> BlockingOutcome {
+        for checker in &self.checkers {
+            if checker.mode() != CheckerMode::Blocking {
+                break;
+            }
+            match checker.check(context, response).await {
+                Ok(result) => {
+                    budget.record_usage(result.usage);
+                    match result.decision {
+                        ControllerDecision::AwaitUser if result.patch.is_empty() => {}
+                        ControllerDecision::Block { violations } if !violations.is_empty() => {
+                            return BlockingOutcome::Denied { violations };
+                        }
+                        _ => return BlockingOutcome::Unavailable,
+                    }
+                }
+                Err(error) => {
+                    budget.record_usage(error.usage());
+                    return BlockingOutcome::Unavailable;
+                }
+            }
+        }
+        BlockingOutcome::Allowed
     }
 
     pub async fn collect(
@@ -229,6 +279,9 @@ impl ResponsePipeline {
         let mut low_confidence = false;
         // Collect every checker against this one immutable snapshot before deciding effects.
         for checker in &self.checkers {
+            if checker.mode() == CheckerMode::Blocking {
+                continue;
+            }
             match checker
                 .check_observed(context, response, capture_payloads)
                 .await
@@ -333,6 +386,9 @@ impl ResponsePipeline {
         }
         let outcome = match decision.unwrap_or(ControllerDecision::AwaitUser) {
             ControllerDecision::AwaitUser => PipelineOutcome::AwaitUser { patch },
+            ControllerDecision::Block { .. } => PipelineOutcome::FailedOpen {
+                error: "advisory checker returned blocking decision".into(),
+            },
             ControllerDecision::Continue {
                 instruction,
                 confidence,
@@ -896,6 +952,8 @@ pub struct WorkflowEngine<'a> {
     interpreter: HumanInputInterpreter,
     handoff_builder: HandoffBuilder,
     pipeline: ResponsePipeline,
+    invariant_checker: Option<Arc<InvariantChecker>>,
+    checker_completion_model: Arc<dyn CompletionModel>,
     workflow_config: WorkflowConfig,
     interpreter_model: String,
     checker_model: String,
@@ -1002,6 +1060,8 @@ impl<'a> WorkflowEngine<'a> {
                 workflow_config,
             ))])
             .expect("continuation checker is advisory"),
+            invariant_checker: None,
+            checker_completion_model: models.checker.clone(),
             workflow_config: workflow_config.clone(),
             interpreter_model: models.interpreter.name().to_owned(),
             checker_model: models.checker.name().to_owned(),
@@ -1270,6 +1330,16 @@ impl<'a> WorkflowEngine<'a> {
         *self.session.last_usage = None;
         let mut budget = AutonomyBudget::new(&self.workflow_config);
         WorkflowIntent::human_continue(prompt)?;
+        let rules = self.session.store.load_invariants(self.session.scope)?;
+        if !rules.is_empty() {
+            let checker = Arc::new(InvariantChecker::new(
+                self.checker_completion_model.clone(),
+                rules,
+                self.workflow_config.checker_max_tokens(),
+            ));
+            self.pipeline.checkers.insert(0, checker.clone());
+            self.invariant_checker = Some(checker);
+        }
         let (mut routing, input_observation) = if let Some(dialog_id) = *self.session.dialog_id {
             let snapshot = self.session.store.load_workflow(dialog_id)?;
             let input_state = snapshot.current_task.clone();
@@ -1357,6 +1427,26 @@ impl<'a> WorkflowEngine<'a> {
                 };
                 (intent, None, observation)
             };
+            if matches!(
+                intent,
+                WorkflowIntent::StartNewTask { .. } | WorkflowIntent::ReplanCurrent { .. }
+            ) {
+                let proposed = WorkflowInput {
+                    source: WorkflowInputSource::Human,
+                    intent: intent.clone(),
+                };
+                if let Some(result) = self
+                    .check_proposed_input(input_state.as_ref(), &proposed, &mut budget)
+                    .await
+                {
+                    return self.finish_invariant_rejection(
+                        result,
+                        input_state,
+                        &budget,
+                        &mut on_event,
+                    );
+                }
+            }
             let routing = WorkflowInputHandler {
                 store: self.session.store,
                 handoff_builder: &self.handoff_builder,
@@ -1377,6 +1467,18 @@ impl<'a> WorkflowEngine<'a> {
             .await?;
             (routing, observation)
         } else {
+            let proposed = WorkflowInput {
+                source: WorkflowInputSource::Human,
+                intent: WorkflowIntent::StartNewTask {
+                    goal: prompt.trim().to_owned(),
+                },
+            };
+            if let Some(result) = self
+                .check_proposed_input(None, &proposed, &mut budget)
+                .await
+            {
+                return self.finish_invariant_rejection(result, None, &budget, &mut on_event);
+            }
             let started = self.session.store.start_dialog_with_workflow_task(
                 self.session.scope,
                 self.session.history.system_prompt(),
@@ -1545,6 +1647,67 @@ impl<'a> WorkflowEngine<'a> {
                     }
                 }
             }
+        }
+    }
+
+    async fn check_proposed_input(
+        &mut self,
+        state: Option<&WorkflowTaskState>,
+        input: &WorkflowInput,
+        budget: &mut AutonomyBudget,
+    ) -> Option<BlockingOutcome> {
+        let checker = self.invariant_checker.as_ref()?;
+        match checker.check_proposed_input(state, input).await {
+            Ok((InvariantVerdict::Allow, usage)) => {
+                budget.record_usage(usage);
+                None
+            }
+            Ok((InvariantVerdict::Deny { violations }, usage)) => {
+                budget.record_usage(usage);
+                Some(BlockingOutcome::Denied { violations })
+            }
+            Err(error) => {
+                budget.record_usage(error.usage());
+                Some(BlockingOutcome::Unavailable)
+            }
+        }
+    }
+
+    fn finish_invariant_rejection<F>(
+        &self,
+        outcome: BlockingOutcome,
+        state: Option<WorkflowTaskState>,
+        budget: &AutonomyBudget,
+        on_event: &mut F,
+    ) -> Result<WorkflowTurnResult, WorkflowEngineError>
+    where
+        F: FnMut(AgentEvent<'_>) -> io::Result<()>,
+    {
+        let reason = self.invariant_message(&outcome);
+        emit(on_event, AgentEvent::Text(&reason))?;
+        self.finish(
+            RoutingOutcome::Rejected {
+                reason: reason.clone(),
+                state,
+            },
+            Some(reason),
+            None,
+            AutonomyStopReason::AwaitUser,
+            budget,
+            on_event,
+        )
+    }
+
+    fn invariant_message(&self, outcome: &BlockingOutcome) -> String {
+        match outcome {
+            BlockingOutcome::Denied { violations } => self.invariant_checker.as_ref().map_or_else(
+                || "Не могу продолжить: проверка инвариантов недоступна.".to_owned(),
+                |checker| render_invariant_refusal(checker.rules(), violations),
+            ),
+            BlockingOutcome::Unavailable => {
+                "Не могу продолжить: проверка инвариантов недоступна.".to_owned()
+            }
+            BlockingOutcome::Allowed => String::new(),
         }
     }
 
@@ -2234,10 +2397,15 @@ impl<'a> WorkflowEngine<'a> {
             .iter()
             .map(|message| message.content().chars().count())
             .sum();
+        let buffered = self.pipeline.has_blocking();
         let mut usage = None;
         let result = self
             .client
             .stream_chat_events(prepared.messages(), |event| match event {
+                StreamEvent::Text(text) if buffered => {
+                    let _ = text;
+                    Ok(())
+                }
                 StreamEvent::Text(text) => on_event(AgentEvent::Text(text)),
                 StreamEvent::Usage(value) => {
                     usage = Some(value);
@@ -2292,6 +2460,44 @@ impl<'a> WorkflowEngine<'a> {
                 None,
             );
             return Err(WorkflowEngineError::provider("ordinary", error));
+        }
+        if buffered {
+            let state =
+                diagnostic_state
+                    .as_ref()
+                    .ok_or(WorkflowEngineError::InvalidInputContext(
+                        "blocking checker requires workflow task",
+                    ))?;
+            let stage_messages = self
+                .session
+                .store
+                .load_stage_messages(state.current_stage_run_id)?
+                .into_iter()
+                .map(|row| row.message)
+                .collect();
+            let context = CheckContext {
+                task: state.clone(),
+                stage_messages,
+                triggering_input: WorkflowInput {
+                    source: WorkflowInputSource::Human,
+                    intent: WorkflowIntent::Continue {
+                        instruction: prompt.to_owned(),
+                    },
+                },
+            };
+            let outcome = self
+                .pipeline
+                .check_blocking(&context, &answer, budget)
+                .await;
+            if outcome != BlockingOutcome::Allowed {
+                let refusal = self.invariant_message(&outcome);
+                emit(on_event, AgentEvent::Text(&refusal))?;
+                return Ok(OrdinaryTurn {
+                    answer: refusal,
+                    persisted_answer: None,
+                });
+            }
+            emit(on_event, AgentEvent::Text(&answer))?;
         }
         let output_chars = answer.chars().count();
         let model_output = self.capture_payloads().then(|| answer.clone());
@@ -2761,6 +2967,12 @@ impl<'a> WorkflowEngine<'a> {
                 .load_memory(self.session.scope)?
                 .blocks(self.session.scope)?,
         );
+        blocks.extend(
+            self.session
+                .store
+                .load_invariants(self.session.scope)?
+                .blocks(self.session.scope)?,
+        );
         Ok(blocks)
     }
 }
@@ -2928,8 +3140,8 @@ where
 
 #[derive(Debug, Error)]
 pub enum WorkflowEngineError {
-    #[error("blocking response checkers require buffered delivery")]
-    BlockingCheckerRequiresBufferedDelivery,
+    #[error("blocking response checkers must precede advisory checkers")]
+    BlockingCheckerAfterAdvisory,
     #[error("autonomous continuation stopped: {0:?}")]
     AutonomyStopped(AutonomyStopReason),
     #[error("invalid workflow input context: {0}")]

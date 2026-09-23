@@ -9,6 +9,9 @@ use crate::chat::{Message, Role};
 use crate::client::TokenUsage;
 use crate::context::{ContextState, ContextSummary, UsageTotals};
 use crate::facts::{Facts, FactsState};
+use crate::invariants::{
+    InvariantError, InvariantRepository, InvariantRule, InvariantSet, invariant_id, invariant_text,
+};
 use crate::memory::{
     MemoryAddress, MemoryError, MemoryRepository, MemorySnapshot, RequestScope, memory_key,
     memory_value,
@@ -19,6 +22,7 @@ use crate::profile::{
 
 pub struct DialogStore {
     pub(crate) connection: Connection,
+    config_invariants: Vec<InvariantRule>,
 }
 
 pub struct StoredDialog {
@@ -136,6 +140,14 @@ impl DialogStore {
                  user_id TEXT PRIMARY KEY,
                  content_markdown TEXT NOT NULL,
                  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+             );
+             CREATE TABLE IF NOT EXISTS invariants (
+                 user_id TEXT NOT NULL,
+                 task_id TEXT NOT NULL,
+                 rule_id TEXT NOT NULL,
+                 rule_text TEXT NOT NULL,
+                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
+                 PRIMARY KEY (user_id, task_id, rule_id)
              );",
         )?;
         connection.execute(
@@ -144,7 +156,14 @@ impl DialogStore {
             [],
         )?;
         crate::workflow_store::migrate(&mut connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            config_invariants: Vec::new(),
+        })
+    }
+
+    pub(crate) fn set_config_invariants(&mut self, rules: Vec<InvariantRule>) {
+        self.config_invariants = rules;
     }
 
     /// Create a dialog and its first user message in one durable transaction.
@@ -1007,6 +1026,70 @@ impl ProfileRepository for DialogStore {
     }
 }
 
+impl InvariantRepository for DialogStore {
+    type Error = StoreError;
+
+    fn load_invariants(&self, scope: &RequestScope) -> Result<InvariantSet, Self::Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT rule_id, rule_text FROM invariants
+             WHERE user_id = ?1 AND task_id = ?2 ORDER BY rule_id",
+        )?;
+        let rows = statement.query_map(params![scope.user_id(), scope.task_id()], |row| {
+            Ok(InvariantRule {
+                id: row.get(0)?,
+                text: row.get(1)?,
+            })
+        })?;
+        let mut rules = std::collections::BTreeMap::new();
+        for rule in &self.config_invariants {
+            rules.insert(rule.id.clone(), rule.clone());
+        }
+        for row in rows {
+            let rule = row?;
+            invariant_id(&rule.id)?;
+            invariant_text(&rule.text)?;
+            rules.entry(rule.id.clone()).or_insert(rule);
+        }
+        Ok(InvariantSet::new(
+            scope.clone(),
+            rules.into_values().collect(),
+        ))
+    }
+
+    fn upsert_invariant(
+        &mut self,
+        scope: &RequestScope,
+        id: &str,
+        text: &str,
+    ) -> Result<(), Self::Error> {
+        let id = invariant_id(id)?;
+        let text = invariant_text(text)?;
+        if self.config_invariants.iter().any(|rule| rule.id == id) {
+            return Err(StoreError::ConfiguredInvariant(id.to_owned()));
+        }
+        self.connection.execute(
+            "INSERT INTO invariants (user_id, task_id, rule_id, rule_text)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id, task_id, rule_id) DO UPDATE SET
+                rule_text = excluded.rule_text,
+                updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
+            params![scope.user_id(), scope.task_id(), id, text],
+        )?;
+        Ok(())
+    }
+
+    fn delete_invariant(&mut self, scope: &RequestScope, id: &str) -> Result<bool, Self::Error> {
+        let id = invariant_id(id)?;
+        if self.config_invariants.iter().any(|rule| rule.id == id) {
+            return Err(StoreError::ConfiguredInvariant(id.to_owned()));
+        }
+        Ok(self.connection.execute(
+            "DELETE FROM invariants WHERE user_id = ?1 AND task_id = ?2 AND rule_id = ?3",
+            params![scope.user_id(), scope.task_id(), id],
+        )? > 0)
+    }
+}
+
 fn address_parts(address: &MemoryAddress) -> Result<(&'static str, &str, &str), MemoryError> {
     let user_id = address.user_id().trim();
     if user_id.is_empty() {
@@ -1139,6 +1222,10 @@ pub enum StoreError {
     InvalidMemory(#[from] MemoryError),
     #[error("invalid user profile: {0}")]
     InvalidProfile(#[from] ProfileError),
+    #[error("invalid invariant: {0}")]
+    InvalidInvariant(#[from] InvariantError),
+    #[error("invariant {0} is defined in config and cannot be changed here")]
+    ConfiguredInvariant(String),
     #[error("dialog {0} was not found")]
     NotFound(i64),
     #[error("dialog {0} changed in another session; restart with --resume {0}")]
