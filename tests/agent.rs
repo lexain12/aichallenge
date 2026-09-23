@@ -13,7 +13,9 @@ use deepseek_cli::workflow_engine::{
     AutonomyStopReason, WorkflowEngineError, WorkflowModels, WorkflowTurnEvent,
 };
 use deepseek_cli::workflow_model::{CompletionModel, ModelFuture, ModelRequest, ModelResponse};
-use deepseek_cli::workflow_store::{AnswerCommit, ProcessingStatus, WorkflowRepository};
+use deepseek_cli::workflow_store::{
+    AnswerCommit, PauseOutcome, ProcessingStatus, WorkflowRepository,
+};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
@@ -110,6 +112,40 @@ async fn config_invariants_cannot_be_bypassed_by_in_memory_agent() {
         agent.run_with_prompt("Use Go").await,
         Err(AgentError::InvariantRequiresStore)
     ));
+}
+
+#[test]
+fn debug_snapshot_reads_paused_task_without_resuming_or_changing_it() {
+    let config = Config::from_toml("api_key='key'\n[context]\nstrategy='summary'", None).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let mut store = DialogStore::open(&path).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "Build a CLI")
+        .unwrap();
+    let PauseOutcome::Paused(paused) = store.pause_current_task(started.dialog_id).unwrap() else {
+        panic!("task should pause");
+    };
+    let agent = Agent::from_dialog(&config, store, started.dialog_id).unwrap();
+    let snapshot = serde_json::to_value(agent.debug_snapshot().unwrap()).unwrap();
+    assert_eq!(snapshot["workflow"]["phase"], "planning");
+    assert_eq!(snapshot["workflow"]["status"], "paused");
+    assert_eq!(snapshot["workflow"]["goal"], "Build a CLI");
+    assert_eq!(snapshot["workflow"]["version"], paused.version);
+    assert_eq!(snapshot["processing"], Value::Null);
+    assert_eq!(
+        agent.workflow_status().unwrap().unwrap().status,
+        TaskStatus::Paused
+    );
+    assert_eq!(
+        DialogStore::open(&path)
+            .unwrap()
+            .load_workflow(started.dialog_id)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        *paused
+    );
 }
 
 // Break caught: disabling workflow must not silently bypass durable project rules.

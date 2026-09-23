@@ -276,6 +276,11 @@ async fn run() -> Result<(), AppError> {
             InputAction::Stats => {
                 stdout_ui.write_context_stats(&mut stdout, agent.context_stats()?)?;
             }
+            InputAction::Debug => {
+                let snapshot = agent.debug_snapshot()?;
+                let json = serde_json::to_string_pretty(&snapshot)?;
+                stdout_ui.write_block(&mut stdout, BlockStyle::System, &json)?;
+            }
             InputAction::TaskStatus => {
                 let status = agent.workflow_status()?;
                 stdout_ui.write_workflow_status(&mut stdout, status.as_ref())?;
@@ -748,6 +753,8 @@ enum AppError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Client(#[from] ClientError),
+    #[error("failed to serialize debug snapshot: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("terminal I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("interruption handling failed: {0}")]

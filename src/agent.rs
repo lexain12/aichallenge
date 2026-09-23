@@ -1,6 +1,7 @@
 use std::io;
 use std::sync::Arc;
 
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::chat::{ChatHistory, Message, Role};
@@ -12,14 +13,14 @@ use crate::context::{
 use crate::debug_log::{DebugLog, RequestMetadata, WorkflowDebugEvent};
 use crate::dialog::{BranchInfo, DialogStore, ForkResult, StoreError};
 use crate::facts::{FactsState, parse_facts_json, plan_facts_update};
-use crate::invariants::{InvariantRepository, InvariantSet};
+use crate::invariants::{InvariantRepository, InvariantRule, InvariantSet};
 use crate::memory::{
     ContextError, ContextProvider, DurableMemoryScope, MemoryRepository, MemorySnapshot,
     RequestScope,
 };
 use crate::profile::{ProfileRepository, UserProfile};
 use crate::system_context::{CompactionPolicy, ContextScope, SystemBlock, SystemBlockMetadata};
-use crate::workflow::{TaskPhase, TaskStatus, WorkflowTaskId};
+use crate::workflow::{TaskPhase, TaskStatus, WorkflowTaskId, WorkflowTaskState};
 use crate::workflow_engine::{
     RecoveredProcessing, WorkflowEngine, WorkflowEngineError, WorkflowModels, WorkflowSession,
 };
@@ -37,6 +38,22 @@ pub struct WorkflowStatus {
     pub expected_action: Option<String>,
     pub stage_sequence: u32,
     pub processing: Option<ProcessingStatus>,
+}
+
+#[derive(Serialize)]
+pub struct AgentDebugSnapshot {
+    scope: DebugScope,
+    workflow: Option<WorkflowTaskState>,
+    processing: Option<ProcessingStatus>,
+    context: ContextStats,
+    invariants: Vec<InvariantRule>,
+}
+
+#[derive(Serialize)]
+struct DebugScope {
+    user_id: String,
+    task_id: String,
+    dialog_id: Option<i64>,
 }
 
 /// An API client and its independent conversation, optionally backed by SQLite.
@@ -403,6 +420,35 @@ impl Agent {
             stage_sequence: task.current_stage_sequence,
             processing: snapshot.processing,
         }))
+    }
+
+    /// Read-only diagnostic projection; does not include raw protocol or dialog messages.
+    pub fn debug_snapshot(&self) -> Result<AgentDebugSnapshot, AgentError> {
+        if self.store.is_none() && self.requires_invariant_store {
+            return Err(AgentError::InvariantRequiresStore);
+        }
+        let (workflow, processing) = match (self.store.as_ref(), self.dialog_id) {
+            (Some(store), Some(dialog_id)) => {
+                let snapshot = store.load_workflow_status(dialog_id)?;
+                (snapshot.current_task, snapshot.processing)
+            }
+            _ => (None, None),
+        };
+        let invariants = match self.store.as_ref() {
+            Some(store) => store.load_invariants(&self.scope)?.rules().to_vec(),
+            None => Vec::new(),
+        };
+        Ok(AgentDebugSnapshot {
+            scope: DebugScope {
+                user_id: self.scope.user_id().to_owned(),
+                task_id: self.scope.task_id().to_owned(),
+                dialog_id: self.dialog_id,
+            },
+            workflow,
+            processing,
+            context: self.context_stats()?,
+            invariants,
+        })
     }
 
     pub async fn run_workflow_streaming<F>(

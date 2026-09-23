@@ -192,6 +192,15 @@ fn parses_task_status_command_exactly() {
 }
 
 #[test]
+fn debug_command_is_local_and_rejects_arguments() {
+    assert_eq!(parse_input(" /debug "), InputAction::Debug);
+    assert_eq!(
+        parse_input("/debug all"),
+        InputAction::InvalidCommand("usage: /debug".into())
+    );
+}
+
+#[test]
 fn stages_a_user_message_without_mutating_committed_history() {
     let history = ChatHistory::new("Be concise".into());
 

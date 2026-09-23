@@ -162,7 +162,7 @@ impl CompactionPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ContextStats {
     pub strategy: ContextStrategy,
     pub full_message_count: usize,

@@ -335,6 +335,25 @@ fn run_cli_args(config_path: &Path, database: &Path, args: &[&str], input: &str)
 }
 
 #[tokio::test]
+async fn debug_command_prints_local_snapshot_without_creating_a_task_or_calling_api() {
+    let server = MockServer::start().await;
+    let mut config = NamedTempFile::new().unwrap();
+    write!(
+        config,
+        "api_key='secret-key'\nbase_url='{}'\n[context]\nstrategy='summary'\n[[invariants]]\nid='STACK'\ntext='Use Rust only'",
+        server.uri()
+    )
+    .unwrap();
+    let output = run_cli(config.path(), "/debug\n/exit\n");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"workflow\": null"), "{stdout}");
+    assert!(stdout.contains("\"id\": \"STACK\""), "{stdout}");
+    assert!(!stdout.contains("secret-key"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn configured_invariant_cannot_be_changed_from_cli_and_session_stays_open() {
     let server = MockServer::start().await;
     let mut config = NamedTempFile::new().unwrap();
