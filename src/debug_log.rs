@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 use crate::chat::{Message, Role};
 use crate::client::TokenUsage;
 use crate::config::{ContextStrategy, DebugConfig};
+use crate::invariants::InvariantViolation;
 use crate::system_context::SystemBlockMetadata;
+use crate::workflow::{TaskPhase, TaskStatus};
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct RequestMetadata {
@@ -51,6 +53,12 @@ pub struct WorkflowDebugMetadata {
     pub autonomous_turn: u32,
     pub autonomous_tokens: u64,
     pub stage_run_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_revision: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_proposal_message_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_parse_result: Option<String>,
     pub transition_id: Option<i64>,
     pub processing_id: Option<i64>,
     pub processing_status: String,
@@ -62,6 +70,18 @@ pub struct WorkflowDebugMetadata {
     pub stage_message_count: usize,
     pub plan_step_count: usize,
     pub checkpoint_item_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_target: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub violation_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_intent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_phase: Option<TaskPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_status: Option<TaskStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -75,6 +95,7 @@ pub struct WorkflowDebugPayload {
     pub model_prompt: Option<String>,
     pub model_output: Option<String>,
     pub provider_error: Option<String>,
+    pub invariant_violations: Option<Vec<InvariantViolation>>,
 }
 
 #[derive(Clone, Debug)]

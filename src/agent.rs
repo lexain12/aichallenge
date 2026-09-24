@@ -33,6 +33,9 @@ pub struct WorkflowStatus {
     pub ordinal: u32,
     pub phase: TaskPhase,
     pub status: TaskStatus,
+    pub goal: String,
+    pub goal_revision: u32,
+    pub goal_proposal_message_id: Option<i64>,
     pub plan_revision: u32,
     pub current_step_id: Option<String>,
     pub expected_action: Option<String>,
@@ -43,6 +46,7 @@ pub struct WorkflowStatus {
 #[derive(Serialize)]
 pub struct AgentDebugSnapshot {
     scope: DebugScope,
+    active_profile: DebugActiveProfile,
     workflow: Option<WorkflowTaskState>,
     processing: Option<ProcessingStatus>,
     context: ContextStats,
@@ -54,6 +58,13 @@ struct DebugScope {
     user_id: String,
     task_id: String,
     dialog_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct DebugActiveProfile {
+    user_id: String,
+    configured: bool,
+    updated_at: Option<String>,
 }
 
 /// An API client and its independent conversation, optionally backed by SQLite.
@@ -414,6 +425,12 @@ impl Agent {
             ordinal: task.ordinal,
             phase: task.phase,
             status: task.status,
+            goal: task.goal,
+            goal_revision: task.goal_revision,
+            goal_proposal_message_id: task
+                .goal_proposal
+                .as_ref()
+                .map(|proposal| proposal.assistant_message_id),
             plan_revision: task.plan.revision,
             current_step_id: task.current_step_id,
             expected_action: task.expected_action,
@@ -438,11 +455,20 @@ impl Agent {
             Some(store) => store.load_invariants(&self.scope)?.rules().to_vec(),
             None => Vec::new(),
         };
+        let profile = match self.store.as_ref() {
+            Some(store) => store.load_profile(self.scope.user_id())?,
+            None => None,
+        };
         Ok(AgentDebugSnapshot {
             scope: DebugScope {
                 user_id: self.scope.user_id().to_owned(),
                 task_id: self.scope.task_id().to_owned(),
                 dialog_id: self.dialog_id,
+            },
+            active_profile: DebugActiveProfile {
+                user_id: self.scope.user_id().to_owned(),
+                configured: profile.is_some(),
+                updated_at: profile.map(|profile| profile.updated_at().to_owned()),
             },
             workflow,
             processing,

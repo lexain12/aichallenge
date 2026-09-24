@@ -23,14 +23,68 @@ fn config(strategy: &str, keep: usize) -> ContextConfig {
 }
 
 fn task() -> WorkflowTaskState {
-    WorkflowTaskState::new(
+    let mut task = WorkflowTaskState::new(
         WorkflowTaskId(1),
         1,
         1,
         "current goal".into(),
         StageRunId(1),
     )
-    .unwrap()
+    .unwrap();
+    task.phase = deepseek_cli::workflow::TaskPhase::Planning;
+    task.goal_revision = 1;
+    task
+}
+
+#[test]
+fn goal_definition_request_forbids_planning_and_requests_visible_proposal() {
+    let goal_task =
+        WorkflowTaskState::new(WorkflowTaskId(1), 1, 1, "Draft goal".into(), StageRunId(1))
+            .unwrap();
+    let config = config("summary", 8);
+    let result = prepare_workflow_request(WorkflowRequestInput {
+        base_prompt: "base",
+        inherited_blocks: Vec::new(),
+        task: &goal_task,
+        stage_messages: &[],
+        pending_input: None,
+        context_config: &config,
+        context_state: &ContextState::default(),
+        facts_state: &FactsState::default(),
+    });
+    let serialized = format!("{:?}", result.prepared.messages());
+    assert!(serialized.contains("Предлагаемая цель:"));
+    assert!(serialized.contains("не составляй план"));
+}
+
+#[test]
+fn reopened_goal_context_has_previous_goal_and_request_but_no_old_stage_protocol() {
+    let mut reopened = WorkflowTaskState::new(
+        WorkflowTaskId(1),
+        1,
+        1,
+        "Approved previous goal".into(),
+        StageRunId(7),
+    )
+    .unwrap();
+    reopened.goal_revision = 1;
+    reopened.current_stage_sequence = 3;
+    let rows = vec![row(50, ProtocolSource::Human, "Добавь Windows")];
+    let config = config("summary", 8);
+    let result = prepare_workflow_request(WorkflowRequestInput {
+        base_prompt: "base",
+        inherited_blocks: Vec::new(),
+        task: &reopened,
+        stage_messages: &rows,
+        pending_input: None,
+        context_config: &config,
+        context_state: &ContextState::default(),
+        facts_state: &FactsState::default(),
+    });
+    let serialized = format!("{:?}", result.prepared.messages());
+    assert!(serialized.contains("Approved previous goal"));
+    assert!(serialized.contains("Добавь Windows"));
+    assert!(!serialized.contains("OLD_STAGE_RAW_SECRET"));
 }
 
 fn row(id: i64, source: ProtocolSource, content: &str) -> StageProtocolMessage {

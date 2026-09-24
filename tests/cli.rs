@@ -118,6 +118,14 @@ strategy = "summary"
 }
 
 #[cfg(unix)]
+fn mark_approved_planning_fixture(database: &Path) {
+    Connection::open(database)
+        .unwrap()
+        .execute_batch("UPDATE workflow_tasks SET phase='planning', goal_revision=1 WHERE phase='goal_definition'; UPDATE task_stage_runs SET phase='planning' WHERE phase='goal_definition';")
+        .unwrap();
+}
+
+#[cfg(unix)]
 fn write_observed_workflow_config(base_url: &str, log_path: &Path, context: &str) -> NamedTempFile {
     let mut file = NamedTempFile::new().expect("create temporary workflow config");
     write!(
@@ -182,30 +190,6 @@ fn observe_stdout(
 }
 
 #[cfg(unix)]
-fn observe_and_close_stdout(
-    mut stdout: std::process::ChildStdout,
-    needle: &'static str,
-) -> (mpsc::Receiver<()>, thread::JoinHandle<Vec<u8>>) {
-    let (seen_tx, seen_rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut buffer = [0_u8; 256];
-        loop {
-            let read = stdout.read(&mut buffer).unwrap();
-            if read == 0 {
-                panic!("stdout closed before rendering {needle:?}");
-            }
-            output.extend_from_slice(&buffer[..read]);
-            if String::from_utf8_lossy(&output).contains(needle) {
-                seen_tx.send(()).unwrap();
-                return output;
-            }
-        }
-    });
-    (seen_rx, handle)
-}
-
-#[cfg(unix)]
 fn wait_for_exit_while_stdin_is_open(
     mut child: std::process::Child,
     _stdin: std::process::ChildStdin,
@@ -233,10 +217,16 @@ fn wait_for_exit_while_stdin_is_open(
 }
 
 #[cfg(unix)]
-fn spawn_partial_sse_server() -> (String, mpsc::Sender<()>, thread::JoinHandle<()>) {
+fn spawn_partial_sse_server() -> (
+    String,
+    mpsc::Sender<()>,
+    mpsc::Receiver<()>,
+    thread::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (release_tx, release_rx) = mpsc::channel();
+    let (sent_tx, sent_rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
@@ -273,9 +263,10 @@ fn spawn_partial_sse_server() -> (String, mpsc::Sender<()>, thread::JoinHandle<(
         )
         .unwrap();
         stream.flush().unwrap();
+        let _ = sent_tx.send(());
         let _ = release_rx.recv_timeout(Duration::from_secs(10));
     });
-    (format!("http://{address}"), release_tx, handle)
+    (format!("http://{address}"), release_tx, sent_rx, handle)
 }
 
 #[derive(Clone)]
@@ -437,24 +428,35 @@ async fn final_disabled_workflow_cli_continues_and_branches_without_controller_l
     let server = MockServer::start().await;
     Mock::given(method("POST")).and(path("/chat/completions"))
         .respond_with(SequenceResponder { responses: Arc::new(Mutex::new([
+            workflow_interpret(json!({"type":"continue","instruction":"continue"})),
             sse("first answer", 2, 1, 3),
-            workflow_check(workflow_patch(0), json!({"type":"continue","instruction":"HIDDEN_DISABLED_CONTROLLER","confidence":0.95})),
+            workflow_check(workflow_patch(1), json!({"type":"continue","instruction":"HIDDEN_DISABLED_CONTROLLER","confidence":0.95})),
             sse("second answer", 2, 1, 3),
-            workflow_check(workflow_patch(1), json!({"type":"await_user"})),
+            workflow_check(workflow_patch(2), json!({"type":"await_user"})),
             sse("legacy answer", 2, 1, 3),
         ].into_iter().collect())) }).mount(&server).await;
     let disabled = write_branching_config(&server.uri());
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("disabled.sqlite3");
+    let mut seed = DialogStore::open(&database).unwrap();
+    seed.start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "approved goal")
+        .unwrap();
+    drop(seed);
+    mark_approved_planning_fixture(&database);
     let config = write_observed_workflow_config(
         &server.uri(),
         &directory.path().join("debug.jsonl"),
         "strategy='branching'",
     );
     assert!(
-        run_cli_args(config.path(), &database, &[], "goal\n/branch\n/exit\n")
-            .status
-            .success()
+        run_cli_args(
+            config.path(),
+            &database,
+            &["--resume-last"],
+            "goal\n/branch\n/exit\n"
+        )
+        .status
+        .success()
     );
     assert_eq!(
         DialogStore::open(&database).unwrap().list().unwrap().len(),
@@ -477,13 +479,13 @@ async fn final_disabled_workflow_cli_continues_and_branches_without_controller_l
     assert!(!String::from_utf8_lossy(&output.stderr).contains("HIDDEN_DISABLED_CONTROLLER"));
     let store = DialogStore::open(&database).unwrap();
     assert_eq!(store.list().unwrap().len(), 3);
-    assert_eq!(store.raw_message_count(1).unwrap(), 4);
-    assert_eq!(store.raw_message_count(2).unwrap(), 4);
-    assert_eq!(store.raw_message_count(3).unwrap(), 6);
-    assert_eq!(store.load(3).unwrap().messages.len(), 5);
+    assert_eq!(store.raw_message_count(1).unwrap(), 5);
+    assert_eq!(store.raw_message_count(2).unwrap(), 5);
+    assert_eq!(store.raw_message_count(3).unwrap(), 7);
+    assert_eq!(store.load(3).unwrap().messages.len(), 6);
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 5);
-    assert!(!String::from_utf8_lossy(&requests[4].body).contains("HIDDEN_DISABLED_CONTROLLER"));
+    assert_eq!(requests.len(), 6);
+    assert!(!String::from_utf8_lossy(&requests[5].body).contains("HIDDEN_DISABLED_CONTROLLER"));
 }
 
 // Break caught: /stats and conversation-memory output must report managed
@@ -499,7 +501,6 @@ async fn final_managed_stats_and_memory_report_current_stage_costs() {
                 [
                     sse(r#"{"language":"Rust"}"#, 2, 1, 3),
                     sse("saved answer", 7, 3, 10),
-                    workflow_check(workflow_patch(0), json!({"type":"await_user"})),
                 ]
                 .into_iter()
                 .collect(),
@@ -537,7 +538,7 @@ async fn final_managed_stats_and_memory_report_current_stage_costs() {
         "{stdout}"
     );
     assert!(stdout.contains("API этапа всего · 13"), "{stdout}");
-    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 // Break caught: /task after restart must not report Processing forever when
@@ -616,6 +617,12 @@ async fn final_workflow_recovery_storage_failure_is_fatal_and_sanitized() {
     let started = store
         .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "goal")
         .unwrap();
+    mark_approved_planning_fixture(&database);
+    let expected = store
+        .load_workflow(started.dialog_id)
+        .unwrap()
+        .current_task
+        .unwrap();
     store
         .append_answer_for_processing(AnswerCommit {
             dialog_id: started.dialog_id,
@@ -649,7 +656,7 @@ async fn final_workflow_recovery_storage_failure_is_fatal_and_sanitized() {
             .unwrap()
             .current_task
             .unwrap(),
-        started.task
+        expected
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
@@ -708,44 +715,45 @@ fn completed_step_patch(version: u64, step: &str) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_acceptance_complete_lifecycle_is_durable_ordered_and_stage_isolated() {
     let server = MockServer::start().await;
-    let mut plan = workflow_patch(0);
+    let mut plan = workflow_patch(1);
     plan["plan_append"] = json!({"steps":[{"id":"build","description":"Implement parser","status":"pending"}],"acceptance_criteria":["parser tests pass"]});
     plan["current_step_id"] = json!("build");
     let mut repair = workflow_handoff("Repair checkpoint", Some("repair"));
     repair["plan_changes"] =
         json!([{"id":"repair","description":"Fix empty input","status":"pending"}]);
     let responses = Arc::new(Mutex::new(VecDeque::from([
+        workflow_interpret(json!({"type":"continue","instruction":"design the parser"})),
         sse("PLAN_RAW_12", 2, 1, 3),
         workflow_check(plan, json!({"type":"await_user"})),
         workflow_interpret(transition_intent("planning_completed")),
         workflow_service(workflow_handoff("Planning checkpoint", Some("build"))),
         sse("EXECUTION_ONE_RAW_12", 2, 1, 3),
         workflow_check(
-            workflow_patch(2),
+            workflow_patch(3),
             json!({"type":"continue","instruction":"CONTROLLER_ONLY_12","confidence":0.95}),
         ),
         sse("EXECUTION_TWO_RAW_12", 2, 1, 3),
         workflow_check(
-            completed_step_patch(3, "build"),
+            completed_step_patch(4, "build"),
             transition_decision("execution_completed", &[]),
         ),
         workflow_service(workflow_handoff("Implementation checkpoint", None)),
         sse("VALIDATION_FAILED_RAW_12", 2, 1, 3),
         workflow_check(
-            workflow_patch(4),
+            workflow_patch(5),
             transition_decision("validation_failed", &["Empty input test fails"]),
         ),
         workflow_service(repair),
         sse("REPAIR_RAW_12", 2, 1, 3),
         workflow_check(
-            completed_step_patch(5, "repair"),
+            completed_step_patch(6, "repair"),
             json!({"type":"await_user"}),
         ),
         workflow_interpret(transition_intent("execution_completed")),
         workflow_service(workflow_handoff("Repair completed checkpoint", None)),
         sse("VALIDATION_PASSED_RAW_12", 2, 1, 3),
         workflow_check(
-            workflow_patch(7),
+            workflow_patch(8),
             transition_decision(
                 "validation_passed",
                 &["parser tests pass => all 12 cases passed"],
@@ -762,12 +770,22 @@ async fn workflow_acceptance_complete_lifecycle_is_durable_ordered_and_stage_iso
         .await;
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("lifecycle.sqlite3");
+    let mut seed = DialogStore::open(&database).unwrap();
+    seed.start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "approved goal")
+        .unwrap();
+    drop(seed);
+    mark_approved_planning_fixture(&database);
     let config = write_observed_workflow_config(
         &server.uri(),
         &directory.path().join("events.jsonl"),
         "strategy = 'summary'",
     );
-    let first = run_cli_args(config.path(), &database, &[], "design the parser\n/exit\n");
+    let first = run_cli_args(
+        config.path(),
+        &database,
+        &["--resume-last"],
+        "design the parser\n/exit\n",
+    );
     assert!(
         first.status.success(),
         "{}",
@@ -777,7 +795,7 @@ async fn workflow_acceptance_complete_lifecycle_is_durable_ordered_and_stage_iso
     let id = store.list().unwrap()[0].id;
     let planned = store.load_workflow(id).unwrap().current_task.unwrap();
     assert_eq!(planned.phase, TaskPhase::Planning);
-    assert_eq!(planned.version, 1);
+    assert_eq!(planned.version, 2);
     let connection = Connection::open(&database).unwrap();
     // The complete immutable row is retained across the last human transition.
     let ledger = || -> Vec<(i64, i64, i64, String, String)> {
@@ -817,7 +835,7 @@ async fn workflow_acceptance_complete_lifecycle_is_durable_ordered_and_stage_iso
     let repaired = store.load_workflow(id).unwrap().current_task.unwrap();
     assert_eq!(repaired.phase, TaskPhase::Execution);
     assert_eq!(repaired.current_stage_sequence, 4);
-    assert_eq!(repaired.version, 6);
+    assert_eq!(repaired.version, 7);
     let prefix = ledger();
     assert_eq!(prefix.len(), 3);
     let finish = run_cli_args(
@@ -833,7 +851,7 @@ async fn workflow_acceptance_complete_lifecycle_is_durable_ordered_and_stage_iso
     );
     let done = store.load_workflow(id).unwrap().current_task.unwrap();
     assert_eq!(done.phase, TaskPhase::Done);
-    assert_eq!(done.version, 8);
+    assert_eq!(done.version, 9);
     assert_eq!(done.id, planned.id);
     let final_ledger = ledger();
     assert_eq!(&final_ledger[..3], prefix.as_slice());
@@ -899,7 +917,7 @@ async fn workflow_acceptance_complete_lifecycle_is_durable_ordered_and_stage_iso
     assert_eq!(
         protocol,
         [
-            vec!["design the parser"],
+            vec!["approved goal", "design the parser"],
             vec!["plan approved; execute"],
             vec![
                 "plan approved; execute",
@@ -945,7 +963,7 @@ async fn workflow_acceptance_complete_lifecycle_is_durable_ordered_and_stage_iso
     }
     assert!(replay.contains("VALIDATION_PASSED_RAW_12"), "{replay}");
     assert!(responses.lock().unwrap().is_empty());
-    assert_eq!(server.received_requests().await.unwrap().len(), 19);
+    assert_eq!(server.received_requests().await.unwrap().len(), 20);
 }
 
 // Break caught: crossing task/stage boundaries must not reintroduce raw history,
@@ -955,7 +973,7 @@ async fn workflow_acceptance_complete_lifecycle_is_durable_ordered_and_stage_iso
 async fn workflow_acceptance_two_tasks_keep_only_current_stage_and_projected_checkpoint() {
     let server = MockServer::start().await;
     let plan_patch = |step: &str| {
-        let mut patch = workflow_patch(0);
+        let mut patch = workflow_patch(1);
         patch["plan_append"] = json!({"steps":[{"id":step,"description":"Build result","status":"pending"}],"acceptance_criteria":["tests pass"]});
         patch["current_step_id"] = json!(step);
         patch
@@ -964,6 +982,7 @@ async fn workflow_acceptance_two_tasks_keep_only_current_stage_and_projected_che
     projected["decisions"] = json!(["TASK2_ACCEPTED_DECISION"]);
     projected["open_issues"] = json!(["TASK2_ACCEPTED_ISSUE"]);
     let responses = Arc::new(Mutex::new(VecDeque::from([
+        workflow_interpret(json!({"type":"continue","instruction":"design task one"})),
         workflow_service(json!({"old":"TASK1_FACTS_MARKER"})),
         sse("TASK1_PLANNING_RAW", 2, 1, 3),
         workflow_check(
@@ -973,13 +992,13 @@ async fn workflow_acceptance_two_tasks_keep_only_current_stage_and_projected_che
         workflow_service(workflow_handoff("TASK1_FULL_HANDOFF_MARKER", Some("first"))),
         sse("TASK1_EXECUTION_RAW", 2, 1, 3),
         workflow_check(
-            completed_step_patch(1, "first"),
+            completed_step_patch(2, "first"),
             transition_decision("execution_completed", &[]),
         ),
         workflow_service(workflow_handoff("Task one implementation checkpoint", None)),
         sse("TASK1_VALIDATION_RAW", 2, 1, 3),
         workflow_check(
-            workflow_patch(2),
+            workflow_patch(3),
             transition_decision(
                 "validation_passed",
                 &["tests pass => observed all cases passing"],
@@ -987,6 +1006,9 @@ async fn workflow_acceptance_two_tasks_keep_only_current_stage_and_projected_che
         ),
         workflow_service(workflow_handoff("Task one final checkpoint", None)),
         workflow_interpret(json!({"type":"start_new_task","goal":"TASK2_CURRENT_GOAL"})),
+        workflow_service(json!({"old":"TASK2_GOAL_FACTS_MARKER"})),
+        sse("Предлагаемая цель: TASK2_CURRENT_GOAL", 2, 1, 3),
+        workflow_interpret(json!({"type":"approve_goal"})),
         workflow_service(json!({"old":"TASK2_PLANNING_FACTS_MARKER"})),
         sse("TASK2_PLANNING_RAW", 2, 1, 3),
         workflow_check(plan_patch("second"), json!({"type":"await_user"})),
@@ -995,15 +1017,15 @@ async fn workflow_acceptance_two_tasks_keep_only_current_stage_and_projected_che
         workflow_service(json!({"current":"TASK2_EXECUTION_FACT"})),
         sse("TASK2_EXECUTION_ONE", 2, 1, 3),
         workflow_check(
-            workflow_patch(2),
+            workflow_patch(3),
             json!({"type":"continue","instruction":"CONTROLLER_FACTS_EXCLUDED","confidence":0.95}),
         ),
         sse("TASK2_EXECUTION_TWO", 2, 1, 3),
-        workflow_check(workflow_patch(3), json!({"type":"await_user"})),
+        workflow_check(workflow_patch(4), json!({"type":"await_user"})),
         workflow_interpret(json!({"type":"continue","instruction":"TASK2_CURRENT_HUMAN"})),
         workflow_service(json!({"current":"TASK2_EXECUTION_FACT"})),
         sse("TASK2_EXECUTION_THREE", 2, 1, 3),
-        workflow_check(workflow_patch(4), json!({"type":"await_user"})),
+        workflow_check(workflow_patch(5), json!({"type":"await_user"})),
     ])));
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -1014,6 +1036,11 @@ async fn workflow_acceptance_two_tasks_keep_only_current_stage_and_projected_che
         .await;
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("two-tasks.sqlite3");
+    let mut seed = DialogStore::open(&database).unwrap();
+    seed.start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "approved task one")
+        .unwrap();
+    drop(seed);
+    mark_approved_planning_fixture(&database);
     let config = write_observed_workflow_config(
         &server.uri(),
         &directory.path().join("events.jsonl"),
@@ -1022,8 +1049,8 @@ async fn workflow_acceptance_two_tasks_keep_only_current_stage_and_projected_che
     let output = run_cli_args(
         config.path(),
         &database,
-        &[],
-        "/profile set PROFILE_MARKER\n/remember user preference USER_MEMORY_MARKER\n/remember task design MEMORY_TASK_MARKER\ndesign task one\nstart second task\nTASK2_EXECUTE_HUMAN\nTASK2_CURRENT_HUMAN\n/exit\n",
+        &["--resume-last"],
+        "/profile set PROFILE_MARKER\n/remember user preference USER_MEMORY_MARKER\n/remember task design MEMORY_TASK_MARKER\ndesign task one\nstart second task\napprove second goal\nTASK2_EXECUTE_HUMAN\nTASK2_CURRENT_HUMAN\n/exit\n",
     );
     assert!(
         output.status.success(),
@@ -1035,7 +1062,7 @@ async fn workflow_acceptance_two_tasks_keep_only_current_stage_and_projected_che
     let task = store.load_workflow(id).unwrap().current_task.unwrap();
     assert_eq!(task.ordinal, 2);
     assert_eq!(task.phase, TaskPhase::Execution);
-    assert_eq!(task.current_stage_sequence, 2);
+    assert_eq!(task.current_stage_sequence, 3);
     assert_eq!(task.checkpoint.summary, "TASK2_ACCEPTED_CHECKPOINT");
     let requests = server.received_requests().await.unwrap();
     let bodies: Vec<Value> = requests.iter().map(|r| r.body_json().unwrap()).collect();
@@ -1114,7 +1141,7 @@ async fn workflow_acceptance_two_tasks_keep_only_current_stage_and_projected_che
                 .contains("Update the key-value memory")
         })
         .collect();
-    assert_eq!(facts.len(), 4);
+    assert_eq!(facts.len(), 5);
     for body in &facts {
         let text = body["messages"].to_string();
         for marker in [
@@ -1208,7 +1235,7 @@ async fn workflow_status_is_printed_after_resume_and_on_command_without_mutation
     let connection = Connection::open(&database).unwrap();
     connection
         .execute(
-            "UPDATE workflow_tasks SET plan_json=?1, current_step_id='write', expected_action='Run focused tests' WHERE id=?2",
+            "UPDATE workflow_tasks SET phase='planning', goal_revision=1, plan_json=?1, current_step_id='write', expected_action='Run focused tests' WHERE id=?2",
             rusqlite::params![
                 json!({
                     "revision": 7,
@@ -1219,6 +1246,9 @@ async fn workflow_status_is_printed_after_resume_and_on_command_without_mutation
                 started.task.id.0,
             ],
         )
+        .unwrap();
+    connection
+        .execute_batch("UPDATE task_stage_runs SET phase='planning';")
         .unwrap();
     drop(connection);
     let before = DialogStore::open(&database)
@@ -1275,6 +1305,128 @@ async fn workflow_status_is_printed_after_resume_and_on_command_without_mutation
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn goal_definition_status_and_debug_show_the_active_proposal() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse("Предлагаемая цель: Сделать CLI", 2, 1, 3))
+        .mount(&server)
+        .await;
+    let config = write_workflow_config(&server.uri());
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("goal-status.sqlite3");
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &[],
+        "Давай обсудим CLI\n/task\n/debug\n/exit\n",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Phase: goal_definition · status: active"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Goal (working, revision 0): Давай обсудим CLI"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Current proposal message: "), "{stdout}");
+    assert!(stdout.contains("\"goal_proposal\""), "{stdout}");
+    let store = DialogStore::open(&database).unwrap();
+    let task = store
+        .load_workflow(store.latest_id().unwrap().unwrap())
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(
+        task.goal_proposal
+            .as_ref()
+            .map(|proposal| proposal.text.as_str()),
+        Some("Сделать CLI")
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_can_approve_reopen_and_reapprove_a_revised_goal() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(
+                [
+                    sse("Предлагаемая цель: Сделать CLI", 2, 1, 3),
+                    workflow_interpret(json!({"type":"approve_goal"})),
+                    sse("Обсудим план.", 2, 1, 3),
+                    workflow_check(workflow_patch(1), json!({"type":"await_user"})),
+                    workflow_interpret(
+                        json!({"type":"reopen_goal","change_request":"Добавить Windows"}),
+                    ),
+                    sse("Предлагаемая цель: Сделать CLI для Windows", 2, 1, 3),
+                    workflow_interpret(json!({"type":"approve_goal"})),
+                    sse("Обсудим новый план.", 2, 1, 3),
+                    workflow_check(workflow_patch(3), json!({"type":"await_user"})),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        })
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("goal-cycle.sqlite3");
+    let log_path = directory.path().join("goal-cycle.jsonl");
+    let config = write_observed_workflow_config(&server.uri(), &log_path, "strategy='summary'");
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &[],
+        "Нужен CLI\n/task\n/debug\nУтверждаю цель\n/task\nВернись к цели: добавь Windows\n/task\nУтверждаю новую цель\n/task\n/exit\n",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Phase: goal_definition · status: active"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Goal (working, revision 0): Нужен CLI"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Goal (approved, revision 2): Сделать CLI для Windows"),
+        "{stdout}"
+    );
+    let store = DialogStore::open(&database).unwrap();
+    let state = store
+        .load_workflow(store.latest_id().unwrap().unwrap())
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(state.phase, TaskPhase::Planning);
+    assert_eq!(state.goal, "Сделать CLI для Windows");
+    assert_eq!(state.goal_revision, 2);
+    assert!(state.goal_proposal.is_none());
+    assert_eq!(state.current_stage_sequence, 4);
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("\"goal_parse_result\":\"valid\""));
+    assert!(!log.contains("Сделать CLI для Windows"), "{log}");
+    assert!(!log.contains("Нужен CLI"), "{log}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 9);
+}
+
 // Break caught: autonomous ordinary turns must render as distinct assistant
 // blocks without attributing the hidden controller instruction to the user.
 #[cfg(unix)]
@@ -1287,10 +1439,11 @@ async fn workflow_autonomous_responses_are_separate_and_hide_controller_text() {
         .respond_with(SequenceResponder {
             responses: Arc::new(Mutex::new(
                 [
+                    workflow_interpret(json!({"type":"continue","instruction":"continue"})),
                     sse("first visible answer", 2, 1, 3),
                     sse(
                         &json!({
-                            "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+                            "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
                             "decision": {"type":"continue","instruction":marker,"confidence":0.95}
                         })
                         .to_string(),
@@ -1301,7 +1454,7 @@ async fn workflow_autonomous_responses_are_separate_and_hide_controller_text() {
                     sse("second visible answer", 2, 1, 3),
                     sse(
                         &json!({
-                            "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+                            "patch": {"expected_version":2,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
                             "decision": {"type":"await_user"}
                         })
                         .to_string(),
@@ -1319,8 +1472,18 @@ async fn workflow_autonomous_responses_are_separate_and_hide_controller_text() {
     let config = write_workflow_config(&server.uri());
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("autonomous-output.sqlite3");
+    let mut seed = DialogStore::open(&database).unwrap();
+    seed.start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "approved goal")
+        .unwrap();
+    drop(seed);
+    mark_approved_planning_fixture(&database);
 
-    let output = run_cli_args(config.path(), &database, &[], "build it\n/exit\n");
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &["--resume-last"],
+        "build it\n/exit\n",
+    );
 
     assert!(
         output.status.success(),
@@ -1368,10 +1531,11 @@ async fn workflow_ordinary_provider_failure_never_prints_hidden_payload() {
         .respond_with(SequenceResponder {
             responses: Arc::new(Mutex::new(
                 [
+                    workflow_interpret(json!({"type":"continue","instruction":"continue"})),
                     sse("first visible answer", 2, 1, 3),
                     sse(
                         &json!({
-                            "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+                            "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
                             "decision": {"type":"continue","instruction":marker,"confidence":0.95}
                         })
                         .to_string(),
@@ -1389,10 +1553,20 @@ async fn workflow_ordinary_provider_failure_never_prints_hidden_payload() {
         .await;
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("ordinary-error.sqlite3");
+    let mut seed = DialogStore::open(&database).unwrap();
+    seed.start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "approved goal")
+        .unwrap();
+    drop(seed);
+    mark_approved_planning_fixture(&database);
     let log_path = directory.path().join("ordinary-error.jsonl");
     let config = write_observed_workflow_config(&server.uri(), &log_path, "strategy = \"summary\"");
 
-    let output = run_cli_args(config.path(), &database, &[], "build it\n/exit\n");
+    let output = run_cli_args(
+        config.path(),
+        &database,
+        &["--resume-last"],
+        "build it\n/exit\n",
+    );
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -1538,6 +1712,7 @@ async fn resumed_cli_recovers_pending_work_before_prompt_and_warns_on_failure() 
         let started = store
             .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "saved goal")
             .unwrap();
+        mark_approved_planning_fixture(&database);
         store
             .append_answer_for_processing(AnswerCommit {
                 dialog_id: started.dialog_id,
@@ -1645,6 +1820,7 @@ async fn unavailable_workflow_debug_path_warns_once_on_run_and_recovery() {
     let started = store
         .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "saved goal")
         .unwrap();
+    mark_approved_planning_fixture(&recovery_database);
     store
         .append_answer_for_processing(AnswerCommit {
             dialog_id: started.dialog_id,
@@ -1678,7 +1854,7 @@ async fn unavailable_workflow_debug_path_warns_once_on_run_and_recovery() {
         1,
         "{recovery_stderr}"
     );
-    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 // Break caught: restoring a paused dialog is inert until a human continuation is accepted.
@@ -1693,6 +1869,7 @@ async fn resumed_paused_dialog_waits_for_human_and_preserves_task_and_stage() {
     let started = store
         .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "saved goal")
         .unwrap();
+    mark_approved_planning_fixture(&database);
     let PauseOutcome::Paused(paused) = store.pause_current_task(started.dialog_id).unwrap() else {
         panic!("active task should pause");
     };
@@ -2067,6 +2244,7 @@ async fn interrupt_during_checker_keeps_completed_workflow_diagnostics() {
         .respond_with(SequenceResponder {
             responses: Arc::new(Mutex::new(
                 [
+                    workflow_interpret(json!({"type":"continue","instruction":"continue"})),
                     sse("visible committed answer", 2, 1, 3),
                     ResponseTemplate::new(200)
                         .set_delay(Duration::from_secs(30))
@@ -2081,6 +2259,11 @@ async fn interrupt_during_checker_keeps_completed_workflow_diagnostics() {
         .await;
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("checker-interrupt.sqlite3");
+    let mut seed = DialogStore::open(&database).unwrap();
+    seed.start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "approved goal")
+        .unwrap();
+    drop(seed);
+    mark_approved_planning_fixture(&database);
     let log_path = directory.path().join("checker-interrupt.jsonl");
     let config = write_observed_workflow_config(&server.uri(), &log_path, "strategy = \"summary\"");
     let mut child = Command::new(env!("CARGO_BIN_EXE_deepseek-cli"))
@@ -2088,6 +2271,7 @@ async fn interrupt_during_checker_keeps_completed_workflow_diagnostics() {
         .arg(config.path())
         .arg("--db")
         .arg(&database)
+        .arg("--resume-last")
         .env_remove("DEEPSEEK_API_KEY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2106,7 +2290,7 @@ async fn interrupt_during_checker_keeps_completed_workflow_diagnostics() {
         .recv_timeout(Duration::from_secs(5))
         .expect("ordinary answer should render before checker blocks");
     tokio::time::timeout(Duration::from_secs(5), async {
-        while server.received_requests().await.unwrap().len() < 2 {
+        while server.received_requests().await.unwrap().len() < 3 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -2129,8 +2313,8 @@ async fn interrupt_during_checker_keeps_completed_workflow_diagnostics() {
     let store = DialogStore::open(&database).unwrap();
     let dialog_id = store.latest_id().unwrap().unwrap();
     let dialog = store.load(dialog_id).unwrap();
-    assert_eq!(dialog.messages.len(), 2);
-    assert_eq!(dialog.messages[1].content(), "visible committed answer");
+    assert_eq!(dialog.messages.len(), 3);
+    assert_eq!(dialog.messages[2].content(), "visible committed answer");
     assert_eq!(
         store
             .load_workflow(dialog_id)
@@ -2146,10 +2330,11 @@ async fn interrupt_during_checker_keeps_completed_workflow_diagnostics() {
         .map(|line| serde_json::from_str(line).unwrap())
         .filter(|value: &Value| value["event"] == "workflow")
         .collect();
-    assert_eq!(events.len(), 2, "{events:#?}");
-    assert_eq!(events[0]["details"]["component"], "input_router");
-    assert_eq!(events[1]["details"]["component"], "ordinary");
-    assert_eq!(events[1]["details"]["processing_status"], "pending");
+    let ordinary = events
+        .iter()
+        .find(|event| event["details"]["component"] == "ordinary")
+        .unwrap();
+    assert_eq!(ordinary["details"]["processing_status"], "pending");
 }
 
 // Break caught: a checker decision completes before the handoff call starts.
@@ -2161,7 +2346,7 @@ async fn interrupt_during_handoff_keeps_completed_checker_diagnostic() {
     let server = MockServer::start().await;
     let checker = json!({
         "patch": {
-            "expected_version":0,
+            "expected_version":1,
             "plan_append": {
                 "steps":[{"id":"s1","description":"implement it","status":"pending"}],
                 "acceptance_criteria":["it works"]
@@ -2179,6 +2364,7 @@ async fn interrupt_during_handoff_keeps_completed_checker_diagnostic() {
         .respond_with(SequenceResponder {
             responses: Arc::new(Mutex::new(
                 [
+                    workflow_interpret(json!({"type":"continue","instruction":"continue"})),
                     sse("visible planning answer", 2, 1, 3),
                     sse(&checker, 3, 2, 5),
                     ResponseTemplate::new(200)
@@ -2194,6 +2380,11 @@ async fn interrupt_during_handoff_keeps_completed_checker_diagnostic() {
         .await;
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("handoff-interrupt.sqlite3");
+    let mut seed = DialogStore::open(&database).unwrap();
+    seed.start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "approved goal")
+        .unwrap();
+    drop(seed);
+    mark_approved_planning_fixture(&database);
     let log_path = directory.path().join("handoff-interrupt.jsonl");
     let config = write_observed_workflow_config(&server.uri(), &log_path, "strategy = \"summary\"");
     let mut child = Command::new(env!("CARGO_BIN_EXE_deepseek-cli"))
@@ -2201,6 +2392,7 @@ async fn interrupt_during_handoff_keeps_completed_checker_diagnostic() {
         .arg(config.path())
         .arg("--db")
         .arg(&database)
+        .arg("--resume-last")
         .env_remove("DEEPSEEK_API_KEY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2219,7 +2411,7 @@ async fn interrupt_during_handoff_keeps_completed_checker_diagnostic() {
         .recv_timeout(Duration::from_secs(5))
         .expect("ordinary answer should render before handoff blocks");
     tokio::time::timeout(Duration::from_secs(5), async {
-        while server.received_requests().await.unwrap().len() < 3 {
+        while server.received_requests().await.unwrap().len() < 4 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -2257,8 +2449,12 @@ async fn interrupt_during_handoff_keeps_completed_checker_diagnostic() {
         .iter()
         .map(|event| event["details"]["component"].as_str().unwrap())
         .collect();
-    assert_eq!(components, ["input_router", "ordinary", "continuation"]);
-    let checker_event = &events[2]["details"];
+    assert!(components.contains(&"ordinary"));
+    assert!(components.contains(&"continuation"));
+    let checker_event = &events
+        .iter()
+        .find(|event| event["details"]["component"] == "continuation")
+        .unwrap()["details"];
     assert_eq!(checker_event["accepted"], true);
     assert_eq!(checker_event["processing_status"], "processing");
     assert_eq!(checker_event["transition_id"], Value::Null);
@@ -2269,7 +2465,7 @@ async fn interrupt_during_handoff_keeps_completed_checker_diagnostic() {
 #[test]
 fn interrupt_discards_partial_work_pauses_exactly_once_and_never_synthesizes_a_task() {
     {
-        let (base_url, release, server) = spawn_partial_sse_server();
+        let (base_url, release, partial_sent, server) = spawn_partial_sse_server();
         let config = write_workflow_config(&base_url);
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("interrupt.sqlite3");
@@ -2284,17 +2480,21 @@ fn interrupt_discards_partial_work_pauses_exactly_once_and_never_synthesizes_a_t
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let (partial_seen, stdout_reader) =
-            observe_stdout(child.stdout.take().unwrap(), "partial fragment");
+        let mut stdout_pipe = child.stdout.take().unwrap();
+        let stdout_reader = thread::spawn(move || {
+            let mut output = Vec::new();
+            stdout_pipe.read_to_end(&mut output).unwrap();
+            output
+        });
         child
             .stdin
             .as_mut()
             .unwrap()
             .write_all(b"Do not commit a partial answer\n")
             .unwrap();
-        partial_seen
+        partial_sent
             .recv_timeout(Duration::from_secs(5))
-            .expect("CLI should render the first streamed fragment");
+            .expect("provider should send the first fragment");
         let stdin = child.stdin.take().unwrap();
         let mut stderr_pipe = child.stderr.take().unwrap();
         send_sigint(&child);
@@ -2305,7 +2505,10 @@ fn interrupt_discards_partial_work_pauses_exactly_once_and_never_synthesizes_a_t
         let mut stderr = Vec::new();
         stderr_pipe.read_to_end(&mut stderr).unwrap();
         assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
-        assert!(stdout.contains("partial fragment"));
+        assert!(
+            !stdout.contains("partial fragment"),
+            "goal proposals must be buffered: {stdout}"
+        );
         assert!(
             stdout.contains("partial model result was discarded"),
             "{stdout}"
@@ -2320,7 +2523,7 @@ fn interrupt_discards_partial_work_pauses_exactly_once_and_never_synthesizes_a_t
             "Do not commit a partial answer"
         );
         let task = store.load_workflow(id).unwrap().current_task.unwrap();
-        assert_eq!(task.phase, TaskPhase::Planning);
+        assert_eq!(task.phase, TaskPhase::GoalDefinition);
         assert_eq!(task.status, TaskStatus::Paused);
         assert_eq!(task.version, 1);
         assert_eq!(task.current_stage_sequence, 1);
@@ -2426,7 +2629,7 @@ fn interrupt_at_idle_prompt_exits_while_stdin_remains_open() {
 #[cfg(unix)]
 #[test]
 fn interrupt_with_closed_stdout_still_pauses_the_active_task() {
-    let (base_url, release, server) = spawn_partial_sse_server();
+    let (base_url, release, partial_sent, server) = spawn_partial_sse_server();
     let config = write_workflow_config(&base_url);
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("closed-stdout-interrupt.sqlite3");
@@ -2443,16 +2646,14 @@ fn interrupt_with_closed_stdout_still_pauses_the_active_task() {
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-    let (partial_seen, stdout_reader) =
-        observe_and_close_stdout(child.stdout.take().unwrap(), "partial fragment");
+    let stdout_pipe = child.stdout.take().unwrap();
     stdin
         .write_all(b"Pause even if output is closed\n")
         .unwrap();
-    partial_seen
+    partial_sent
         .recv_timeout(Duration::from_secs(5))
-        .expect("CLI should render the first streamed fragment");
-    let rendered = String::from_utf8(stdout_reader.join().unwrap()).unwrap();
-    assert!(rendered.contains("partial fragment"));
+        .expect("provider should send the first fragment");
+    drop(stdout_pipe);
 
     send_sigint(&child);
     let status = wait_for_exit_while_stdin_is_open(child, stdin);

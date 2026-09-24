@@ -8,6 +8,7 @@ pub mod context;
 pub mod debug_log;
 pub mod dialog;
 pub mod facts;
+pub mod goal_definition;
 pub mod invariants;
 pub mod memory;
 pub mod profile;

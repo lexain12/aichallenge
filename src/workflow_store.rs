@@ -12,9 +12,10 @@ use crate::dialog::{DialogStore, StoreError};
 use crate::facts::{Facts, FactsState};
 use crate::memory::RequestScope;
 use crate::workflow::{
-    PatchContext, StageChangeAuthorization, StageRunId, StateMachine, TaskPhase, TaskStatePatch,
-    TaskStatus, TransitionEvent, WorkflowInput, WorkflowInputSource, WorkflowIntent,
-    WorkflowTaskId, WorkflowTaskState,
+    GoalApprovalAuthorization, GoalReopenAuthorization, PatchContext, StageChangeAuthorization,
+    StageCheckpoint, StageRunId, StateMachine, TaskPhase, TaskStatePatch, TaskStatus,
+    TransitionEvent, WorkflowInput, WorkflowInputSource, WorkflowIntent, WorkflowTaskId,
+    WorkflowTaskState, authorize_goal_approval, authorize_goal_reopen,
 };
 use crate::workflow_context::{StageReductionState, facts_candidates};
 use crate::workflow_model::{CheckContext, HandoffPayload, project_handoff};
@@ -124,6 +125,21 @@ pub trait WorkflowRepository {
         &mut self,
         command: AnswerCommit<'_>,
     ) -> Result<PersistedAnswer, StoreError>;
+    fn append_goal_answer_for_processing(
+        &mut self,
+        command: AnswerCommit<'_>,
+        proposal_text: Option<&str>,
+    ) -> Result<PersistedAnswer, StoreError>;
+    fn commit_goal_approval(
+        &mut self,
+        command: InputCommit<'_>,
+        authorization: &GoalApprovalAuthorization,
+    ) -> Result<PersistedTransition, StoreError>;
+    fn commit_goal_reopen(
+        &mut self,
+        command: InputCommit<'_>,
+        authorization: &GoalReopenAuthorization,
+    ) -> Result<PersistedTransition, StoreError>;
     fn append_unmanaged_answer(
         &mut self,
         command: UnmanagedAnswerCommit<'_>,
@@ -828,7 +844,49 @@ impl WorkflowRepository for DialogStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result = append_answer(&tx, &command)
+        let result = append_answer(&tx, &command, None)
+            .map_err(|error| workflow_conflict(error, command.dialog_id))?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn append_goal_answer_for_processing(
+        &mut self,
+        command: AnswerCommit<'_>,
+        proposal_text: Option<&str>,
+    ) -> Result<PersistedAnswer, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = append_answer(&tx, &command, proposal_text)
+            .map_err(|error| workflow_conflict(error, command.dialog_id))?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn commit_goal_approval(
+        &mut self,
+        command: InputCommit<'_>,
+        authorization: &GoalApprovalAuthorization,
+    ) -> Result<PersistedTransition, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = commit_goal_change(&tx, &command, GoalChange::Approve(authorization))
+            .map_err(|error| workflow_conflict(error, command.dialog_id))?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn commit_goal_reopen(
+        &mut self,
+        command: InputCommit<'_>,
+        authorization: &GoalReopenAuthorization,
+    ) -> Result<PersistedTransition, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = commit_goal_change(&tx, &command, GoalChange::Reopen(authorization))
             .map_err(|error| workflow_conflict(error, command.dialog_id))?;
         tx.commit()?;
         Ok(result)
@@ -1164,6 +1222,7 @@ pub(crate) fn copy_workflow_branch(
             "phase",
             "status",
             "goal",
+            "goal_revision",
             "plan_json",
             "current_step_id",
             "expected_action",
@@ -1218,6 +1277,31 @@ pub(crate) fn copy_workflow_branch(
         if let Some((task, stage)) = mapping {
             require_one(tx.execute("INSERT INTO message_task_stages (message_id,workflow_task_id,stage_run_id) VALUES (?1,?2,?3)", params![new,mapped_id(&tasks,task)?,mapped_id(&stages,stage)?])?,target_dialog_id)?;
         }
+    }
+    let proposals = {
+        let mut statement = tx.prepare(
+            "SELECT p.workflow_task_id,p.stage_run_id,p.assistant_message_id,p.text
+             FROM goal_proposals p JOIN workflow_tasks t ON t.id=p.workflow_task_id
+             WHERE t.dialog_id=?1",
+        )?;
+        statement
+            .query_map([source_dialog_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (task_id, stage_id, assistant_id, proposal_text) in proposals {
+        require_one(tx.execute(
+            "INSERT INTO goal_proposals (workflow_task_id,stage_run_id,assistant_message_id,text)
+             VALUES (?1,?2,?3,?4)",
+            params![mapped_id(&tasks,task_id)?,mapped_id(&stages,stage_id)?,
+                mapped_id(message_id_map,assistant_id)?,proposal_text],
+        )?, target_dialog_id)?;
     }
     let processing = copy_rows(
         tx,
@@ -1855,12 +1939,12 @@ fn create_task(
     )
     .map_err(domain_error)?;
     connection.execute(
-        "INSERT INTO workflow_tasks (dialog_id, ordinal, phase, status, goal, plan_json, checkpoint_json, version)
-         VALUES (?1, ?2, 'planning', 'active', ?3, ?4, ?5, 0)",
+        "INSERT INTO workflow_tasks (dialog_id, ordinal, phase, status, goal, goal_revision, plan_json, checkpoint_json, version)
+         VALUES (?1, ?2, 'goal_definition', 'active', ?3, 0, ?4, ?5, 0)",
         params![dialog_id, ordinal, goal, serde_json::to_string(&task.plan)?, serde_json::to_string(&task.checkpoint)?],
     )?;
     task.id = WorkflowTaskId(connection.last_insert_rowid());
-    connection.execute("INSERT INTO task_stage_runs (workflow_task_id, phase, sequence) VALUES (?1, 'planning', 1)", [task.id.0])?;
+    connection.execute("INSERT INTO task_stage_runs (workflow_task_id, phase, sequence) VALUES (?1, 'goal_definition', 1)", [task.id.0])?;
     task.current_stage_run_id = StageRunId(connection.last_insert_rowid());
     initialize_stage_context(connection, task.current_stage_run_id)?;
     let changed = connection.execute(
@@ -2202,6 +2286,158 @@ fn commit_controller(
     Ok(result)
 }
 
+enum GoalChange<'a> {
+    Approve(&'a GoalApprovalAuthorization),
+    Reopen(&'a GoalReopenAuthorization),
+}
+
+fn commit_goal_change(
+    connection: &Connection,
+    command: &InputCommit<'_>,
+    change: GoalChange<'_>,
+) -> Result<PersistedTransition, StoreError> {
+    validate_protocol_text(command.protocol_text)?;
+    validate_confidence(command.confidence)?;
+    if command.confidence.is_none() || command.input.source != WorkflowInputSource::Human {
+        return invalid("goal transition requires interpreted human input");
+    }
+    command.input.validate().map_err(domain_error)?;
+    let source = load_workflow(connection, command.dialog_id)?
+        .current_task
+        .ok_or(StoreError::WorkflowConflict(command.dialog_id))?;
+    if !command.expected_current_task.matches(Some(&source)) {
+        return Err(StoreError::WorkflowConflict(command.dialog_id));
+    }
+    let (event, target_phase, handoff) = match change {
+        GoalChange::Approve(authorization) => {
+            if command.input.intent != WorkflowIntent::ApproveGoal
+                || authorize_goal_approval(&source, &command.input.source).map_err(domain_error)?
+                    != *authorization
+            {
+                return Err(StoreError::WorkflowConflict(command.dialog_id));
+            }
+            (
+                "goal_approved",
+                TaskPhase::Planning,
+                serde_json::json!({
+                    "approved_goal": authorization.goal_text,
+                }),
+            )
+        }
+        GoalChange::Reopen(authorization) => {
+            let WorkflowIntent::ReopenGoal { change_request } = &command.input.intent else {
+                return invalid("reopen requires ReopenGoal input");
+            };
+            if authorize_goal_reopen(&source, &command.input.source, change_request.clone())
+                .map_err(domain_error)?
+                != *authorization
+            {
+                return Err(StoreError::WorkflowConflict(command.dialog_id));
+            }
+            (
+                "goal_reopened",
+                TaskPhase::GoalDefinition,
+                serde_json::json!({
+                    "previous_goal": source.goal,
+                    "change_request": authorization.change_request,
+                }),
+            )
+        }
+    };
+    let mut target = source.clone();
+    target.phase = target_phase;
+    target.status = TaskStatus::Active;
+    target.goal_proposal = None;
+    match change {
+        GoalChange::Approve(authorization) => {
+            target.goal = authorization.goal_text.clone();
+            target.goal_revision = target
+                .goal_revision
+                .checked_add(1)
+                .ok_or_else(|| StoreError::InvalidWorkflow("goal revision overflow".into()))?;
+        }
+        GoalChange::Reopen(authorization) => {
+            target.plan.revision = authorization.next_plan_revision;
+        }
+    }
+    target.plan.steps.clear();
+    target.plan.acceptance_criteria.clear();
+    target.current_step_id = None;
+    target.expected_action = None;
+    target.checkpoint = StageCheckpoint {
+        summary: String::new(),
+        decisions: Vec::new(),
+        open_issues: Vec::new(),
+    };
+    target.current_stage_sequence = target
+        .current_stage_sequence
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidWorkflow("stage sequence overflow".into()))?;
+    target.version = next_version(source.version)?;
+    let input_message_id =
+        insert_message(connection, command.dialog_id, "user", command.protocol_text)?;
+    connection.execute(
+        "INSERT INTO workflow_inputs (dialog_id,message_id,source,intent_json,confidence,outcome)
+         VALUES (?1,?2,'human',?3,?4,'accepted')",
+        params![
+            command.dialog_id,
+            input_message_id,
+            serde_json::to_string(&command.input.intent)?,
+            command.confidence
+        ],
+    )?;
+    let workflow_input_id = connection.last_insert_rowid();
+    require_one(
+        connection.execute(
+            "UPDATE task_stage_runs SET finished_at=strftime('%Y-%m-%d %H:%M:%f','now')
+         WHERE id=?1 AND workflow_task_id=?2 AND finished_at IS NULL",
+            params![source.current_stage_run_id.0, source.id.0],
+        )?,
+        command.dialog_id,
+    )?;
+    connection.execute(
+        "INSERT INTO task_stage_runs (workflow_task_id,phase,sequence) VALUES (?1,?2,?3)",
+        params![
+            source.id.0,
+            enum_text(&target.phase)?,
+            target.current_stage_sequence
+        ],
+    )?;
+    target.current_stage_run_id = StageRunId(connection.last_insert_rowid());
+    connection.execute(
+        "INSERT INTO task_transitions
+         (workflow_task_id,from_stage_run_id,to_stage_run_id,workflow_input_id,event,source_version,source_fingerprint,handoff_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![source.id.0,source.current_stage_run_id.0,target.current_stage_run_id.0,
+            workflow_input_id,event,sqlite_version(source.version)?,source_fingerprint(&source)?,handoff.to_string()],
+    )?;
+    let transition_id = connection.last_insert_rowid();
+    target.incoming_handoff_id = Some(transition_id);
+    target.validate().map_err(domain_error)?;
+    connection.execute(
+        "DELETE FROM goal_proposals WHERE workflow_task_id=?1",
+        [source.id.0],
+    )?;
+    map_message(connection, input_message_id, &target)?;
+    require_one(connection.execute(
+        "UPDATE workflow_tasks SET phase=?1,status='active',goal=?2,goal_revision=?3,plan_json=?4,
+         current_step_id=NULL,expected_action=NULL,checkpoint_json=?5,current_stage_run_id=?6,
+         incoming_handoff_id=?7,version=?8,updated_at=strftime('%Y-%m-%d %H:%M:%f','now')
+         WHERE id=?9 AND dialog_id=?10 AND current_stage_run_id=?11 AND version=?12",
+        params![enum_text(&target.phase)?,target.goal,target.goal_revision,
+            serde_json::to_string(&target.plan)?,serde_json::to_string(&target.checkpoint)?,
+            target.current_stage_run_id.0,transition_id,sqlite_version(target.version)?,
+            source.id.0,command.dialog_id,source.current_stage_run_id.0,sqlite_version(source.version)?],
+    )?, command.dialog_id)?;
+    initialize_stage_context(connection, target.current_stage_run_id)?;
+    touch_dialog(connection, command.dialog_id, input_message_id)?;
+    Ok(PersistedTransition {
+        transition_id,
+        input_message_id,
+        target_state: target,
+    })
+}
+
 fn append_input(
     connection: &Connection,
     command: &InputCommit<'_>,
@@ -2253,6 +2489,17 @@ fn append_input(
             None
         }
     };
+    if task
+        .as_ref()
+        .is_some_and(|state| state.phase == TaskPhase::GoalDefinition)
+        && !matches!(effect, AcceptedInputEffect::RouteUnmanaged)
+    {
+        connection.execute(
+            "DELETE FROM goal_proposals WHERE workflow_task_id=?1",
+            [task.as_ref().expect("goal task exists").id.0],
+        )?;
+        task.as_mut().expect("goal task exists").goal_proposal = None;
+    }
     let message_id = insert_message(connection, command.dialog_id, "user", command.protocol_text)?;
     let workflow_input_id = if matches!(effect, AcceptedInputEffect::RouteUnmanaged) {
         None
@@ -2296,6 +2543,7 @@ fn append_input(
 fn append_answer(
     connection: &Connection,
     command: &AnswerCommit<'_>,
+    proposal_text: Option<&str>,
 ) -> Result<PersistedAnswer, StoreError> {
     let task = current_task(
         connection,
@@ -2305,6 +2553,16 @@ fn append_answer(
         command.expected_version,
     )?;
     active_task(&task)?;
+    if proposal_text.is_some() && task.phase != TaskPhase::GoalDefinition {
+        return invalid("goal proposal requires goal_definition phase");
+    }
+    if task.phase == TaskPhase::GoalDefinition {
+        let extracted = crate::goal_definition::parse_goal_proposal(command.content)
+            .map_err(|_| StoreError::InvalidWorkflow("malformed visible goal proposal".into()))?;
+        if extracted.as_deref() != proposal_text {
+            return invalid("stored goal proposal differs from visible answer");
+        }
+    }
     let message_id = insert_message(connection, command.dialog_id, "assistant", command.content)?;
     if let Some(usage) = &command.usage {
         connection.execute(
@@ -2313,6 +2571,18 @@ fn append_answer(
         )?;
     }
     map_message(connection, message_id, &task)?;
+    if task.phase == TaskPhase::GoalDefinition {
+        connection.execute(
+            "DELETE FROM goal_proposals WHERE workflow_task_id=?1",
+            [task.id.0],
+        )?;
+        if let Some(text) = proposal_text {
+            connection.execute(
+                "INSERT INTO goal_proposals (workflow_task_id,stage_run_id,assistant_message_id,text) VALUES (?1,?2,?3,?4)",
+                params![task.id.0, task.current_stage_run_id.0, message_id, text],
+            )?;
+        }
+    }
     connection.execute(
         "INSERT INTO response_processing (assistant_message_id, checker_name, expected_version, status, attempts)
          VALUES (?1, 'continuation', ?2, 'pending', 0)",
@@ -2502,7 +2772,7 @@ fn load_workflow(
         "SELECT t.id, t.dialog_id, t.ordinal, t.phase, t.status, t.goal, t.plan_json,
                 t.current_step_id, t.expected_action, t.checkpoint_json, t.current_stage_run_id,
                 t.incoming_handoff_id, t.version, s.workflow_task_id, s.phase, s.sequence, s.finished_at,
-                h.workflow_task_id, h.to_stage_run_id
+                h.workflow_task_id, h.to_stage_run_id, t.goal_revision
          FROM workflow_tasks t
          LEFT JOIN task_stage_runs s ON s.id = t.current_stage_run_id
          LEFT JOIN task_transitions h ON h.id = t.incoming_handoff_id
@@ -2528,6 +2798,65 @@ fn load_workflow(
     {
         return invalid("incoming handoff does not target the current task and stage");
     }
+    let goal_proposal_row = connection
+        .query_row(
+            "SELECT p.text, p.assistant_message_id, p.stage_run_id,
+                    m.dialog_id, m.role, ms.workflow_task_id, ms.stage_run_id,
+                    s.workflow_task_id, m.content
+             FROM goal_proposals p
+             JOIN messages m ON m.id=p.assistant_message_id
+             LEFT JOIN message_task_stages ms ON ms.message_id=m.id
+             JOIN task_stage_runs s ON s.id=p.stage_run_id
+             WHERE p.workflow_task_id=?1",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let goal_proposal = if let Some((
+        text,
+        message_id,
+        proposal_stage_id,
+        message_dialog_id,
+        message_role,
+        mapped_task_id,
+        mapped_stage_id,
+        proposal_stage_task_id,
+        visible_answer,
+    )) = goal_proposal_row
+    {
+        if message_dialog_id != dialog_id
+            || message_role != "assistant"
+            || mapped_task_id != Some(task_id)
+            || mapped_stage_id != Some(proposal_stage_id)
+            || proposal_stage_task_id != task_id
+        {
+            return invalid("goal proposal message ownership or role mismatch");
+        }
+        let visible_goal = crate::goal_definition::parse_goal_proposal(&visible_answer)
+            .map_err(|_| StoreError::InvalidWorkflow("malformed visible goal proposal".into()))?;
+        if visible_goal.as_deref() != Some(text.as_str()) {
+            return invalid("goal proposal differs from visible answer");
+        }
+        Some(crate::workflow::GoalProposal {
+            text,
+            assistant_message_id: message_id,
+            stage_run_id: StageRunId(proposal_stage_id),
+        })
+    } else {
+        None
+    };
     let task = WorkflowTaskState {
         id: WorkflowTaskId(integer(row, 0)?),
         dialog_id,
@@ -2535,6 +2864,8 @@ fn load_workflow(
         phase,
         status,
         goal: field(row, 5)?,
+        goal_revision: unsigned(integer(row, 19)?, "goal revision")?,
+        goal_proposal,
         plan: json(&field::<String>(row, 6)?)?,
         current_step_id: field(row, 7)?,
         expected_action: field(row, 8)?,
@@ -2587,15 +2918,25 @@ fn text_enum<T: DeserializeOwned>(row: &Row<'_>, index: usize) -> Result<T, Stor
 }
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
+    connection.execute_batch("PRAGMA foreign_keys=OFF")?;
+    let result = migrate_without_foreign_keys(connection);
+    let restore = connection.execute_batch("PRAGMA foreign_keys=ON");
+    result?;
+    restore?;
+    Ok(())
+}
+
+fn migrate_without_foreign_keys(connection: &mut Connection) -> Result<(), StoreError> {
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS workflow_tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             dialog_id INTEGER NOT NULL REFERENCES dialogs(id),
             ordinal INTEGER NOT NULL CHECK (ordinal > 0),
-            phase TEXT NOT NULL CHECK (phase IN ('planning','execution','validation','done')),
+            phase TEXT NOT NULL CHECK (phase IN ('goal_definition','planning','execution','validation','done')),
             status TEXT NOT NULL CHECK (status IN ('active','paused')),
             goal TEXT NOT NULL,
+            goal_revision INTEGER NOT NULL DEFAULT 1 CHECK (goal_revision >= 0),
             plan_json TEXT NOT NULL,
             current_step_id TEXT,
             expected_action TEXT,
@@ -2618,7 +2959,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         CREATE TABLE IF NOT EXISTS task_stage_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id),
-            phase TEXT NOT NULL CHECK (phase IN ('planning','execution','validation','done')),
+            phase TEXT NOT NULL CHECK (phase IN ('goal_definition','planning','execution','validation','done')),
             sequence INTEGER NOT NULL CHECK (sequence > 0),
             started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
             finished_at TEXT,
@@ -2657,6 +2998,12 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id),
             stage_run_id INTEGER NOT NULL REFERENCES task_stage_runs(id)
         );
+        CREATE TABLE IF NOT EXISTS goal_proposals (
+            workflow_task_id INTEGER PRIMARY KEY REFERENCES workflow_tasks(id),
+            stage_run_id INTEGER NOT NULL REFERENCES task_stage_runs(id),
+            assistant_message_id INTEGER NOT NULL REFERENCES messages(id),
+            text TEXT NOT NULL CHECK (length(trim(text)) > 0)
+        );
         CREATE TABLE IF NOT EXISTS response_processing (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             assistant_message_id INTEGER NOT NULL REFERENCES messages(id),
@@ -2678,7 +3025,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             workflow_input_id INTEGER NOT NULL UNIQUE REFERENCES workflow_inputs(id),
             event TEXT NOT NULL CHECK (event IN (
                 'planning_completed','execution_completed','validation_passed','validation_failed',
-                'replan_requested'
+                'replan_requested','goal_approved','goal_reopened'
             )),
             source_version INTEGER NOT NULL CHECK (source_version >= 0),
             source_fingerprint TEXT,
@@ -2697,11 +3044,133 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         // deliberate non-replayable sentinel, never inferred from current state.
         tx.execute_batch("ALTER TABLE task_transitions ADD COLUMN source_fingerprint TEXT")?;
     }
+    upgrade_legacy_workflow_schema(&tx)?;
     if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
         return Err(StoreError::InvalidWorkflow(
             "foreign key check failed".into(),
         ));
     }
     tx.commit()?;
+    Ok(())
+}
+
+fn upgrade_legacy_workflow_schema(connection: &Connection) -> Result<(), StoreError> {
+    let task_sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='workflow_tasks'",
+        [],
+        |row| row.get(0),
+    )?;
+    let transition_sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='task_transitions'",
+        [],
+        |row| row.get(0),
+    )?;
+    if task_sql.contains("goal_definition")
+        && task_sql.contains("goal_revision")
+        && transition_sql.contains("goal_approved")
+    {
+        return Ok(());
+    }
+    let has_revision: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('workflow_tasks') WHERE name='goal_revision')",
+        [],
+        |row| row.get(0),
+    )?;
+    let saved_sequences: Vec<(String, i64)> = connection
+        .prepare(
+            "SELECT name, seq FROM sqlite_sequence
+             WHERE name IN ('workflow_tasks','task_stage_runs','task_transitions')",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    connection.execute_batch(
+        "CREATE TABLE workflow_tasks_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dialog_id INTEGER NOT NULL REFERENCES dialogs(id),
+            ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+            phase TEXT NOT NULL CHECK (phase IN ('goal_definition','planning','execution','validation','done')),
+            status TEXT NOT NULL CHECK (status IN ('active','paused')),
+            goal TEXT NOT NULL,
+            goal_revision INTEGER NOT NULL DEFAULT 1 CHECK (goal_revision >= 0),
+            plan_json TEXT NOT NULL,
+            current_step_id TEXT,
+            expected_action TEXT,
+            checkpoint_json TEXT NOT NULL,
+            current_stage_run_id INTEGER,
+            incoming_handoff_id INTEGER,
+            version INTEGER NOT NULL CHECK (version >= 0),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+            UNIQUE(dialog_id, ordinal),
+            FOREIGN KEY(current_stage_run_id) REFERENCES task_stage_runs(id),
+            FOREIGN KEY(incoming_handoff_id) REFERENCES task_transitions(id)
+        );",
+    )?;
+    let revision = if has_revision { "goal_revision" } else { "1" };
+    connection.execute_batch(&format!(
+        "INSERT INTO workflow_tasks_new
+         (id,dialog_id,ordinal,phase,status,goal,goal_revision,plan_json,current_step_id,
+          expected_action,checkpoint_json,current_stage_run_id,incoming_handoff_id,version,
+          created_at,updated_at)
+         SELECT id,dialog_id,ordinal,phase,status,goal,{revision},plan_json,current_step_id,
+                expected_action,checkpoint_json,current_stage_run_id,incoming_handoff_id,version,
+                created_at,updated_at FROM workflow_tasks;
+         DROP TABLE workflow_tasks;
+         ALTER TABLE workflow_tasks_new RENAME TO workflow_tasks;
+         CREATE UNIQUE INDEX one_unfinished_workflow_task_per_dialog
+           ON workflow_tasks(dialog_id) WHERE phase <> 'done';"
+    ))?;
+    connection.execute_batch(
+        "CREATE TABLE task_stage_runs_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id),
+            phase TEXT NOT NULL CHECK (phase IN ('goal_definition','planning','execution','validation','done')),
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+            finished_at TEXT,
+            CHECK (finished_at IS NULL OR finished_at >= started_at),
+            UNIQUE(workflow_task_id, sequence)
+        );
+        INSERT INTO task_stage_runs_new (id,workflow_task_id,phase,sequence,started_at,finished_at)
+          SELECT id,workflow_task_id,phase,sequence,started_at,finished_at FROM task_stage_runs;
+        DROP TABLE task_stage_runs;
+        ALTER TABLE task_stage_runs_new RENAME TO task_stage_runs;
+        CREATE TABLE task_transitions_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id),
+            from_stage_run_id INTEGER NOT NULL REFERENCES task_stage_runs(id),
+            to_stage_run_id INTEGER NOT NULL REFERENCES task_stage_runs(id),
+            workflow_input_id INTEGER NOT NULL UNIQUE REFERENCES workflow_inputs(id),
+            event TEXT NOT NULL CHECK (event IN (
+                'planning_completed','execution_completed','validation_passed','validation_failed',
+                'replan_requested','goal_approved','goal_reopened'
+            )),
+            source_version INTEGER NOT NULL CHECK (source_version >= 0),
+            source_fingerprint TEXT,
+            handoff_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
+        );
+        INSERT INTO task_transitions_new
+          (id,workflow_task_id,from_stage_run_id,to_stage_run_id,workflow_input_id,event,
+           source_version,source_fingerprint,handoff_json,created_at)
+          SELECT id,workflow_task_id,from_stage_run_id,to_stage_run_id,workflow_input_id,event,
+                 source_version,source_fingerprint,handoff_json,created_at FROM task_transitions;
+        DROP TABLE task_transitions;
+        ALTER TABLE task_transitions_new RENAME TO task_transitions;
+        CREATE UNIQUE INDEX one_transition_per_source_stage
+          ON task_transitions(workflow_task_id,from_stage_run_id,source_version);",
+    )?;
+    for (name, sequence) in saved_sequences {
+        let updated = connection.execute(
+            "UPDATE sqlite_sequence SET seq=max(seq,?2) WHERE name=?1",
+            params![name, sequence],
+        )?;
+        if updated == 0 {
+            connection.execute(
+                "INSERT INTO sqlite_sequence(name,seq) VALUES (?1,?2)",
+                params![name, sequence],
+            )?;
+        }
+    }
     Ok(())
 }

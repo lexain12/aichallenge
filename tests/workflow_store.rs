@@ -8,6 +8,7 @@ use deepseek_cli::workflow::{
 use deepseek_cli::workflow::{PlanAppend, PlanStepStatus, StepStatusUpdate, TaskStatePatch};
 use deepseek_cli::workflow::{StageRunId, TaskPhase, TaskStatus};
 use deepseek_cli::workflow::{WorkflowInput, WorkflowInputSource, WorkflowIntent, WorkflowTaskId};
+use deepseek_cli::workflow::{authorize_goal_approval, authorize_goal_reopen};
 use deepseek_cli::workflow_context::StageReductionState;
 use deepseek_cli::workflow_model::HandoffPayload;
 use deepseek_cli::workflow_store::TransitionCommit;
@@ -22,6 +23,445 @@ use deepseek_cli::workflow_store::{
     PauseOutcome, ProcessingStatus, ProtocolSource, WorkflowRepository,
 };
 use rusqlite::Connection;
+
+#[test]
+fn new_task_starts_in_persisted_goal_definition_stage() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("goal-start.sqlite3")).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "Build a parser")
+        .unwrap();
+    assert_eq!(started.task.phase, TaskPhase::GoalDefinition);
+    let restored = store
+        .load_workflow(started.dialog_id)
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(restored.phase, TaskPhase::GoalDefinition);
+    assert_eq!(restored.goal_revision, 0);
+    assert!(restored.plan.steps.is_empty());
+}
+
+#[test]
+fn legacy_workflow_schema_is_upgraded_without_losing_task_and_stage_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("legacy-workflow.sqlite3");
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         CREATE TABLE dialogs (id INTEGER PRIMARY KEY AUTOINCREMENT, system_prompt TEXT NOT NULL, title TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT 'now', last_message_id INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE workflow_tasks (
+           id INTEGER PRIMARY KEY AUTOINCREMENT, dialog_id INTEGER NOT NULL REFERENCES dialogs(id),
+           ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+           phase TEXT NOT NULL CHECK (phase IN ('planning','execution','validation','done')),
+           status TEXT NOT NULL CHECK (status IN ('active','paused')), goal TEXT NOT NULL,
+           plan_json TEXT NOT NULL, current_step_id TEXT, expected_action TEXT,
+           checkpoint_json TEXT NOT NULL, current_stage_run_id INTEGER,
+           incoming_handoff_id INTEGER, version INTEGER NOT NULL CHECK (version >= 0),
+           created_at TEXT NOT NULL DEFAULT 'now', updated_at TEXT NOT NULL DEFAULT 'now',
+           UNIQUE(dialog_id, ordinal),
+           FOREIGN KEY(current_stage_run_id) REFERENCES task_stage_runs(id),
+           FOREIGN KEY(incoming_handoff_id) REFERENCES task_transitions(id));
+         CREATE TABLE task_stage_runs (
+           id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id),
+           phase TEXT NOT NULL CHECK (phase IN ('planning','execution','validation','done')),
+           sequence INTEGER NOT NULL CHECK (sequence > 0),
+           started_at TEXT NOT NULL DEFAULT 'now', finished_at TEXT,
+           CHECK (finished_at IS NULL OR finished_at >= started_at), UNIQUE(workflow_task_id, sequence));
+         CREATE TABLE task_transitions (
+           id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id),
+           from_stage_run_id INTEGER NOT NULL REFERENCES task_stage_runs(id),
+           to_stage_run_id INTEGER NOT NULL REFERENCES task_stage_runs(id),
+           workflow_input_id INTEGER NOT NULL UNIQUE, event TEXT NOT NULL CHECK (event IN (
+             'planning_completed','execution_completed','validation_passed','validation_failed','replan_requested')),
+           source_version INTEGER NOT NULL CHECK (source_version >= 0), source_fingerprint TEXT,
+           handoff_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT 'now');
+         INSERT INTO dialogs (id,system_prompt,title) VALUES (4,'BASE','legacy');
+         INSERT INTO workflow_tasks (id,dialog_id,ordinal,phase,status,goal,plan_json,checkpoint_json,version)
+           VALUES (9,4,1,'planning','active','Legacy goal','{\"revision\":0,\"steps\":[],\"acceptance_criteria\":[]}',
+             '{\"summary\":\"\",\"decisions\":[],\"open_issues\":[]}',0);
+         INSERT INTO task_stage_runs (id,workflow_task_id,phase,sequence) VALUES (12,9,'planning',1);
+         UPDATE workflow_tasks SET current_stage_run_id=12 WHERE id=9;
+         CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, dialog_id INTEGER NOT NULL REFERENCES dialogs(id), role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT 'now');
+         CREATE TABLE workflow_inputs (id INTEGER PRIMARY KEY AUTOINCREMENT, dialog_id INTEGER NOT NULL REFERENCES dialogs(id), message_id INTEGER NOT NULL UNIQUE REFERENCES messages(id), source TEXT NOT NULL, checker_name TEXT, model_name TEXT, triggering_assistant_message_id INTEGER REFERENCES messages(id), intent_json TEXT NOT NULL, confidence REAL, outcome TEXT NOT NULL, rejection_reason TEXT, processing_id INTEGER, created_at TEXT NOT NULL DEFAULT 'now');
+         CREATE TABLE response_processing (id INTEGER PRIMARY KEY AUTOINCREMENT, assistant_message_id INTEGER NOT NULL REFERENCES messages(id), checker_name TEXT NOT NULL, expected_version INTEGER NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, result_json TEXT, last_error TEXT, created_at TEXT NOT NULL DEFAULT 'now', updated_at TEXT NOT NULL DEFAULT 'now', UNIQUE(assistant_message_id,checker_name));
+         CREATE TABLE task_stage_context (stage_run_id INTEGER PRIMARY KEY REFERENCES task_stage_runs(id), context_json TEXT NOT NULL, facts_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT 'now');
+         CREATE TABLE dialog_workflow_state (dialog_id INTEGER PRIMARY KEY REFERENCES dialogs(id), current_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id));
+         INSERT INTO messages (id,dialog_id,role,content) VALUES (20,4,'user','start'),(21,4,'assistant','old answer');
+         INSERT INTO workflow_inputs (id,dialog_id,message_id,source,intent_json,confidence,outcome)
+           VALUES (22,4,20,'human','{\"ProposeTransition\":{\"event\":\"PlanningCompleted\",\"evidence\":[]}}',0.95,'accepted');
+         UPDATE task_stage_runs SET finished_at='now' WHERE id=12;
+         INSERT INTO task_stage_runs (id,workflow_task_id,phase,sequence) VALUES (13,9,'execution',2);
+         INSERT INTO task_transitions (id,workflow_task_id,from_stage_run_id,to_stage_run_id,workflow_input_id,event,source_version,handoff_json)
+           VALUES (23,9,12,13,22,'planning_completed',0,'{}');
+         UPDATE workflow_tasks SET phase='execution',current_stage_run_id=13,incoming_handoff_id=23,version=1 WHERE id=9;
+         INSERT INTO task_stage_context (stage_run_id,context_json,facts_json) VALUES (13,'{}','{}');
+         INSERT INTO response_processing (id,assistant_message_id,checker_name,expected_version,status)
+           VALUES (24,21,'continuation',1,'pending');
+         INSERT INTO dialog_workflow_state (dialog_id,current_task_id) VALUES (4,9);
+         UPDATE sqlite_sequence SET seq=90 WHERE name='workflow_tasks';
+         UPDATE sqlite_sequence SET seq=120 WHERE name='task_stage_runs';
+         UPDATE sqlite_sequence SET seq=230 WHERE name='task_transitions';"
+    ).unwrap();
+    drop(connection);
+    let store = DialogStore::open(&path).unwrap();
+    let check = Connection::open(&path).unwrap();
+    assert_eq!(
+        check
+            .query_row(
+                "SELECT goal_revision FROM workflow_tasks WHERE id=9",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        check
+            .query_row("SELECT phase FROM task_stage_runs WHERE id=12", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "planning"
+    );
+    assert_eq!(
+        store.load_workflow(4).unwrap().current_task.unwrap().phase,
+        TaskPhase::Execution
+    );
+    assert_eq!(
+        check
+            .query_row(
+                "SELECT event FROM task_transitions WHERE id=23",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "planning_completed"
+    );
+    assert_eq!(
+        check
+            .query_row(
+                "SELECT status FROM response_processing WHERE id=24",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        check
+            .query_row(
+                "SELECT context_json FROM task_stage_context WHERE stage_run_id=13",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "{}"
+    );
+    for (table, expected) in [
+        ("workflow_tasks", 90),
+        ("task_stage_runs", 120),
+        ("task_transitions", 230),
+    ] {
+        let sequence: i64 = check
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sequence, expected,
+            "{table} sequence must survive migration"
+        );
+    }
+    assert!(
+        !check
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap()
+    );
+    drop(store);
+    DialogStore::open(&path).unwrap();
+}
+
+#[test]
+fn saved_goal_proposal_is_bound_to_assistant_message_and_cleared_by_discussion() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("proposal.sqlite3")).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "Build a parser")
+        .unwrap();
+    let answer = store
+        .append_goal_answer_for_processing(
+            AnswerCommit {
+                dialog_id: started.dialog_id,
+                task_id: started.task.id,
+                stage_run_id: started.stage_run_id,
+                expected_version: started.task.version,
+                content: "Предлагаемая цель: Сделать CLI",
+                usage: None,
+            },
+            Some("Сделать CLI"),
+        )
+        .unwrap();
+    let current = store
+        .load_workflow(started.dialog_id)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let proposal = current.goal_proposal.unwrap();
+    assert_eq!(proposal.text, "Сделать CLI");
+    assert_eq!(proposal.assistant_message_id, answer.message_id);
+    assert_eq!(proposal.stage_run_id, started.stage_run_id);
+    store
+        .append_input(
+            InputCommit {
+                dialog_id: started.dialog_id,
+                input: &WorkflowInput {
+                    source: WorkflowInputSource::Human,
+                    intent: WorkflowIntent::Continue {
+                        instruction: "Добавь Windows".into(),
+                    },
+                },
+                protocol_text: "Добавь Windows",
+                confidence: Some(0.99),
+                expected_current_task: ExpectedCurrentTask::Present {
+                    task_id: current.id,
+                    version: current.version,
+                },
+            },
+            AcceptedInputEffect::ContinueSameStage,
+        )
+        .unwrap();
+    assert!(
+        store
+            .load_workflow(started.dialog_id)
+            .unwrap()
+            .current_task
+            .unwrap()
+            .goal_proposal
+            .is_none()
+    );
+}
+
+#[test]
+fn tampered_goal_proposal_cannot_be_loaded_or_approved() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("tampered-goal.sqlite3");
+    let mut store = DialogStore::open(&path).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "Draft")
+        .unwrap();
+    store
+        .append_goal_answer_for_processing(
+            AnswerCommit {
+                dialog_id: started.dialog_id,
+                task_id: started.task.id,
+                stage_run_id: started.stage_run_id,
+                expected_version: 0,
+                content: "Предлагаемая цель: Сделать CLI",
+                usage: None,
+            },
+            Some("Сделать CLI"),
+        )
+        .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE goal_proposals SET text='Удалить все данные' WHERE workflow_task_id=?1",
+            [started.task.id.0],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.load_workflow(started.dialog_id),
+        Err(StoreError::InvalidWorkflow(_))
+    ));
+}
+
+#[test]
+fn human_approval_and_reopen_are_atomic_stage_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("goal-transitions.sqlite3")).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "Draft")
+        .unwrap();
+    store
+        .append_goal_answer_for_processing(
+            AnswerCommit {
+                dialog_id: started.dialog_id,
+                task_id: started.task.id,
+                stage_run_id: started.stage_run_id,
+                expected_version: 0,
+                content: "Предлагаемая цель: Сделать CLI",
+                usage: None,
+            },
+            Some("Сделать CLI"),
+        )
+        .unwrap();
+    let source = store
+        .load_workflow(started.dialog_id)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let authorization = authorize_goal_approval(&source, &WorkflowInputSource::Human).unwrap();
+    let approved = store
+        .commit_goal_approval(
+            InputCommit {
+                dialog_id: started.dialog_id,
+                input: &WorkflowInput {
+                    source: WorkflowInputSource::Human,
+                    intent: WorkflowIntent::ApproveGoal,
+                },
+                protocol_text: "Да, утверждаю эту цель",
+                confidence: Some(0.99),
+                expected_current_task: ExpectedCurrentTask::Present {
+                    task_id: source.id,
+                    version: source.version,
+                },
+            },
+            &authorization,
+        )
+        .unwrap();
+    assert_eq!(approved.target_state.phase, TaskPhase::Planning);
+    assert_eq!(approved.target_state.goal, "Сделать CLI");
+    assert_eq!(approved.target_state.goal_revision, 1);
+    assert!(approved.target_state.goal_proposal.is_none());
+    assert!(approved.target_state.plan.steps.is_empty());
+    let reopen = authorize_goal_reopen(
+        &approved.target_state,
+        &WorkflowInputSource::Human,
+        "Добавь Windows".into(),
+    )
+    .unwrap();
+    let reopened = store
+        .commit_goal_reopen(
+            InputCommit {
+                dialog_id: started.dialog_id,
+                input: &WorkflowInput {
+                    source: WorkflowInputSource::Human,
+                    intent: WorkflowIntent::ReopenGoal {
+                        change_request: "Добавь Windows".into(),
+                    },
+                },
+                protocol_text: "Добавь Windows в цель",
+                confidence: Some(0.99),
+                expected_current_task: ExpectedCurrentTask::Present {
+                    task_id: approved.target_state.id,
+                    version: approved.target_state.version,
+                },
+            },
+            &reopen,
+        )
+        .unwrap();
+    assert_eq!(reopened.target_state.phase, TaskPhase::GoalDefinition);
+    assert_eq!(reopened.target_state.goal, "Сделать CLI");
+    assert_eq!(reopened.target_state.plan.revision, 1);
+    assert!(reopened.target_state.plan.steps.is_empty());
+    assert_eq!(
+        store
+            .load_workflow(started.dialog_id)
+            .unwrap()
+            .current_task
+            .unwrap(),
+        reopened.target_state
+    );
+}
+
+#[test]
+fn branch_remaps_active_goal_proposal_to_its_own_message() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("goal-branch.sqlite3")).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "Draft")
+        .unwrap();
+    let answer = store
+        .append_goal_answer_for_processing(
+            AnswerCommit {
+                dialog_id: started.dialog_id,
+                task_id: started.task.id,
+                stage_run_id: started.stage_run_id,
+                expected_version: 0,
+                content: "Предлагаемая цель: Сделать CLI",
+                usage: None,
+            },
+            Some("Сделать CLI"),
+        )
+        .unwrap();
+    let branch_id = store
+        .fork_dialog(started.dialog_id, 2)
+        .unwrap()
+        .new_dialog_id;
+    let branch = store
+        .load_workflow(branch_id)
+        .unwrap()
+        .current_task
+        .unwrap();
+    let original = store
+        .load_workflow(started.dialog_id)
+        .unwrap()
+        .current_task
+        .unwrap();
+    assert_eq!(branch.phase, TaskPhase::GoalDefinition);
+    assert_eq!(branch.goal_revision, 0);
+    assert_eq!(branch.goal_proposal.as_ref().unwrap().text, "Сделать CLI");
+    assert_ne!(
+        branch.goal_proposal.as_ref().unwrap().assistant_message_id,
+        answer.message_id
+    );
+    assert_ne!(
+        branch.goal_proposal.as_ref().unwrap().stage_run_id,
+        original.current_stage_run_id
+    );
+}
+
+#[test]
+fn human_approval_after_pause_resumes_and_keeps_the_same_proposal() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DialogStore::open(&directory.path().join("goal-pause.sqlite3")).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "Draft")
+        .unwrap();
+    store
+        .append_goal_answer_for_processing(
+            AnswerCommit {
+                dialog_id: started.dialog_id,
+                task_id: started.task.id,
+                stage_run_id: started.stage_run_id,
+                expected_version: 0,
+                content: "Предлагаемая цель: Сделать CLI",
+                usage: None,
+            },
+            Some("Сделать CLI"),
+        )
+        .unwrap();
+    let PauseOutcome::Paused(paused) = store.pause_current_task(started.dialog_id).unwrap() else {
+        panic!("must pause")
+    };
+    assert!(paused.goal_proposal.is_some());
+    let authorization = authorize_goal_approval(&paused, &WorkflowInputSource::Human).unwrap();
+    let transition = store
+        .commit_goal_approval(
+            InputCommit {
+                dialog_id: started.dialog_id,
+                input: &WorkflowInput {
+                    source: WorkflowInputSource::Human,
+                    intent: WorkflowIntent::ApproveGoal,
+                },
+                protocol_text: "Утверждаю",
+                confidence: Some(0.99),
+                expected_current_task: ExpectedCurrentTask::Present {
+                    task_id: paused.id,
+                    version: paused.version,
+                },
+            },
+            &authorization,
+        )
+        .unwrap();
+    assert_eq!(transition.target_state.status, TaskStatus::Active);
+    assert_eq!(transition.target_state.phase, TaskPhase::Planning);
+}
 
 // Break caught: moving the large state behind indirection must still decode
 // existing audit JSON and replay it with exactly the same serialized shape.
@@ -69,6 +509,10 @@ fn processing_context_is_bound_to_dialog_and_original_answer() {
     let mut store = DialogStore::open(&directory.path().join("context.sqlite3")).unwrap();
     let started = store
         .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "original goal")
+        .unwrap();
+    Connection::open(directory.path().join("context.sqlite3"))
+        .unwrap()
+        .execute_batch("UPDATE workflow_tasks SET phase='planning', goal_revision=1; UPDATE task_stage_runs SET phase='planning';")
         .unwrap();
     let answer = store
         .append_answer_for_processing(AnswerCommit {
@@ -1132,8 +1576,8 @@ fn human_transition_replay_returns_original_after_later_replan() {
 }
 
 #[test]
-fn replan_always_creates_a_new_planning_run_including_planning_and_done() {
-    for phase in ["planning", "execution", "validation", "done"] {
+fn replan_always_creates_a_new_planning_run_before_done() {
+    for phase in ["planning", "execution", "validation"] {
         let mut fixture = Fixture::new();
         fixture
             .connection
@@ -1700,7 +2144,7 @@ fn terminal_done_stage_rejects_work_and_allows_only_next_human_task() {
         .unwrap();
     assert_eq!(
         (next.task.ordinal, next.task.phase),
-        (2, TaskPhase::Planning)
+        (2, TaskPhase::GoalDefinition)
     );
     assert_ne!(next.task.id, done.id);
     let branch = fixture.store.fork_dialog(1, 3).unwrap().new_dialog_id;
@@ -3550,7 +3994,7 @@ fn stale_human_input_cannot_target_replacement_task_with_the_same_version() {
 #[test]
 fn stale_creation_cannot_replace_a_different_done_task_with_the_same_version() {
     let mut fixture = Fixture::new();
-    fixture.connection.execute_batch("UPDATE workflow_tasks SET phase='done', status='active'; UPDATE task_stage_runs SET phase='done';").unwrap();
+    fixture.connection.execute_batch("UPDATE workflow_tasks SET phase='done', status='active', goal_revision=1; UPDATE task_stage_runs SET phase='done';").unwrap();
     let observed = fixture
         .store
         .load_workflow(1)
@@ -3568,7 +4012,7 @@ fn stale_creation_cannot_replace_a_different_done_task_with_the_same_version() {
     fixture
         .connection
         .execute(
-            "UPDATE workflow_tasks SET phase='done', version=3 WHERE id=?1",
+            "UPDATE workflow_tasks SET phase='done', goal_revision=1, version=3 WHERE id=?1",
             [replacement.task.id.0],
         )
         .unwrap();
@@ -4257,7 +4701,7 @@ fn existing_dialog_creation_rejects_stale_versions_and_competing_unfinished_task
         Err(StoreError::WorkflowConflict(_))
     ));
     let connection = Connection::open(path).unwrap();
-    connection.execute_batch("UPDATE workflow_tasks SET phase='done', version=4; UPDATE task_stage_runs SET phase='done';").unwrap();
+    connection.execute_batch("UPDATE workflow_tasks SET phase='done', goal_revision=1, version=4; UPDATE task_stage_runs SET phase='done';").unwrap();
     assert!(matches!(
         second.create_task_with_human_input(
             dialog,

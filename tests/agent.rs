@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::Write;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use deepseek_cli::agent::{Agent, AgentError, AgentEvent};
@@ -8,6 +9,7 @@ use deepseek_cli::config::Config;
 use deepseek_cli::dialog::DialogStore;
 use deepseek_cli::invariants::InvariantRepository;
 use deepseek_cli::memory::{DurableMemoryScope, RequestScope};
+use deepseek_cli::profile::ProfileRepository;
 use deepseek_cli::workflow::{TaskPhase, TaskStatus};
 use deepseek_cli::workflow_engine::{
     AutonomyStopReason, WorkflowEngineError, WorkflowModels, WorkflowTurnEvent,
@@ -30,6 +32,25 @@ fn config(server: &MockServer) -> Config {
     )
     .unwrap();
     Config::load(file.path(), None).unwrap()
+}
+
+// Historical checker tests start with an already-approved goal so they can
+// exercise planning/execution rather than the new goal-definition gate.
+fn approved_planning_store(path: &Path) -> (DialogStore, i64) {
+    let mut store = DialogStore::open(path).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "approved goal")
+        .unwrap();
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch("UPDATE workflow_tasks SET phase='planning', goal_revision=1; UPDATE task_stage_runs SET phase='planning';")
+        .unwrap();
+    (store, started.dialog_id)
+}
+
+fn continue_interpretation() -> String {
+    json!({"confidence":0.95,"intent":{"type":"continue","instruction":"continue planning"}})
+        .to_string()
 }
 
 #[test]
@@ -101,6 +122,156 @@ async fn config_only_invariant_blocks_new_task_before_ordinary_generation() {
 }
 
 #[tokio::test]
+async fn invariant_input_rejection_logs_safe_checker_result() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let log_path = directory.path().join("checks.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='key'\nbase_url='{}'\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=false\n[[invariants]]\nid='STACK'\ntext='Use Rust only'",
+            server.uri(), log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let service = Arc::new(AgentWorkflowModel::default());
+    service.responses.lock().unwrap().push_back(
+        json!({"type":"deny","violations":[{"id":"STACK","reason":"SECRET_REASON"}]}).to_string(),
+    );
+    let store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();
+    let mut agent = Agent::with_store(&config, store)
+        .unwrap()
+        .with_workflow_models(injected_models(&service));
+
+    let answer = agent
+        .run_with_prompt("Build a backend in Go")
+        .await
+        .unwrap();
+
+    assert!(answer.contains("STACK"));
+    let log = std::fs::read_to_string(log_path).unwrap();
+    let checks: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| {
+            event["event"] == "workflow" && event["details"]["mode"] == "blocking"
+        })
+        .collect();
+    assert_eq!(checks.len(), 1, "{log}");
+    let details = &checks[0]["details"];
+    assert_eq!(details["component"], "invariants");
+    assert_eq!(details["check_target"], "start_new_task");
+    assert_eq!(details["outcome"], "denied");
+    assert_eq!(details["violation_ids"], json!(["STACK"]));
+    assert!(details.get("payload").is_none());
+    assert!(!log.contains("SECRET_REASON"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn invariant_response_rejection_logs_ordered_checks_without_running_advisory() {
+    let server = MockServer::start().await;
+    mount_sequence(&server, [sse("Go answer", 2, 1, 3)]).await;
+    let directory = tempfile::tempdir().unwrap();
+    let log_path = directory.path().join("checks.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='key'\nbase_url='{}'\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=true\n[[invariants]]\nid='STACK'\ntext='Use Rust only'",
+            server.uri(), log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let service = Arc::new(AgentWorkflowModel::default());
+    service.responses.lock().unwrap().extend([
+        json!({"type":"allow"}).to_string(),
+        json!({"type":"deny","violations":[{"id":"STACK","reason":"Go conflicts with Rust"}]})
+            .to_string(),
+    ]);
+    let store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();
+    let mut agent = Agent::with_store(&config, store)
+        .unwrap()
+        .with_workflow_models(injected_models(&service));
+
+    let answer = agent.run_with_prompt("Try Go").await.unwrap();
+
+    assert!(answer.contains("Go conflicts with Rust"));
+    let log = std::fs::read_to_string(log_path).unwrap();
+    let checks: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| {
+            event["event"] == "workflow" && event["details"]["mode"] == "blocking"
+        })
+        .collect();
+    assert_eq!(checks.len(), 2, "{log}");
+    assert_eq!(checks[0]["details"]["check_target"], "start_new_task");
+    assert_eq!(checks[0]["details"]["outcome"], "allowed");
+    assert_eq!(checks[1]["details"]["check_target"], "candidate_response");
+    assert_eq!(checks[1]["details"]["outcome"], "denied");
+    assert_eq!(checks[1]["details"]["violation_ids"], json!(["STACK"]));
+    assert!(
+        checks[1]["details"]["payload"]
+            .to_string()
+            .contains("Go conflicts with Rust")
+    );
+    assert!(!log.contains("\"component\":\"continuation\""));
+    assert_eq!(service.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn rejected_task_start_log_explains_unfinished_task_and_interpreted_intent() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let log_path = directory.path().join("checks.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='key'\nbase_url='{}'\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=false",
+            server.uri(), log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut store = DialogStore::open(&directory.path().join("dialogs.sqlite3")).unwrap();
+    let started = store
+        .start_dialog_with_workflow_task(&RequestScope::default(), "BASE", "Build a CLI")
+        .unwrap();
+    let service = Arc::new(AgentWorkflowModel::default());
+    service.responses.lock().unwrap().push_back(
+        json!({"confidence":0.95,"intent":{"type":"start_new_task","goal":"Other goal"}})
+            .to_string(),
+    );
+    let mut agent = Agent::from_dialog(&config, store, started.dialog_id)
+        .unwrap()
+        .with_workflow_models(injected_models(&service));
+
+    agent
+        .run_workflow_streaming("Start another task", |_| Ok(()))
+        .await
+        .unwrap();
+
+    let log = std::fs::read_to_string(log_path).unwrap();
+    let router: Value = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| {
+            event["event"] == "workflow"
+                && event["details"]["component"] == "input_router"
+                && event["details"]["outcome"] == "rejected"
+        })
+        .expect("rejected router diagnostic");
+    let details = &router["details"];
+    assert_eq!(details["input_intent"], "start_new_task");
+    assert_eq!(details["input_phase"], "goal_definition");
+    assert_eq!(details["input_status"], "active");
+    assert_eq!(
+        details["rejection_reason"],
+        "dialog already has an unfinished task"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn config_invariants_cannot_be_bypassed_by_in_memory_agent() {
     let config = Config::from_toml(
         "api_key='key'\n[context]\nstrategy='summary'\n[[invariants]]\nid='STACK'\ntext='Use Rust only'",
@@ -128,7 +299,7 @@ fn debug_snapshot_reads_paused_task_without_resuming_or_changing_it() {
     };
     let agent = Agent::from_dialog(&config, store, started.dialog_id).unwrap();
     let snapshot = serde_json::to_value(agent.debug_snapshot().unwrap()).unwrap();
-    assert_eq!(snapshot["workflow"]["phase"], "planning");
+    assert_eq!(snapshot["workflow"]["phase"], "goal_definition");
     assert_eq!(snapshot["workflow"]["status"], "paused");
     assert_eq!(snapshot["workflow"]["goal"], "Build a CLI");
     assert_eq!(snapshot["workflow"]["version"], paused.version);
@@ -146,6 +317,38 @@ fn debug_snapshot_reads_paused_task_without_resuming_or_changing_it() {
             .unwrap(),
         *paused
     );
+}
+
+#[test]
+fn debug_snapshot_identifies_active_profile_without_exposing_its_text() {
+    let config = Config::from_toml("api_key='key'\n[context]\nstrategy='summary'", None).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dialogs.sqlite3");
+    let mut store = DialogStore::open(&path).unwrap();
+    store
+        .replace_profile("alice", "ALICE_PRIVATE_PROFILE")
+        .unwrap();
+    store.replace_profile("bob", "BOB_PRIVATE_PROFILE").unwrap();
+
+    for user_id in ["alice", "bob", "default"] {
+        let agent = Agent::with_store_for_scope(
+            &config,
+            DialogStore::open(&path).unwrap(),
+            RequestScope::new(user_id, "project").unwrap(),
+        )
+        .unwrap();
+        let snapshot = serde_json::to_value(agent.debug_snapshot().unwrap()).unwrap();
+        assert_eq!(snapshot["active_profile"]["user_id"], user_id);
+        assert_eq!(
+            snapshot["active_profile"]["configured"],
+            user_id != "default"
+        );
+        assert_eq!(
+            snapshot["active_profile"]["updated_at"].is_string(),
+            user_id != "default"
+        );
+        assert!(!snapshot.to_string().contains("PRIVATE_PROFILE"));
+    }
 }
 
 // Break caught: disabling workflow must not silently bypass durable project rules.
@@ -335,7 +538,8 @@ async fn final_managed_context_stats_use_only_current_stage_reductions() {
     let connection = rusqlite::Connection::open(&database).unwrap();
     connection
         .execute_batch(
-            "UPDATE task_stage_runs SET finished_at=started_at;
+            "UPDATE workflow_tasks SET phase='planning', goal_revision=1;
+        UPDATE task_stage_runs SET finished_at=started_at;
         INSERT INTO task_stage_runs(workflow_task_id,phase,sequence) VALUES(1,'planning',2);
         UPDATE workflow_tasks SET current_stage_run_id=2;",
         )
@@ -590,7 +794,10 @@ async fn workflow_status_is_a_read_only_durable_projection() {
 
     assert_eq!(status.task_id, before.id);
     assert_eq!(status.ordinal, 1);
-    assert_eq!(status.phase, TaskPhase::Planning);
+    assert_eq!(status.phase, TaskPhase::GoalDefinition);
+    assert_eq!(status.goal, "saved goal");
+    assert_eq!(status.goal_revision, 0);
+    assert_eq!(status.goal_proposal_message_id, None);
     assert_eq!(status.status, TaskStatus::Active);
     assert_eq!(status.plan_revision, 0);
     assert_eq!(status.current_step_id, None);
@@ -637,14 +844,18 @@ async fn workflow_events_report_sanitized_processing_failure_and_stop_reason() {
         .responses
         .lock()
         .unwrap()
+        .push_back(continue_interpretation());
+    service
+        .responses
+        .lock()
+        .unwrap()
         .push_back("RAW_CHECKER_SECRET_11".into());
     let directory = tempfile::tempdir().unwrap();
-    let mut agent = Agent::with_store(
-        &managed_config(&server),
-        DialogStore::open(&directory.path().join("workflow-events.sqlite3")).unwrap(),
-    )
-    .unwrap()
-    .with_workflow_models(injected_models(&service));
+    let (store, dialog_id) =
+        approved_planning_store(&directory.path().join("workflow-events.sqlite3"));
+    let mut agent = Agent::from_dialog(&managed_config(&server), store, dialog_id)
+        .unwrap()
+        .with_workflow_models(injected_models(&service));
     let mut events = Vec::new();
 
     agent
@@ -703,15 +914,21 @@ async fn managed_workflow_writes_metadata_only_debug_event_by_default() {
     .unwrap();
     let marker = "CONTROLLER_SECRET_11";
     let service = Arc::new(AgentWorkflowModel::default());
+    service
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(continue_interpretation());
     service.responses.lock().unwrap().push_back(
         json!({
-            "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+            "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
             "decision": {"type":"continue","instruction":marker,"confidence":0.95}
         })
         .to_string(),
     );
-    service.responses.lock().unwrap().push_back(await_check(1));
-    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap())
+    service.responses.lock().unwrap().push_back(await_check(2));
+    let (store, dialog_id) = approved_planning_store(&database);
+    let mut agent = Agent::from_dialog(&config, store, dialog_id)
         .unwrap()
         .with_workflow_models(injected_models(&service));
 
@@ -723,17 +940,20 @@ async fn managed_workflow_writes_metadata_only_debug_event_by_default() {
         .map(|line| serde_json::from_str(line).unwrap())
         .filter(|event: &Value| event["event"] == "workflow")
         .collect();
-    assert_eq!(values.len(), 3, "{values:#?}");
-    assert_eq!(values[0]["details"]["component"], "input_router");
-    assert_eq!(values[0]["details"]["model"], "local");
-    assert_eq!(values[1]["details"]["component"], "ordinary");
-    assert_eq!(values[1]["details"]["model"], "ordinary-model");
-    assert_eq!(values[1]["details"]["autonomous_tokens"], 3);
-    assert_eq!(values[2]["details"]["source"], "controller");
-    assert_eq!(values[2]["details"]["component"], "continuation");
-    assert_eq!(values[2]["details"]["model"], "agent-test-model");
-    assert_eq!(values[2]["details"]["processing_status"], "completed");
-    assert_eq!(values[2]["details"]["accepted"], false);
+    let ordinary = values
+        .iter()
+        .find(|value| value["details"]["component"] == "ordinary")
+        .unwrap();
+    let checker = values
+        .iter()
+        .find(|value| value["details"]["component"] == "continuation")
+        .unwrap();
+    assert_eq!(ordinary["details"]["model"], "ordinary-model");
+    assert_eq!(ordinary["details"]["autonomous_tokens"], 3);
+    assert_eq!(checker["details"]["source"], "controller");
+    assert_eq!(checker["details"]["model"], "agent-test-model");
+    assert_eq!(checker["details"]["processing_status"], "completed");
+    assert_eq!(checker["details"]["accepted"], false);
     for secret in [
         "HUMAN_SECRET_11",
         "ORDINARY_SECRET_ONE",
@@ -749,19 +969,50 @@ async fn managed_workflow_writes_metadata_only_debug_event_by_default() {
     }
 }
 
+#[tokio::test]
+async fn goal_proposal_log_exposes_only_binding_id_without_payload_opt_in() {
+    let server = MockServer::start().await;
+    mount_sequence(&server, [sse("Предлагаемая цель: СЕКРЕТНАЯ_ЦЕЛЬ", 2, 1, 3)]).await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("goal-log.sqlite3");
+    let log_path = directory.path().join("goal-log.jsonl");
+    let config = Config::from_toml(
+        &format!(
+            "api_key='test-key'\nbase_url='{}'\n[workflow]\n[context]\nstrategy='summary'\n[debug]\nlog_path={:?}\nlog_payloads=false",
+            server.uri(), log_path
+        ),
+        None,
+    )
+    .unwrap();
+    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+    agent
+        .run_with_prompt("ОБСУДИМ_СЕКРЕТНУЮ_ЦЕЛЬ")
+        .await
+        .unwrap();
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("goal_proposal_message_id"), "{log}");
+    assert!(log.contains("\"goal_parse_result\":\"valid\""), "{log}");
+    assert!(!log.contains("СЕКРЕТНАЯ_ЦЕЛЬ"), "{log}");
+    assert!(!log.contains("ОБСУДИМ_СЕКРЕТНУЮ_ЦЕЛЬ"), "{log}");
+}
+
 // Break caught: an invalid checker transition is a rejected controller
 // proposal, not an accepted human decision inferred from endpoint phases.
 #[tokio::test]
 async fn rejected_checker_transition_logs_the_real_failed_decision() {
     let server = MockServer::start().await;
     let proposed = json!({
-        "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+        "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
         "decision": {"type":"emit_transition","event":"execution_completed","evidence":[],"confidence":0.95}
     })
     .to_string();
     mount_sequence(
         &server,
-        [sse("visible answer", 2, 1, 3), sse(&proposed, 4, 2, 6)],
+        [
+            sse(&continue_interpretation(), 2, 1, 3),
+            sse("visible answer", 2, 1, 3),
+            sse(&proposed, 4, 2, 6),
+        ],
     )
     .await;
     let directory = tempfile::tempdir().unwrap();
@@ -776,7 +1027,8 @@ async fn rejected_checker_transition_logs_the_real_failed_decision() {
         None,
     )
     .unwrap();
-    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+    let (store, dialog_id) = approved_planning_store(&database);
+    let mut agent = Agent::from_dialog(&config, store, dialog_id).unwrap();
 
     agent.run_with_prompt("start task").await.unwrap();
 
@@ -794,8 +1046,8 @@ async fn rejected_checker_transition_logs_the_real_failed_decision() {
     assert_eq!(details["source"], "controller");
     assert_eq!(details["model"], "checker-model");
     assert_eq!(details["mode"], "advisory");
-    assert_eq!(details["input_version"], 0);
-    assert_eq!(details["output_version"], 0);
+    assert_eq!(details["input_version"], 1);
+    assert_eq!(details["output_version"], 1);
     assert_eq!(details["proposed_event"], "execution_completed");
     assert_eq!(details["accepted"], false);
     assert_eq!(details["outcome"], "failed");
@@ -812,7 +1064,7 @@ async fn accepted_transition_logs_matching_checker_and_handoff_invocations() {
     let server = MockServer::start().await;
     let checker = json!({
         "patch": {
-            "expected_version":0,
+            "expected_version":1,
             "plan_append": {
                 "steps":[{"id":"s1","description":"implement it","status":"pending"}],
                 "acceptance_criteria":["it works"]
@@ -843,6 +1095,7 @@ async fn accepted_transition_logs_matching_checker_and_handoff_invocations() {
     mount_sequence(
         &server,
         [
+            sse(&continue_interpretation(), 2, 1, 3),
             sse("planning answer", 2, 1, 3),
             sse(&checker, 3, 2, 5),
             sse(&handoff, 4, 2, 6),
@@ -866,7 +1119,8 @@ async fn accepted_transition_logs_matching_checker_and_handoff_invocations() {
         None,
     )
     .unwrap();
-    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+    let (store, dialog_id) = approved_planning_store(&database);
+    let mut agent = Agent::from_dialog(&config, store, dialog_id).unwrap();
 
     agent.run_with_prompt("start task").await.unwrap();
     agent.run_with_prompt("more detail").await.unwrap();
@@ -889,7 +1143,7 @@ async fn accepted_transition_logs_matching_checker_and_handoff_invocations() {
         .find(|event| event["details"]["component"] == "handoff_builder")
         .expect("handoff event");
     assert_eq!(transition_checker["details"]["accepted"], true);
-    assert_eq!(transition_checker["details"]["output_version"], 0);
+    assert_eq!(transition_checker["details"]["output_version"], 1);
     assert_eq!(
         transition_checker["details"]["processing_status"],
         "processing"
@@ -920,7 +1174,7 @@ async fn handoff_completed_before_token_rejection_is_logged_without_transition()
     let server = MockServer::start().await;
     let checker = json!({
         "patch": {
-            "expected_version":0,
+            "expected_version":1,
             "plan_append": {
                 "steps":[{"id":"s1","description":"implement it","status":"pending"}],
                 "acceptance_criteria":["it works"]
@@ -946,6 +1200,7 @@ async fn handoff_completed_before_token_rejection_is_logged_without_transition()
     mount_sequence(
         &server,
         [
+            sse(&continue_interpretation(), 0, 0, 0),
             sse("planning answer", 1, 0, 1),
             sse(&checker, 1, 0, 1),
             sse(&handoff, 1, 1, 2),
@@ -964,7 +1219,8 @@ async fn handoff_completed_before_token_rejection_is_logged_without_transition()
         None,
     )
     .unwrap();
-    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+    let (store, dialog_id) = approved_planning_store(&database);
+    let mut agent = Agent::from_dialog(&config, store, dialog_id).unwrap();
 
     assert_eq!(
         agent.run_with_prompt("start task").await.unwrap(),
@@ -998,13 +1254,17 @@ async fn handoff_completed_before_token_rejection_is_logged_without_transition()
 async fn failed_checker_payload_is_bound_to_its_own_invocation() {
     let server = MockServer::start().await;
     let raw_checker = json!({
-        "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+        "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
         "decision": {"type":"emit_transition","event":"execution_completed","evidence":[],"confidence":0.95}
     })
     .to_string();
     mount_sequence(
         &server,
-        [sse("visible answer", 2, 1, 3), sse(&raw_checker, 4, 2, 6)],
+        [
+            sse(&continue_interpretation(), 2, 1, 3),
+            sse("visible answer", 2, 1, 3),
+            sse(&raw_checker, 4, 2, 6),
+        ],
     )
     .await;
     let directory = tempfile::tempdir().unwrap();
@@ -1019,7 +1279,8 @@ async fn failed_checker_payload_is_bound_to_its_own_invocation() {
         None,
     )
     .unwrap();
-    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+    let (store, dialog_id) = approved_planning_store(&database);
+    let mut agent = Agent::from_dialog(&config, store, dialog_id).unwrap();
 
     agent.run_with_prompt("start task").await.unwrap();
 
@@ -1043,6 +1304,7 @@ async fn checker_diagnostic_precedes_failure_persistence_error() {
     mount_sequence(
         &server,
         [
+            sse(&continue_interpretation(), 2, 1, 3),
             sse("visible answer", 2, 1, 3),
             sse("CHECKER_INVALID_RAW", 3, 2, 5),
         ],
@@ -1051,7 +1313,7 @@ async fn checker_diagnostic_precedes_failure_persistence_error() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("checker-persistence.sqlite3");
     let log_path = directory.path().join("checker-persistence.jsonl");
-    let store = DialogStore::open(&database).unwrap();
+    let (store, dialog_id) = approved_planning_store(&database);
     rusqlite::Connection::open(&database)
         .unwrap()
         .execute_batch(
@@ -1068,7 +1330,7 @@ async fn checker_diagnostic_precedes_failure_persistence_error() {
         None,
     )
     .unwrap();
-    let mut agent = Agent::with_store(&config, store).unwrap();
+    let mut agent = Agent::from_dialog(&config, store, dialog_id).unwrap();
 
     assert!(matches!(
         agent.run_with_prompt("start task").await,
@@ -1203,18 +1465,19 @@ async fn managed_workflow_nests_controller_and_checker_payloads_when_enabled() {
     let server = MockServer::start().await;
     let marker = "OPT_IN_CONTROLLER_SECRET_11";
     let first_checker = json!({
-        "patch": {"expected_version":0,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+        "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
         "decision": {"type":"continue","instruction":marker,"confidence":0.95}
     })
     .to_string();
     let second_checker = json!({
-        "patch": {"expected_version":1,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
+        "patch": {"expected_version":2,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},
         "decision": {"type":"await_user"}
     })
     .to_string();
     mount_sequence(
         &server,
         [
+            sse(&continue_interpretation(), 2, 1, 3),
             sse("first answer", 2, 1, 3),
             sse(&first_checker, 2, 1, 3),
             sse("second answer", 2, 1, 3),
@@ -1234,7 +1497,8 @@ async fn managed_workflow_nests_controller_and_checker_payloads_when_enabled() {
         None,
     )
     .unwrap();
-    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
+    let (store, dialog_id) = approved_planning_store(&database);
+    let mut agent = Agent::from_dialog(&config, store, dialog_id).unwrap();
 
     agent.run_with_prompt("human prompt").await.unwrap();
 
@@ -1284,9 +1548,12 @@ async fn managed_workflow_nests_controller_and_checker_payloads_when_enabled() {
         "second answer"
     );
     for value in &values {
+        if value["details"]["component"] == "human_input_interpreter" {
+            continue;
+        }
         assert!(
             value["details"]["payload"]["interpreter_output"].is_null(),
-            "a local new-task route fabricated interpreter output: {value:#?}"
+            "another invocation reused interpreter output: {value:#?}"
         );
         let mut metadata_only = value.clone();
         metadata_only["details"]
@@ -1311,10 +1578,8 @@ async fn workflow_payload_logging_captures_matching_interpreter_response() {
         &server,
         [
             sse("first answer", 2, 1, 3),
-            sse(&await_check(0), 2, 1, 3),
             sse(&raw_interpreter, 3, 2, 5),
             sse("second answer", 2, 1, 3),
-            sse(&await_check(1), 2, 1, 3),
         ],
     )
     .await;
@@ -1553,15 +1818,17 @@ async fn acceptance_restart_recovers_once_then_human_continues_the_stored_execut
     let database = directory.path().join("restart-acceptance.sqlite3");
     let config = managed_config(&server);
     let service = Arc::new(AgentWorkflowModel::default());
-    let mut plan: Value = serde_json::from_str(&await_check(0)).unwrap();
+    let mut plan: Value = serde_json::from_str(&await_check(1)).unwrap();
     plan["patch"]["plan_append"] = json!({"steps":[{"id":"stored-build-step","description":"Implement persisted design","status":"pending"}],"acceptance_criteria":["tests pass"]});
     plan["patch"]["current_step_id"] = json!("stored-build-step");
     service.responses.lock().unwrap().extend([
+        continue_interpretation(),
         plan.to_string(),
         json!({"confidence":0.95,"intent":{"type":"propose_transition","event":"planning_completed","evidence":[]}}).to_string(),
         json!({"summary":"STORED_DESIGN_CHECKPOINT","completed_step_ids":[],"next_step_id":"stored-build-step","expected_action":"Implement persisted design","plan_changes":[],"decisions":[],"open_issues":[]}).to_string(),
     ]);
-    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap())
+    let (store, dialog_id) = approved_planning_store(&database);
+    let mut agent = Agent::from_dialog(&config, store, dialog_id)
         .unwrap()
         .with_workflow_models(injected_models(&service));
     agent.run_with_prompt("design a parser").await.unwrap();
@@ -1587,7 +1854,7 @@ async fn acceptance_restart_recovers_once_then_human_continues_the_stored_execut
     let before = store.load_workflow(id).unwrap().current_task.unwrap();
     assert_eq!(before.phase, TaskPhase::Execution);
     assert_eq!(before.current_step_id.as_deref(), Some("stored-build-step"));
-    assert_eq!(before.version, 2);
+    assert_eq!(before.version, 3);
     let pending = store.load_pending_processing(id).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].status, ProcessingStatus::Processing);
@@ -1612,7 +1879,7 @@ async fn acceptance_restart_recovers_once_then_human_continues_the_stored_execut
         }),
         ..Default::default()
     });
-    let mut proposed: Value = serde_json::from_str(&await_check(2)).unwrap();
+    let mut proposed: Value = serde_json::from_str(&await_check(3)).unwrap();
     proposed["patch"]["expected_action"] = json!("Resume stored build");
     proposed["decision"] =
         json!({"type":"continue","instruction":"MUST_NOT_AUTONOMOUSLY_RESUME","confidence":0.95});
@@ -1620,7 +1887,7 @@ async fn acceptance_restart_recovers_once_then_human_continues_the_stored_execut
         proposed.to_string(),
         json!({"confidence":0.95,"intent":{"type":"continue","instruction":"continue"}})
             .to_string(),
-        await_check(4),
+        await_check(5),
     ]);
     let mut resumed = Agent::from_dialog(&config, store, id)
         .unwrap()
@@ -1645,7 +1912,7 @@ async fn acceptance_restart_recovers_once_then_human_continues_the_stored_execut
     let recovered = store.load_workflow(id).unwrap().current_task.unwrap();
     assert_eq!(recovered.current_stage_run_id, before.current_stage_run_id);
     assert_eq!(recovered.plan, before.plan);
-    assert_eq!(recovered.version, 3);
+    assert_eq!(recovered.version, 4);
     let connection = rusqlite::Connection::open(&database).unwrap();
     assert_eq!(
         connection
@@ -1696,7 +1963,7 @@ async fn acceptance_restart_recovers_once_then_human_continues_the_stored_execut
     assert_eq!(after.plan, before.plan);
     assert_eq!(after.current_stage_run_id, before.current_stage_run_id);
     assert_eq!(after.current_step_id, before.current_step_id);
-    assert_eq!(after.version, 4);
+    assert_eq!(after.version, 5);
     assert_eq!(recovery.requests.lock().unwrap().len(), 3);
     assert_eq!(
         store
@@ -1761,12 +2028,10 @@ async fn managed_agent_persists_task_and_uses_injected_interpreter_before_the_ne
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("dialogs.sqlite3");
     let service = Arc::new(AgentWorkflowModel::default());
-    service.responses.lock().unwrap().push_back(await_check(0));
     service.responses.lock().unwrap().push_back(
         json!({"confidence":0.95,"intent":{"type":"continue","instruction":"continue plan"}})
             .to_string(),
     );
-    service.responses.lock().unwrap().push_back(await_check(1));
     let mut agent = Agent::with_store(
         &managed_config(&server),
         DialogStore::open(&database).unwrap(),
@@ -1776,8 +2041,8 @@ async fn managed_agent_persists_task_and_uses_injected_interpreter_before_the_ne
     agent.run_with_prompt("create a parser").await.unwrap();
     assert_eq!(
         service.requests.lock().unwrap().len(),
-        1,
-        "first task only calls its checker"
+        0,
+        "goal definition waits for human input without an advisory checker"
     );
     let observer = DialogStore::open(&database).unwrap();
     let first = observer
@@ -1785,7 +2050,7 @@ async fn managed_agent_persists_task_and_uses_injected_interpreter_before_the_ne
         .unwrap()
         .current_task
         .unwrap();
-    assert_eq!(first.phase, TaskPhase::Planning);
+    assert_eq!(first.phase, TaskPhase::GoalDefinition);
     assert_eq!(
         observer
             .load_pending_processing(first.dialog_id)
@@ -1796,14 +2061,18 @@ async fn managed_agent_persists_task_and_uses_injected_interpreter_before_the_ne
     agent.run_with_prompt("continue plan").await.unwrap();
     {
         let requests = service.requests.lock().unwrap();
-        assert_eq!(
-            requests.len(),
-            3,
-            "checker, next human interpreter, checker"
-        );
-        let interpreted: Value = serde_json::from_str(requests[1].messages[1].content()).unwrap();
+        assert_eq!(requests.len(), 1, "the next human input is interpreted");
+        let interpreted: Value =
+            serde_json::from_str(requests[0].messages.last().unwrap().content()).unwrap();
         assert_eq!(interpreted["human_text"], "continue plan");
-        assert!(!requests[1].messages[1].content().contains("first answer"));
+        assert!(
+            !requests[0]
+                .messages
+                .last()
+                .unwrap()
+                .content()
+                .contains("first answer")
+        );
     }
     let task = observer
         .load_workflow(first.dialog_id)
@@ -1842,11 +2111,10 @@ async fn managed_agent_uses_configured_service_models_and_restored_stage_context
         &server,
         [
             sse("old execution answer", 2, 1, 3),
-            sse(&await_check(0), 2, 1, 3),
             sse(&interpretation, 2, 1, 3),
             sse(&handoff, 2, 1, 3),
             sse("validation answer", 2, 1, 3),
-            sse(&await_check(1), 2, 1, 3),
+            sse(&await_check(2), 2, 1, 3),
         ],
     )
     .await;
@@ -1857,7 +2125,7 @@ async fn managed_agent_uses_configured_service_models_and_restored_stage_context
     agent.run_with_prompt("execution-only input").await.unwrap();
     let id = agent.dialog_id().unwrap();
     let connection = rusqlite::Connection::open(&database).unwrap();
-    connection.execute_batch("UPDATE workflow_tasks SET phase='execution',goal='current task goal'; UPDATE task_stage_runs SET phase='execution';").unwrap();
+    connection.execute_batch("UPDATE workflow_tasks SET phase='execution',goal='current task goal',goal_revision=1; UPDATE task_stage_runs SET phase='execution';").unwrap();
     drop(agent);
     let mut agent = Agent::from_dialog(&config, DialogStore::open(&database).unwrap(), id).unwrap();
     assert_eq!(
@@ -1876,14 +2144,13 @@ async fn managed_agent_uses_configured_service_models_and_restored_stage_context
             .collect::<Vec<_>>(),
         [
             "ordinary-model",
-            "checker-model",
             "interpreter-model",
             "handoff-model",
             "ordinary-model",
             "checker-model"
         ]
     );
-    let ordinary = bodies[4]["messages"].to_string();
+    let ordinary = bodies[3]["messages"].to_string();
     assert!(ordinary.contains("validation"));
     assert!(ordinary.contains("CURRENT CHECKPOINT"));
     assert!(!ordinary.contains("execution-only input"));
@@ -1968,12 +2235,18 @@ async fn restored_managed_dialog_with_hidden_controller_input_can_branch() {
     .unwrap();
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("dialogs.sqlite3");
-    let mut agent = Agent::with_store(&config, DialogStore::open(&database).unwrap()).unwrap();
-    agent.run_with_prompt("human goal").await.unwrap();
-    let id = agent.dialog_id().unwrap();
-    drop(agent);
-    let mut store = DialogStore::open(&database).unwrap();
+    let (mut store, id) = approved_planning_store(&database);
     let task = store.load_workflow(id).unwrap().current_task.unwrap();
+    store
+        .append_answer_for_processing(AnswerCommit {
+            dialog_id: id,
+            task_id: task.id,
+            stage_run_id: task.current_stage_run_id,
+            expected_version: task.version,
+            content: "saved answer",
+            usage: None,
+        })
+        .unwrap();
     let processing = store.load_pending_processing(id).unwrap().remove(0);
     let lease = store
         .lease_processing(processing.id, task.version, ProcessingLeaseMode::Normal)
@@ -2030,7 +2303,7 @@ async fn restored_managed_dialog_with_hidden_controller_input_can_branch() {
             .iter()
             .all(|m| m.content() != "HIDDEN CONTROLLER")
     );
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 fn agent(server: &MockServer) -> Agent {

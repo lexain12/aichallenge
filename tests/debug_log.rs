@@ -95,6 +95,9 @@ fn workflow_payloads_are_metadata_only_by_default_and_nested_when_enabled() {
         autonomous_turn: 2,
         autonomous_tokens: 144,
         stage_run_id: 9,
+        goal_revision: Some(0),
+        goal_proposal_message_id: Some(41),
+        goal_parse_result: None,
         transition_id: Some(11),
         processing_id: Some(13),
         processing_status: "failed".into(),
@@ -111,6 +114,12 @@ fn workflow_payloads_are_metadata_only_by_default_and_nested_when_enabled() {
         stage_message_count: 3,
         plan_step_count: 2,
         checkpoint_item_count: 1,
+        check_target: None,
+        violation_ids: Vec::new(),
+        input_intent: None,
+        input_phase: None,
+        input_status: None,
+        rejection_reason: None,
     };
     let payload = WorkflowDebugPayload {
         interpreter_output: Some(marker.into()),
@@ -122,6 +131,7 @@ fn workflow_payloads_are_metadata_only_by_default_and_nested_when_enabled() {
         model_prompt: Some(marker.into()),
         model_output: Some(marker.into()),
         provider_error: Some(marker.into()),
+        invariant_violations: None,
     };
 
     let mut safe = DebugLog::new(Some(safe_path.clone()), false, "secret-key");
@@ -131,6 +141,7 @@ fn workflow_payloads_are_metadata_only_by_default_and_nested_when_enabled() {
     assert_eq!(safe_value["event"], "workflow");
     assert_eq!(safe_value["details"]["component"], "continuation_checker");
     assert_eq!(safe_value["details"]["autonomous_tokens"], 144);
+    assert_eq!(safe_value["details"]["goal_proposal_message_id"], 41);
     assert!(safe_value["details"].get("payload").is_none());
     let safe_text = safe_value.to_string();
     assert!(!safe_text.contains(marker));

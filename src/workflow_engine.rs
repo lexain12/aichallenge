@@ -14,6 +14,7 @@ use crate::context::{ContextState, ContextSummary, prepare_request};
 use crate::debug_log::{WorkflowDebugEvent, WorkflowDebugMetadata, WorkflowDebugPayload};
 use crate::dialog::{DialogStore, StoreError};
 use crate::facts::{FactsError, parse_facts_json, plan_facts_update};
+use crate::goal_definition::parse_goal_proposal;
 use crate::invariants::{
     InvariantRepository, InvariantVerdict, InvariantViolation, render_invariant_refusal,
 };
@@ -21,9 +22,9 @@ use crate::memory::{ContextError, ContextProvider, MemoryRepository, RequestScop
 use crate::profile::ProfileRepository;
 use crate::system_context::SystemBlock;
 use crate::workflow::{
-    PatchContext, StageChangeAuthorization, StateMachine, TaskPhase, TaskStatePatch, TaskStatus,
-    TransitionEvent, WorkflowError, WorkflowInput, WorkflowInputSource, WorkflowIntent,
-    WorkflowTaskState,
+    PatchContext, PlanAppend, StageChangeAuthorization, StateMachine, TaskPhase, TaskStatePatch,
+    TaskStatus, TransitionEvent, WorkflowError, WorkflowInput, WorkflowInputSource, WorkflowIntent,
+    WorkflowTaskState, authorize_goal_approval, authorize_goal_reopen,
 };
 use crate::workflow_context::{
     StageReductionState, WorkflowRequestInput, facts_candidates, plan_stage_compaction,
@@ -156,6 +157,22 @@ pub enum BlockingOutcome {
     Unavailable,
 }
 
+struct BlockingCheckResult {
+    outcome: BlockingOutcome,
+    observations: Vec<BlockingObservation>,
+}
+
+struct BlockingObservation {
+    checker: String,
+    outcome: BlockingOutcome,
+    usage: Option<TokenUsage>,
+    error_kind: Option<&'static str>,
+    http_status: Option<u16>,
+    raw_output: Option<String>,
+    provider_error: Option<String>,
+    output_chars: usize,
+}
+
 #[derive(Debug)]
 pub enum PipelineOutcome {
     AwaitUser {
@@ -228,28 +245,81 @@ impl ResponsePipeline {
         response: &str,
         budget: &mut AutonomyBudget,
     ) -> BlockingOutcome {
+        self.check_blocking_observed(context, response, budget, false)
+            .await
+            .outcome
+    }
+
+    async fn check_blocking_observed(
+        &self,
+        context: &CheckContext,
+        response: &str,
+        budget: &mut AutonomyBudget,
+        capture_payloads: bool,
+    ) -> BlockingCheckResult {
+        let mut observations = Vec::new();
         for checker in &self.checkers {
             if checker.mode() != CheckerMode::Blocking {
                 break;
             }
-            match checker.check(context, response).await {
+            match checker
+                .check_observed(context, response, capture_payloads)
+                .await
+            {
                 Ok(result) => {
                     budget.record_usage(result.usage);
-                    match result.decision {
-                        ControllerDecision::AwaitUser if result.patch.is_empty() => {}
-                        ControllerDecision::Block { violations } if !violations.is_empty() => {
-                            return BlockingOutcome::Denied { violations };
+                    let outcome = match result.decision {
+                        ControllerDecision::AwaitUser if result.patch.is_empty() => {
+                            BlockingOutcome::Allowed
                         }
-                        _ => return BlockingOutcome::Unavailable,
+                        ControllerDecision::Block { violations } if !violations.is_empty() => {
+                            BlockingOutcome::Denied { violations }
+                        }
+                        _ => BlockingOutcome::Unavailable,
+                    };
+                    observations.push(BlockingObservation {
+                        checker: checker.name().to_owned(),
+                        error_kind: (outcome == BlockingOutcome::Unavailable)
+                            .then_some("invalid_output"),
+                        outcome: outcome.clone(),
+                        usage: result.usage,
+                        http_status: None,
+                        raw_output: result.raw_output,
+                        provider_error: None,
+                        output_chars: result.output_chars,
+                    });
+                    if outcome != BlockingOutcome::Allowed {
+                        return BlockingCheckResult {
+                            outcome,
+                            observations,
+                        };
                     }
                 }
                 Err(error) => {
                     budget.record_usage(error.usage());
-                    return BlockingOutcome::Unavailable;
+                    let (error_kind, http_status) = error.operator_metadata();
+                    observations.push(BlockingObservation {
+                        checker: checker.name().to_owned(),
+                        outcome: BlockingOutcome::Unavailable,
+                        usage: error.usage(),
+                        error_kind: Some(error_kind),
+                        http_status,
+                        raw_output: error.raw_output().map(str::to_owned),
+                        provider_error: (capture_payloads && error.raw_output().is_none())
+                            .then(|| error.raw_diagnostic()),
+                        output_chars: error.output_chars(),
+                    });
+                    return BlockingCheckResult {
+                        outcome: BlockingOutcome::Unavailable,
+                        observations,
+                    };
                 }
             }
         }
-        BlockingOutcome::Allowed
+        BlockingCheckResult {
+            outcome: BlockingOutcome::Allowed,
+            observations,
+        }
     }
 
     pub async fn collect(
@@ -592,9 +662,58 @@ impl WorkflowInputHandler<'_> {
             None
         };
         match &input.intent {
+            WorkflowIntent::ApproveGoal => {
+                let Some(task) = source else {
+                    return self.reject(command, source, context, "no goal proposal to approve");
+                };
+                let authorization = match authorize_goal_approval(task, &input.source) {
+                    Ok(authorization) => authorization,
+                    Err(_) => {
+                        return self.reject(
+                            command,
+                            source,
+                            context,
+                            "goal approval rejected: no current proposal or invalid phase",
+                        );
+                    }
+                };
+                let saved = self.store.commit_goal_approval(command, &authorization)?;
+                Ok(RoutingOutcome::Managed {
+                    input_message_id: saved.input_message_id,
+                    state: saved.target_state,
+                })
+            }
+            WorkflowIntent::ReopenGoal { change_request } => {
+                let Some(task) = source else {
+                    return self.reject(command, source, context, "no task to revise goal");
+                };
+                let authorization =
+                    match authorize_goal_reopen(task, &input.source, change_request.clone()) {
+                        Ok(authorization) => authorization,
+                        Err(_) => {
+                            return self.reject(
+                                command,
+                                source,
+                                context,
+                                "goal reopening rejected: invalid phase",
+                            );
+                        }
+                    };
+                let saved = self.store.commit_goal_reopen(command, &authorization)?;
+                Ok(RoutingOutcome::Managed {
+                    input_message_id: saved.input_message_id,
+                    state: saved.target_state,
+                })
+            }
             WorkflowIntent::StartNewTask { goal } => {
-                if StateMachine::validate_new_task(source).is_err() {
-                    return self.reject(command, source, context, "workflow task start rejected");
+                if let Err(error) = StateMachine::validate_new_task(source) {
+                    let reason = match error {
+                        WorkflowError::UnfinishedTaskExists => {
+                            "dialog already has an unfinished task"
+                        }
+                        _ => "workflow task start rejected: invalid current task",
+                    };
+                    return self.reject(command, source, context, reason);
                 }
                 let started = self.store.create_task_with_human_input(
                     dialog_id,
@@ -1028,6 +1147,7 @@ struct OrdinaryTurn {
 #[derive(Clone)]
 struct InputObservation {
     component: &'static str,
+    intent: &'static str,
     model: String,
     mode: &'static str,
     input_state: Option<WorkflowTaskState>,
@@ -1173,7 +1293,7 @@ impl<'a> WorkflowEngine<'a> {
             payload.provider_error = observation.provider_error;
             payload.model_prompt = Some(prompt.to_owned());
         }
-        let metadata = workflow_debug_metadata(
+        let mut metadata = workflow_debug_metadata(
             "human",
             observation.component,
             &observation.model,
@@ -1195,6 +1315,13 @@ impl<'a> WorkflowEngine<'a> {
             observation.output_chars,
             observation.stage_message_count,
         );
+        metadata.input_intent = Some(observation.intent.to_owned());
+        metadata.input_phase = observation.input_state.as_ref().map(|state| state.phase);
+        metadata.input_status = observation.input_state.as_ref().map(|state| state.status);
+        metadata.rejection_reason = match routing {
+            RoutingOutcome::Rejected { reason, .. } => Some(reason.clone()),
+            _ => None,
+        };
         self.record_diagnostic(metadata, payload);
     }
 
@@ -1261,6 +1388,60 @@ impl<'a> WorkflowEngine<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn record_blocking_observation(
+        &mut self,
+        source: &str,
+        target: &str,
+        state: Option<&WorkflowTaskState>,
+        budget: &AutonomyBudget,
+        observation: BlockingObservation,
+        input_chars: usize,
+        stage_message_count: usize,
+    ) {
+        if !self.diagnostics_enabled() {
+            return;
+        }
+        let (accepted, outcome, violations) = match &observation.outcome {
+            BlockingOutcome::Allowed => (true, "allowed", None),
+            BlockingOutcome::Denied { violations } => (false, "denied", Some(violations)),
+            BlockingOutcome::Unavailable => (false, "unavailable", None),
+        };
+        let mut payload = self.payload_for_task(state);
+        if let Some(payload) = payload.as_mut() {
+            payload.checker_output = observation.raw_output;
+            payload.provider_error = observation.provider_error;
+            payload.invariant_violations = violations.cloned();
+        }
+        let mut metadata = workflow_debug_metadata(
+            source,
+            &observation.checker,
+            &self.checker_model,
+            "blocking",
+            state,
+            state,
+            None,
+            accepted,
+            outcome,
+            budget,
+            state,
+            None,
+            None,
+            "none",
+            observation.error_kind,
+            observation.http_status,
+            observation.usage,
+            input_chars,
+            observation.output_chars,
+            stage_message_count,
+        );
+        metadata.check_target = Some(target.to_owned());
+        metadata.violation_ids = violations
+            .map(|items| items.iter().map(|item| item.id.clone()).collect())
+            .unwrap_or_default();
+        self.record_diagnostic(metadata, payload);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn record_service_diagnostic(
         &mut self,
         component: &'static str,
@@ -1317,6 +1498,50 @@ impl<'a> WorkflowEngine<'a> {
             stage_message_count,
         );
         self.record_diagnostic(metadata, payload);
+    }
+
+    fn record_goal_parse_diagnostic(
+        &mut self,
+        task: &WorkflowTaskState,
+        budget: &AutonomyBudget,
+        result: &'static str,
+        answer_chars: usize,
+    ) {
+        if !self.diagnostics_enabled() {
+            return;
+        }
+        let mut metadata = workflow_debug_metadata(
+            if budget.turns == 0 {
+                "human"
+            } else {
+                "controller"
+            },
+            "goal_proposal_parser",
+            "local",
+            "deterministic",
+            Some(task),
+            Some(task),
+            None,
+            result != "malformed",
+            if result == "malformed" {
+                "rejected"
+            } else {
+                "accepted"
+            },
+            budget,
+            Some(task),
+            None,
+            None,
+            "none",
+            None,
+            None,
+            None,
+            0,
+            answer_chars,
+            0,
+        );
+        metadata.goal_parse_result = Some(result.to_owned());
+        self.record_diagnostic(metadata, None);
     }
 
     pub async fn run_human_input<F>(
@@ -1382,6 +1607,7 @@ impl<'a> WorkflowEngine<'a> {
                 };
                 let observation = InputObservation {
                     component: "human_input_interpreter",
+                    intent: intent.kind(),
                     model: self.interpreter_model.clone(),
                     mode: "advisory",
                     input_state: input_state.clone(),
@@ -1412,6 +1638,7 @@ impl<'a> WorkflowEngine<'a> {
                 };
                 let observation = InputObservation {
                     component: "input_router",
+                    intent: intent.kind(),
                     model: "local".into(),
                     mode: "deterministic",
                     input_state: None,
@@ -1429,7 +1656,10 @@ impl<'a> WorkflowEngine<'a> {
             };
             if matches!(
                 intent,
-                WorkflowIntent::StartNewTask { .. } | WorkflowIntent::ReplanCurrent { .. }
+                WorkflowIntent::StartNewTask { .. }
+                    | WorkflowIntent::ReplanCurrent { .. }
+                    | WorkflowIntent::ApproveGoal
+                    | WorkflowIntent::ReopenGoal { .. }
             ) {
                 let proposed = WorkflowInput {
                     source: WorkflowInputSource::Human,
@@ -1446,6 +1676,22 @@ impl<'a> WorkflowEngine<'a> {
                         &mut on_event,
                     );
                 }
+            }
+            if matches!(intent, WorkflowIntent::ApproveGoal)
+                && let Some(goal) = input_state
+                    .as_ref()
+                    .and_then(|task| task.goal_proposal.as_ref())
+                    .map(|proposal| proposal.text.clone())
+                && let Some(result) = self
+                    .check_goal_candidate(input_state.as_ref(), &goal, &mut budget)
+                    .await
+            {
+                return self.finish_invariant_rejection(
+                    result,
+                    input_state,
+                    &budget,
+                    &mut on_event,
+                );
             }
             let routing = WorkflowInputHandler {
                 store: self.session.store,
@@ -1492,6 +1738,7 @@ impl<'a> WorkflowEngine<'a> {
             };
             let observation = InputObservation {
                 component: "input_router",
+                intent: proposed.intent.kind(),
                 model: "local".into(),
                 mode: "deterministic",
                 input_state: None,
@@ -1513,6 +1760,7 @@ impl<'a> WorkflowEngine<'a> {
         {
             let local_observation = InputObservation {
                 component: "input_router",
+                intent: input_observation.intent,
                 model: "local".into(),
                 mode: "deterministic",
                 input_state: input_observation.input_state.clone(),
@@ -1657,20 +1905,115 @@ impl<'a> WorkflowEngine<'a> {
         budget: &mut AutonomyBudget,
     ) -> Option<BlockingOutcome> {
         let checker = self.invariant_checker.as_ref()?;
-        match checker.check_proposed_input(state, input).await {
+        let (outcome, observation) = match checker.check_proposed_input(state, input).await {
             Ok((InvariantVerdict::Allow, usage)) => {
                 budget.record_usage(usage);
-                None
+                (
+                    BlockingOutcome::Allowed,
+                    BlockingObservation {
+                        checker: "invariants".into(),
+                        outcome: BlockingOutcome::Allowed,
+                        usage,
+                        error_kind: None,
+                        http_status: None,
+                        raw_output: None,
+                        provider_error: None,
+                        output_chars: 0,
+                    },
+                )
             }
             Ok((InvariantVerdict::Deny { violations }, usage)) => {
                 budget.record_usage(usage);
-                Some(BlockingOutcome::Denied { violations })
+                let outcome = BlockingOutcome::Denied { violations };
+                (
+                    outcome.clone(),
+                    BlockingObservation {
+                        checker: "invariants".into(),
+                        outcome,
+                        usage,
+                        error_kind: None,
+                        http_status: None,
+                        raw_output: None,
+                        provider_error: None,
+                        output_chars: 0,
+                    },
+                )
             }
             Err(error) => {
                 budget.record_usage(error.usage());
-                Some(BlockingOutcome::Unavailable)
+                let (error_kind, http_status) = error.operator_metadata();
+                (
+                    BlockingOutcome::Unavailable,
+                    BlockingObservation {
+                        checker: "invariants".into(),
+                        outcome: BlockingOutcome::Unavailable,
+                        usage: error.usage(),
+                        error_kind: Some(error_kind),
+                        http_status,
+                        raw_output: error.raw_output().map(str::to_owned),
+                        provider_error: self.capture_payloads().then(|| error.raw_diagnostic()),
+                        output_chars: error.output_chars(),
+                    },
+                )
             }
-        }
+        };
+        self.record_blocking_observation(
+            "human",
+            input.intent.kind(),
+            state,
+            budget,
+            observation,
+            serde_json::to_string(input).map_or(0, |text| text.chars().count()),
+            0,
+        );
+        (outcome != BlockingOutcome::Allowed).then_some(outcome)
+    }
+
+    async fn check_goal_candidate(
+        &mut self,
+        state: Option<&WorkflowTaskState>,
+        goal: &str,
+        budget: &mut AutonomyBudget,
+    ) -> Option<BlockingOutcome> {
+        let checker = self.invariant_checker.as_ref()?;
+        let (outcome, usage, error_kind, http_status) = match checker
+            .check_goal_candidate(state, goal)
+            .await
+        {
+            Ok((InvariantVerdict::Allow, usage)) => (BlockingOutcome::Allowed, usage, None, None),
+            Ok((InvariantVerdict::Deny { violations }, usage)) => {
+                (BlockingOutcome::Denied { violations }, usage, None, None)
+            }
+            Err(error) => {
+                let (kind, status) = error.operator_metadata();
+                (
+                    BlockingOutcome::Unavailable,
+                    error.usage(),
+                    Some(kind),
+                    status,
+                )
+            }
+        };
+        budget.record_usage(usage);
+        self.record_blocking_observation(
+            "goal",
+            "candidate_goal",
+            state,
+            budget,
+            BlockingObservation {
+                checker: "invariants".into(),
+                outcome: outcome.clone(),
+                usage,
+                error_kind,
+                http_status,
+                raw_output: None,
+                provider_error: None,
+                output_chars: 0,
+            },
+            goal.chars().count(),
+            0,
+        );
+        (outcome != BlockingOutcome::Allowed).then_some(outcome)
     }
 
     fn finish_invariant_rejection<F>(
@@ -1799,6 +2142,26 @@ impl<'a> WorkflowEngine<'a> {
         else {
             return Ok(ProcessingOutcome::Stop(AutonomyStopReason::CheckerFailed));
         };
+        if task.phase == TaskPhase::GoalDefinition {
+            let patch = TaskStatePatch {
+                expected_version: task.version,
+                plan_append: PlanAppend::default(),
+                step_updates: Vec::new(),
+                current_step_id: None,
+                expected_action: None,
+                checkpoint: None,
+            };
+            let result = self.session.store.commit_await_user_with_mode(
+                processing_id,
+                task.id,
+                task.current_stage_run_id,
+                task.version,
+                lease.attempts,
+                &patch,
+                mode,
+            )?;
+            return Ok(ProcessingOutcome::Completed(result));
+        }
         let stage_message_count = work.context.stage_messages.len();
         let pipeline = self
             .pipeline
@@ -2397,7 +2760,11 @@ impl<'a> WorkflowEngine<'a> {
             .iter()
             .map(|message| message.content().chars().count())
             .sum();
-        let buffered = self.pipeline.has_blocking();
+        let buffered = self.pipeline.has_blocking()
+            || diagnostic_state
+                .as_ref()
+                .is_some_and(|state| state.phase == TaskPhase::GoalDefinition);
+        let mut goal_proposal = None;
         let mut usage = None;
         let result = self
             .client
@@ -2485,10 +2852,22 @@ impl<'a> WorkflowEngine<'a> {
                     },
                 },
             };
-            let outcome = self
+            let checked = self
                 .pipeline
-                .check_blocking(&context, &answer, budget)
+                .check_blocking_observed(&context, &answer, budget, self.capture_payloads())
                 .await;
+            for observation in checked.observations {
+                self.record_blocking_observation(
+                    "controller",
+                    "candidate_response",
+                    Some(state),
+                    budget,
+                    observation,
+                    answer.chars().count(),
+                    context.stage_messages.len(),
+                );
+            }
+            let outcome = checked.outcome;
             if outcome != BlockingOutcome::Allowed {
                 let refusal = self.invariant_message(&outcome);
                 emit(on_event, AgentEvent::Text(&refusal))?;
@@ -2497,23 +2876,70 @@ impl<'a> WorkflowEngine<'a> {
                     persisted_answer: None,
                 });
             }
+            if state.phase == TaskPhase::GoalDefinition {
+                goal_proposal = match parse_goal_proposal(&answer) {
+                    Ok(proposal) => {
+                        self.record_goal_parse_diagnostic(
+                            state,
+                            budget,
+                            if proposal.is_some() {
+                                "valid"
+                            } else {
+                                "absent"
+                            },
+                            answer.chars().count(),
+                        );
+                        proposal
+                    }
+                    Err(_) => {
+                        self.record_goal_parse_diagnostic(
+                            state,
+                            budget,
+                            "malformed",
+                            answer.chars().count(),
+                        );
+                        let refusal = "Не удалось однозначно выделить предложенную цель. Пожалуйста, уточните формулировку.".to_owned();
+                        emit(on_event, AgentEvent::Text(&refusal))?;
+                        return Ok(OrdinaryTurn {
+                            answer: refusal,
+                            persisted_answer: None,
+                        });
+                    }
+                };
+                if let Some(goal) = goal_proposal.as_deref()
+                    && let Some(outcome) =
+                        self.check_goal_candidate(Some(state), goal, budget).await
+                {
+                    let refusal = self.invariant_message(&outcome);
+                    emit(on_event, AgentEvent::Text(&refusal))?;
+                    return Ok(OrdinaryTurn {
+                        answer: refusal,
+                        persisted_answer: None,
+                    });
+                }
+            }
             emit(on_event, AgentEvent::Text(&answer))?;
         }
         let output_chars = answer.chars().count();
         let model_output = self.capture_payloads().then(|| answer.clone());
         let persisted_answer = match &routing {
             RoutingOutcome::Managed { state, .. } => {
-                match self
-                    .session
-                    .store
-                    .append_answer_for_processing(AnswerCommit {
-                        dialog_id,
-                        task_id: state.id,
-                        stage_run_id: state.current_stage_run_id,
-                        expected_version: state.version,
-                        content: &answer,
-                        usage,
-                    }) {
+                let command = AnswerCommit {
+                    dialog_id,
+                    task_id: state.id,
+                    stage_run_id: state.current_stage_run_id,
+                    expected_version: state.version,
+                    content: &answer,
+                    usage,
+                };
+                let saved = if state.phase == TaskPhase::GoalDefinition {
+                    self.session
+                        .store
+                        .append_goal_answer_for_processing(command, goal_proposal.as_deref())
+                } else {
+                    self.session.store.append_answer_for_processing(command)
+                };
+                match saved {
                     Ok(answer) => Some(answer),
                     Err(error) => {
                         self.record_service_diagnostic(
@@ -2576,10 +3002,19 @@ impl<'a> WorkflowEngine<'a> {
         };
         *self.session.persisted_message_count += 1;
         self.session.history.push_answer(answer.clone(), usage);
+        let logged_state = if self.diagnostics_enabled()
+            && diagnostic_state
+                .as_ref()
+                .is_some_and(|state| state.phase == TaskPhase::GoalDefinition)
+        {
+            self.session.store.load_workflow(dialog_id)?.current_task
+        } else {
+            None
+        };
         self.record_service_diagnostic(
             "ordinary",
             "generation",
-            diagnostic_state.as_ref(),
+            logged_state.as_ref().or(diagnostic_state.as_ref()),
             budget,
             true,
             "accepted",
@@ -3112,6 +3547,12 @@ fn workflow_debug_metadata(
         autonomous_turn: budget.turns,
         autonomous_tokens: budget.tokens,
         stage_run_id: stage_state.map_or(0, |task| task.current_stage_run_id.0),
+        goal_revision: counts.map(|task| task.goal_revision),
+        goal_proposal_message_id: output_state
+            .and_then(|task| task.goal_proposal.as_ref())
+            .or_else(|| input_state.and_then(|task| task.goal_proposal.as_ref()))
+            .map(|proposal| proposal.assistant_message_id),
+        goal_parse_result: None,
         transition_id,
         processing_id,
         processing_status: processing_status.to_owned(),
@@ -3127,6 +3568,12 @@ fn workflow_debug_metadata(
                 + task.checkpoint.open_issues.len()
                 + usize::from(!task.checkpoint.summary.is_empty())
         }),
+        check_target: None,
+        violation_ids: Vec::new(),
+        input_intent: None,
+        input_phase: None,
+        input_status: None,
+        rejection_reason: None,
     }
 }
 
@@ -3295,10 +3742,18 @@ mod tests {
         };
         let directory = tempfile::tempdir().unwrap();
         let mut store = DialogStore::open(&directory.path().join("dynamic-log.sqlite3")).unwrap();
-        let mut dialog_id = None;
-        let mut scope = RequestScope::default();
+        let started = store
+            .start_dialog_with_workflow_task(
+                &RequestScope::default(),
+                "BASE",
+                "legacy approved goal",
+            )
+            .unwrap();
+        store.connection.execute_batch("UPDATE workflow_tasks SET phase='planning',goal_revision=1; UPDATE task_stage_runs SET phase='planning';").unwrap();
+        let mut dialog_id = Some(started.dialog_id);
+        let mut scope = RequestScope::default().with_dialog_id(dialog_id);
         let mut history = ChatHistory::new("BASE".into());
-        let mut persisted_message_count = 0;
+        let mut persisted_message_count = 1;
         let mut last_usage = None;
         let write_attempts = Arc::new(AtomicUsize::new(0));
         let mut debug_log = DebugLog::from_writer_for_test(
@@ -3338,7 +3793,7 @@ mod tests {
         )
         .with_pipeline(pipeline)
         .with_diagnostics(&mut log_diagnostic, initially_enabled)
-        .run_human_input("start task", |_| Ok(()))
+        .run_human_input("continue", |_| Ok(()))
         .await
         .unwrap();
 

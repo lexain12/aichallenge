@@ -286,6 +286,26 @@ async fn interpreter_falls_back_on_api_malformed_and_low_confidence_and_keeps_us
     }
 }
 
+#[tokio::test]
+async fn interpreter_instructs_model_to_refine_unapproved_goal_instead_of_starting_task() {
+    let model = recording(None);
+    let interpreter = HumanInputInterpreter::new(model.clone(), &workflow_config());
+    interpreter
+        .interpret(
+            "Хочу сделать echo сервер на rust",
+            Some(&task(TaskPhase::GoalDefinition)),
+        )
+        .await
+        .unwrap();
+
+    let requests = model.requests.lock().unwrap();
+    let policy = requests[0].messages[0].content();
+    assert!(
+        policy.contains("A new desired outcome in goal_definition is continue, not start_new_task"),
+        "interpreter policy does not distinguish a draft goal from a separate task: {policy}"
+    );
+}
+
 // Break caught: the real adapter rejects whitespace, but its billed usage must survive checker errors and human fallback.
 #[tokio::test]
 async fn real_adapter_blank_completion_retains_checker_and_interpreter_usage() {
@@ -420,6 +440,10 @@ fn task(phase: TaskPhase) -> WorkflowTaskState {
     )
     .unwrap();
     task.phase = phase;
+    if phase == TaskPhase::GoalDefinition {
+        return task;
+    }
+    task.goal_revision = 1;
     task.plan.steps = vec![PlanStep {
         id: "implement".into(),
         description: "Build search".into(),
@@ -427,6 +451,66 @@ fn task(phase: TaskPhase) -> WorkflowTaskState {
     }];
     task.plan.acceptance_criteria = vec!["search works".into()];
     task
+}
+
+#[test]
+fn parser_accepts_typed_goal_decisions() {
+    let approved =
+        parse_human_interpretation(r#"{"confidence":0.99,"intent":{"type":"approve_goal"}}"#)
+            .unwrap();
+    assert!(matches!(
+        approved,
+        HumanInterpretation::Managed {
+            intent: WorkflowIntent::ApproveGoal,
+            ..
+        }
+    ));
+    let reopened = parse_human_interpretation(
+        r#"{"confidence":0.99,"intent":{"type":"reopen_goal","change_request":"Add offline mode"}}"#,
+    ).unwrap();
+    assert!(
+        matches!(reopened, HumanInterpretation::Managed { intent: WorkflowIntent::ReopenGoal { change_request }, .. } if change_request == "Add offline mode")
+    );
+}
+
+#[tokio::test]
+async fn approval_without_current_proposal_falls_back_to_discussion() {
+    let model = recording(Some(
+        r#"{"confidence":0.99,"intent":{"type":"approve_goal"}}"#.into(),
+    ));
+    let interpreter = HumanInputInterpreter::new(model, &workflow_config());
+    let result = interpreter
+        .interpret("да", Some(&task(TaskPhase::GoalDefinition)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, HumanInterpretation::Managed { intent: WorkflowIntent::Continue { instruction }, .. } if instruction == "да")
+    );
+}
+
+#[tokio::test]
+async fn conditional_yes_with_active_proposal_remains_discussion() {
+    let mut current = task(TaskPhase::GoalDefinition);
+    current.goal_proposal = Some(GoalProposal {
+        text: "Сделать CLI с авторизацией".into(),
+        assistant_message_id: 11,
+        stage_run_id: current.current_stage_run_id,
+    });
+    let model = recording(Some(
+        r#"{"confidence":0.99,"intent":{"type":"continue","instruction":"Убрать авторизацию из цели"}}"#.into(),
+    ));
+    let interpreter = HumanInputInterpreter::new(model, &workflow_config());
+    let result = interpreter
+        .interpret("да, но без авторизации", Some(&current))
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        HumanInterpretation::Managed {
+            intent: WorkflowIntent::Continue { .. },
+            ..
+        }
+    ));
 }
 
 fn check_json() -> serde_json::Value {

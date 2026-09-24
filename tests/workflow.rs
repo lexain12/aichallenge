@@ -1,3 +1,4 @@
+use deepseek_cli::workflow::{GoalProposal, authorize_goal_approval, authorize_goal_reopen};
 use deepseek_cli::workflow::{
     MAX_ACCEPTANCE_CRITERIA, MAX_ACCEPTANCE_CRITERION_CHARS, PatchContext, PlanAppend, PlanStep,
     PlanStepStatus, StageCheckpoint, StageRunId, StateMachine, StepStatusUpdate, TaskPhase,
@@ -13,6 +14,8 @@ fn state(phase: TaskPhase) -> WorkflowTaskState {
         phase,
         status: TaskStatus::Active,
         goal: "Ship the workflow domain".into(),
+        goal_revision: 1,
+        goal_proposal: None,
         plan: TaskPlan {
             revision: 0,
             steps: vec![
@@ -63,6 +66,28 @@ fn empty_patch(expected_version: u64) -> TaskStatePatch {
         current_step_id: None,
         expected_action: None,
         checkpoint: None,
+    }
+}
+
+#[test]
+fn goal_definition_cannot_skip_planning() {
+    let task = WorkflowTaskState::new(
+        WorkflowTaskId(1),
+        2,
+        1,
+        "Build parser".into(),
+        StageRunId(3),
+    )
+    .unwrap();
+    assert_eq!(task.phase, TaskPhase::GoalDefinition);
+    assert!(task.plan.steps.is_empty());
+    for event in [
+        TransitionEvent::PlanningCompleted,
+        TransitionEvent::ExecutionCompleted,
+        TransitionEvent::ValidationPassed,
+        TransitionEvent::ValidationFailed,
+    ] {
+        assert!(StateMachine::authorize(&task, event, &[]).is_err());
     }
 }
 
@@ -194,12 +219,11 @@ fn source_status_and_dialog_guards_are_local_and_exhaustive() {
 }
 
 #[test]
-fn only_humans_can_authorize_a_replan_from_every_phase() {
+fn only_humans_can_authorize_a_replan_from_approved_unfinished_phases() {
     for phase in [
         TaskPhase::Planning,
         TaskPhase::Execution,
         TaskPhase::Validation,
-        TaskPhase::Done,
     ] {
         let task = state(phase);
         let authorization = StateMachine::authorize_replan(
@@ -217,6 +241,14 @@ fn only_humans_can_authorize_a_replan_from_every_phase() {
             "Support the repaired deployment"
         );
     }
+    assert!(
+        StateMachine::authorize_replan(
+            &state(TaskPhase::Done),
+            &WorkflowInputSource::Human,
+            "again".into()
+        )
+        .is_err()
+    );
     let done = done_state();
     assert!(
         StateMachine::authorize_replan(
@@ -227,6 +259,59 @@ fn only_humans_can_authorize_a_replan_from_every_phase() {
                 triggering_assistant_message_id: 9,
             },
             "bypass the human".into(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn only_human_can_approve_current_visible_goal_proposal() {
+    let mut task =
+        WorkflowTaskState::new(WorkflowTaskId(1), 2, 1, "draft".into(), StageRunId(3)).unwrap();
+    assert!(authorize_goal_approval(&task, &WorkflowInputSource::Human).is_err());
+    task.goal_proposal = Some(GoalProposal {
+        text: "Build parser".into(),
+        assistant_message_id: 7,
+        stage_run_id: StageRunId(3),
+    });
+    let authorization = authorize_goal_approval(&task, &WorkflowInputSource::Human).unwrap();
+    assert_eq!(authorization.goal_text, "Build parser");
+    assert_eq!(authorization.assistant_message_id, 7);
+    assert_eq!(authorization.source_stage_run_id, StageRunId(3));
+    assert!(
+        authorize_goal_approval(
+            &task,
+            &WorkflowInputSource::Controller {
+                checker: "c".into(),
+                model: "m".into(),
+                triggering_assistant_message_id: 7
+            }
+        )
+        .is_err()
+    );
+    task.current_stage_run_id = StageRunId(4);
+    assert!(authorize_goal_approval(&task, &WorkflowInputSource::Human).is_err());
+}
+
+#[test]
+fn reopening_goal_requires_human_and_unfinished_approved_phase() {
+    for phase in [
+        TaskPhase::Planning,
+        TaskPhase::Execution,
+        TaskPhase::Validation,
+    ] {
+        let task = state(phase);
+        let authorization =
+            authorize_goal_reopen(&task, &WorkflowInputSource::Human, "Change goal".into())
+                .unwrap();
+        assert_eq!(authorization.source_stage_run_id, task.current_stage_run_id);
+        assert_eq!(authorization.next_plan_revision, task.plan.revision + 1);
+    }
+    assert!(
+        authorize_goal_reopen(
+            &state(TaskPhase::Done),
+            &WorkflowInputSource::Human,
+            "Change goal".into()
         )
         .is_err()
     );

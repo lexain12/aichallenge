@@ -7,7 +7,7 @@ use crate::context::{
 };
 use crate::facts::FactsState;
 use crate::system_context::{CompactionPolicy, ContextScope, SystemBlock};
-use crate::workflow::{WorkflowTaskState, render_task_state};
+use crate::workflow::{TaskPhase, WorkflowTaskState, render_task_state};
 use crate::workflow_store::{ProtocolSource, StageProtocolMessage};
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +56,14 @@ pub fn prepare_workflow_request(input: WorkflowRequestInput<'_>) -> WorkflowStag
     );
     let mut blocks = input.inherited_blocks;
     blocks.push(workflow_task_block(input.task));
+    if input.task.phase == TaskPhase::GoalDefinition {
+        blocks.push(SystemBlock::new(
+            "goal_definition_policy",
+            "Текущая цель — рабочий черновик, не утверждённая задача. Обсуждай и уточняй её; не составляй план и не приступай к реализации. Когда формулировка готова, выведи ровно одну отдельную строку вида «Предлагаемая цель: <текст>». Только человек может утвердить эту формулировку следующим сообщением.",
+            ContextScope::Task,
+            CompactionPolicy::Exclude,
+        ));
+    }
     if input.context_config.strategy() == ContextStrategy::StickyFacts
         && let Some(facts) = input.facts_state.system_block()
     {

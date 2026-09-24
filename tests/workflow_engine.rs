@@ -276,7 +276,7 @@ impl Fixture {
                 .unwrap()
                 .to_owned();
             let plan = json!({"revision":1,"steps":[{"id":"build","description":"build result","status":"completed"}], "acceptance_criteria":["tests pass"]});
-            connection.execute("UPDATE workflow_tasks SET phase=?1,status=?2,plan_json=?3,goal='current task goal'", params![phase,status,plan.to_string()]).unwrap();
+            connection.execute("UPDATE workflow_tasks SET phase=?1,status=?2,plan_json=?3,goal='current task goal',goal_revision=1", params![phase,status,plan.to_string()]).unwrap();
             connection
                 .execute("UPDATE task_stage_runs SET phase=?1", [phase])
                 .unwrap();
@@ -379,6 +379,123 @@ fn checked(version: u64, action: Option<&str>, decision: Value) -> Value {
 
 fn continue_decision() -> Value {
     json!({"type":"continue","instruction":"HIDDEN next instruction","confidence":0.95})
+}
+
+#[tokio::test]
+async fn first_answer_persists_visible_goal_proposal_without_entering_planning() {
+    let mut fixture = Fixture::new(None, TaskStatus::Active).await;
+    fixture
+        .ordinary(ordinary_response("Предлагаемая цель: Сделать CLI", true))
+        .await;
+    let result = fixture.run("Нужен CLI", |_| Ok(())).await.unwrap();
+    let state = fixture.current().unwrap();
+    assert_eq!(state.phase, TaskPhase::GoalDefinition);
+    assert!(state.plan.steps.is_empty());
+    assert_eq!(
+        state
+            .goal_proposal
+            .as_ref()
+            .map(|proposal| proposal.text.as_str()),
+        Some("Сделать CLI")
+    );
+    assert_eq!(result.stop_reason, AutonomyStopReason::AwaitUser);
+}
+
+#[tokio::test]
+async fn human_yes_approves_latest_proposal_once_and_enters_planning() {
+    let mut fixture = Fixture::new(None, TaskStatus::Active).await;
+    fixture
+        .ordinary(ordinary_response("Предлагаемая цель: Сделать CLI", true))
+        .await;
+    fixture.run("Нужен CLI", |_| Ok(())).await.unwrap();
+    fixture
+        .interpreter
+        .reply(interpretation(json!({"type":"approve_goal"})));
+    fixture
+        .checker
+        .reply(checked(1, None, json!({"type":"await_user"})));
+    fixture.run("да, утверждаю", |_| Ok(())).await.unwrap();
+    let state = fixture.current().unwrap();
+    assert_eq!(state.phase, TaskPhase::Planning);
+    assert_eq!(state.goal, "Сделать CLI");
+    assert_eq!(state.goal_revision, 1);
+    assert!(state.goal_proposal.is_none(), "{state:?}");
+    assert_eq!(fixture.count("task_transitions"), 1);
+}
+
+#[tokio::test]
+async fn conditional_yes_keeps_goal_open_and_invalidates_old_proposal() {
+    let mut fixture = Fixture::new(None, TaskStatus::Active).await;
+    fixture
+        .ordinary(ordinary_response(
+            "Предлагаемая цель: CLI с авторизацией",
+            true,
+        ))
+        .await;
+    fixture.run("Нужен CLI", |_| Ok(())).await.unwrap();
+    fixture.interpreter.reply(interpretation(json!({
+        "type":"continue","instruction":"Убрать авторизацию"
+    })));
+    fixture.server.reset().await;
+    fixture
+        .ordinary(ordinary_response("Уточним требования.", true))
+        .await;
+    fixture
+        .run("да, но без авторизации", |_| Ok(()))
+        .await
+        .unwrap();
+    let state = fixture.current().unwrap();
+    assert_eq!(state.phase, TaskPhase::GoalDefinition);
+    assert!(state.goal_proposal.is_none(), "{state:?}");
+    assert_eq!(fixture.count("task_transitions"), 0);
+}
+
+#[tokio::test]
+async fn human_can_reopen_approved_goal_without_old_plan_leakage() {
+    let mut fixture = Fixture::new(None, TaskStatus::Active).await;
+    fixture
+        .ordinary(ordinary_response("Предлагаемая цель: Сделать CLI", true))
+        .await;
+    fixture.run("Нужен CLI", |_| Ok(())).await.unwrap();
+    fixture
+        .interpreter
+        .reply(interpretation(json!({"type":"approve_goal"})));
+    fixture
+        .checker
+        .reply(checked(1, None, json!({"type":"await_user"})));
+    fixture.run("утверждаю", |_| Ok(())).await.unwrap();
+    fixture.server.reset().await;
+    fixture
+        .ordinary(ordinary_response("Обсудим Windows.", true))
+        .await;
+    fixture.interpreter.reply(interpretation(
+        json!({"type":"reopen_goal","change_request":"Добавь Windows"}),
+    ));
+    fixture
+        .run("Изменим цель: добавь Windows", |_| Ok(()))
+        .await
+        .unwrap();
+    let state = fixture.current().unwrap();
+    assert_eq!(state.phase, TaskPhase::GoalDefinition);
+    assert_eq!(state.goal, "Сделать CLI");
+    assert_eq!(state.plan.revision, 1);
+    assert!(state.plan.steps.is_empty());
+    assert_eq!(fixture.count("task_transitions"), 2);
+    assert_eq!(fixture.handoff.calls(), 0);
+    let stage_messages = fixture
+        .store
+        .load_stage_messages(state.current_stage_run_id)
+        .unwrap();
+    assert!(
+        stage_messages
+            .iter()
+            .any(|row| row.message.content() == "Изменим цель: добавь Windows")
+    );
+    assert!(
+        stage_messages
+            .iter()
+            .all(|row| row.message.content() != "Предлагаемая цель: Сделать CLI")
+    );
 }
 
 // Break caught: typed but illegal phase proposals must never schedule handoff or ordinary work.
@@ -555,10 +672,10 @@ async fn cancellation_at_interpreter_handoff_ordinary_and_recovery_boundaries_is
 // Break caught: ordinary answers must be durable before checker work, and await_user applies one patch.
 #[tokio::test]
 async fn await_user_applies_one_patch_and_ends_the_loop() {
-    let mut f = Fixture::new(None, TaskStatus::Active).await;
+    let mut f = Fixture::new(Some(TaskPhase::Planning), TaskStatus::Active).await;
     f.ordinary(ordinary_response("plan drafted", true)).await;
     f.checker.reply(checked(
-        0,
+        1,
         Some("ask for approval"),
         json!({"type":"await_user"}),
     ));
@@ -576,7 +693,7 @@ async fn await_user_applies_one_patch_and_ends_the_loop() {
         result.final_state.unwrap().expected_action.as_deref(),
         Some("ask for approval")
     );
-    assert_eq!(f.current().unwrap().version, 1);
+    assert_eq!(f.current().unwrap().version, 2);
     assert!(
         f.store
             .load_pending_processing(f.dialog_id.unwrap())
@@ -588,12 +705,15 @@ async fn await_user_applies_one_patch_and_ends_the_loop() {
 // Break caught: controller continuation must be persisted, hidden from transcript, and used by the next call.
 #[tokio::test]
 async fn continue_persists_hidden_input_then_runs_another_ordinary_turn() {
-    let mut f = Fixture::new(None, TaskStatus::Active).await;
+    let mut f = Fixture::new(Some(TaskPhase::Planning), TaskStatus::Active).await;
+    f.interpreter.reply(interpretation(
+        json!({"type":"continue","instruction":"implement"}),
+    ));
     f.ordinary(ordinary_response("ordinary answer", true)).await;
     f.checker
-        .reply(checked(0, Some("part two"), continue_decision()));
+        .reply(checked(1, Some("part two"), continue_decision()));
     f.checker
-        .reply(checked(1, None, json!({"type":"await_user"})));
+        .reply(checked(2, None, json!({"type":"await_user"})));
     let mut events = vec![];
     let result = f
         .run("implement", |event| {
@@ -609,7 +729,7 @@ async fn continue_persists_hidden_input_then_runs_another_ordinary_turn() {
         .await
         .unwrap();
     assert_eq!(result.autonomous_turns, 1);
-    assert_eq!(result.tokens, 12);
+    assert_eq!(result.tokens, 15);
     assert_eq!(events, [(1, TaskPhase::Planning)]);
     let requests = f.server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2);
@@ -618,7 +738,7 @@ async fn continue_persists_hidden_input_then_runs_another_ordinary_turn() {
             .to_string()
             .contains("HIDDEN next instruction")
     );
-    assert_eq!(f.count("workflow_inputs"), 2);
+    assert_eq!(f.count("workflow_inputs"), 3);
     assert_eq!(f.history.messages().len(), 3);
     assert!(
         !f.store
@@ -633,32 +753,38 @@ async fn continue_persists_hidden_input_then_runs_another_ordinary_turn() {
 // Break caught: the prospective boundary must reject turn three before its hidden input is saved.
 #[tokio::test]
 async fn turn_limit_allows_exactly_two_autonomous_ordinary_turns() {
-    let mut f = Fixture::new(None, TaskStatus::Active).await;
+    let mut f = Fixture::new(Some(TaskPhase::Planning), TaskStatus::Active).await;
+    f.interpreter.reply(interpretation(
+        json!({"type":"continue","instruction":"implement"}),
+    ));
     f.limits(2, 1000);
     f.ordinary(ordinary_response("answer", true)).await;
-    for version in 0..3 {
+    for version in 1..4 {
         f.checker.reply(checked(version, None, continue_decision()));
     }
     let result = f.run("implement", |_| Ok(())).await.unwrap();
     assert_eq!(result.stop_reason, AutonomyStopReason::TurnLimit);
     assert_eq!(result.autonomous_turns, 2);
-    assert_eq!(result.tokens, 18);
+    assert_eq!(result.tokens, 21);
     assert_eq!(f.server.received_requests().await.unwrap().len(), 3);
-    assert_eq!(f.count("workflow_inputs"), 3);
+    assert_eq!(f.count("workflow_inputs"), 4);
 }
 
 // Break caught: usage gaps and exhausted tokens must never create hidden controller work.
 #[tokio::test]
 async fn missing_usage_and_exact_token_limit_preserve_answer_without_controller_input() {
     for missing in [false, true] {
-        let mut f = Fixture::new(None, TaskStatus::Active).await;
+        let mut f = Fixture::new(Some(TaskPhase::Planning), TaskStatus::Active).await;
         f.limits(8, 6);
+        f.interpreter.reply(interpretation(
+            json!({"type":"continue","instruction":"implement"}),
+        ));
         f.checker = Arc::new(FakeModel {
             missing_usage: missing,
             ..Default::default()
         });
         f.checker
-            .reply(checked(0, Some("unsafe to schedule"), continue_decision()));
+            .reply(checked(1, Some("unsafe to schedule"), continue_decision()));
         f.ordinary(ordinary_response("complete answer", true)).await;
         let result = f.run("implement", |_| Ok(())).await.unwrap();
         assert_eq!(
@@ -669,10 +795,10 @@ async fn missing_usage_and_exact_token_limit_preserve_answer_without_controller_
                 AutonomyStopReason::TokenLimit
             }
         );
-        assert_eq!(result.tokens, if missing { 3 } else { 6 });
-        assert_eq!(f.count("workflow_inputs"), 1);
+        assert_eq!(result.tokens, if missing { 6 } else { 9 });
+        assert_eq!(f.count("workflow_inputs"), 2);
         assert_eq!(result.answer.as_deref(), Some("complete answer"));
-        assert_eq!(f.current().unwrap().version, 1);
+        assert_eq!(f.current().unwrap().version, 2);
         assert_eq!(
             f.current().unwrap().expected_action.as_deref(),
             Some("unsafe to schedule")
@@ -718,18 +844,18 @@ async fn absent_facts_or_summary_usage_stops_continuation_after_the_completed_an
 #[tokio::test]
 async fn unsafe_checker_outcomes_preserve_answer_and_state() {
     for outcome in ["malformed", "api", "confidence", "invalid-patch"] {
-        let mut f = Fixture::new(None, TaskStatus::Active).await;
+        let mut f = Fixture::new(Some(TaskPhase::Planning), TaskStatus::Active).await;
         f.ordinary(ordinary_response("ordinary answer", true)).await;
         match outcome {
             "malformed" => f.checker.reply(json!({"bad":"JSON shape"})),
             "api" => {}
             "confidence" => f.checker.reply(checked(
-                0,
+                1,
                 Some("do not apply"),
                 json!({"type":"continue","instruction":"next","confidence":0.1}),
             )),
             _ => {
-                let mut value = checked(0, None, continue_decision());
+                let mut value = checked(1, None, continue_decision());
                 value["patch"]["current_step_id"] = json!("unknown");
                 f.checker.reply(value);
             }
@@ -743,8 +869,8 @@ async fn unsafe_checker_outcomes_preserve_answer_and_state() {
                 AutonomyStopReason::CheckerFailed
             }
         );
-        assert_eq!(f.current().unwrap().version, 0);
-        assert_eq!(f.count("workflow_inputs"), 1);
+        assert_eq!(f.current().unwrap().version, 1);
+        assert_eq!(f.count("workflow_inputs"), 2);
         assert_eq!(result.answer.as_deref(), Some("ordinary answer"));
         let job = &f
             .store
@@ -980,6 +1106,122 @@ async fn denied_new_task_is_not_created() {
 }
 
 #[tokio::test]
+async fn denied_candidate_goal_is_neither_shown_nor_saved() {
+    let mut fixture = Fixture::new(None, TaskStatus::Active).await;
+    fixture
+        .store
+        .upsert_invariant(&fixture.scope, "STACK", "Use Rust only")
+        .unwrap();
+    fixture.checker.reply(json!({"type":"allow"})); // human start
+    fixture.checker.reply(json!({"type":"allow"})); // full answer
+    fixture
+        .checker
+        .reply(json!({"type":"deny","violations":[{"id":"STACK","reason":"Goal requires Go"}]}));
+    fixture
+        .ordinary(ordinary_response(
+            "Предлагаемая цель: Сделать backend на Go",
+            true,
+        ))
+        .await;
+    let mut visible = String::new();
+    fixture
+        .run("Нужен backend", |event| {
+            if let AgentEvent::Text(text) = event {
+                visible.push_str(text);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(!visible.contains("Сделать backend на Go"));
+    assert!(visible.contains("STACK"));
+    let current = fixture.current().unwrap();
+    assert_eq!(current.phase, TaskPhase::GoalDefinition);
+    assert!(current.goal_proposal.is_none());
+    assert_eq!(fixture.count("response_processing"), 0);
+}
+
+#[tokio::test]
+async fn invariant_denied_goal_approval_keeps_the_visible_proposal_pending() {
+    let mut fixture = Fixture::new(None, TaskStatus::Active).await;
+    fixture
+        .ordinary(ordinary_response("Предлагаемая цель: Сделать CLI", true))
+        .await;
+    fixture.run("Нужен CLI", |_| Ok(())).await.unwrap();
+    let before = fixture.current().unwrap();
+    fixture
+        .store
+        .upsert_invariant(&fixture.scope, "STACK", "Use Rust only")
+        .unwrap();
+    fixture
+        .interpreter
+        .reply(interpretation(json!({"type":"approve_goal"})));
+    fixture
+        .checker
+        .reply(json!({"type":"deny","violations":[{"id":"STACK","reason":"Conflict"}]}));
+    let result = fixture.run("Утверждаю", |_| Ok(())).await.unwrap();
+    assert!(result.answer.unwrap().contains("STACK"));
+    assert_eq!(fixture.current().unwrap(), before);
+    assert_eq!(fixture.count("task_transitions"), 0);
+}
+
+#[tokio::test]
+async fn approval_checks_exact_saved_goal_after_input_check() {
+    let mut fixture = Fixture::new(None, TaskStatus::Active).await;
+    fixture
+        .ordinary(ordinary_response("Предлагаемая цель: Сделать CLI", true))
+        .await;
+    fixture.run("Нужен CLI", |_| Ok(())).await.unwrap();
+    let before = fixture.current().unwrap();
+    fixture
+        .store
+        .upsert_invariant(&fixture.scope, "STACK", "Use Rust only")
+        .unwrap();
+    fixture
+        .interpreter
+        .reply(interpretation(json!({"type":"approve_goal"})));
+    fixture.checker.reply(json!({"type":"allow"}));
+    fixture
+        .checker
+        .reply(json!({"type":"deny","violations":[{"id":"STACK","reason":"Goal conflicts"}]}));
+    let result = fixture.run("Утверждаю", |_| Ok(())).await.unwrap();
+    assert!(result.answer.unwrap().contains("STACK"));
+    assert_eq!(fixture.current().unwrap(), before);
+    assert_eq!(fixture.count("task_transitions"), 0);
+}
+
+#[tokio::test]
+async fn invariant_denied_goal_reopen_keeps_approved_plan() {
+    let mut fixture = Fixture::new(None, TaskStatus::Active).await;
+    fixture
+        .ordinary(ordinary_response("Предлагаемая цель: Сделать CLI", true))
+        .await;
+    fixture.run("Нужен CLI", |_| Ok(())).await.unwrap();
+    fixture
+        .interpreter
+        .reply(interpretation(json!({"type":"approve_goal"})));
+    fixture
+        .checker
+        .reply(checked(1, None, json!({"type":"await_user"})));
+    fixture.run("Утверждаю", |_| Ok(())).await.unwrap();
+    let before = fixture.current().unwrap();
+    fixture
+        .store
+        .upsert_invariant(&fixture.scope, "STACK", "Use Rust only")
+        .unwrap();
+    fixture.interpreter.reply(interpretation(
+        json!({"type":"reopen_goal","change_request":"Use Go"}),
+    ));
+    fixture
+        .checker
+        .reply(json!({"type":"deny","violations":[{"id":"STACK","reason":"Conflict"}]}));
+    let result = fixture.run("Измени цель на Go", |_| Ok(())).await.unwrap();
+    assert!(result.answer.unwrap().contains("STACK"));
+    assert_eq!(fixture.current().unwrap(), before);
+    assert_eq!(fixture.count("task_transitions"), 1);
+}
+
+#[tokio::test]
 async fn malformed_invariant_verdict_withholds_candidate_and_reports_unavailable_check() {
     let mut f = Fixture::new(Some(TaskPhase::Execution), TaskStatus::Active).await;
     f.store
@@ -1092,10 +1334,13 @@ async fn repeated_next_fingerprint_stops_before_hidden_input_commit() {
 
 #[tokio::test]
 async fn a_new_human_input_gets_a_fresh_autonomy_budget() {
-    let mut f = Fixture::new(None, TaskStatus::Active).await;
+    let mut f = Fixture::new(Some(TaskPhase::Planning), TaskStatus::Active).await;
+    f.interpreter.reply(interpretation(
+        json!({"type":"continue","instruction":"first human"}),
+    ));
     f.limits(1, 1000);
     f.ordinary(ordinary_response("answer", true)).await;
-    for version in 0..4 {
+    for version in 1..5 {
         f.checker.reply(checked(version, None, continue_decision()));
     }
     let first = f.run("first human", |_| Ok(())).await.unwrap();
@@ -1325,30 +1570,33 @@ async fn completed_processing_replay_never_duplicates_patch_controller_or_transi
 #[tokio::test]
 async fn checker_races_reload_state_and_never_emit_controller_work() {
     for race in ["version", "attempt"] {
-        let mut f = Fixture::new(None, TaskStatus::Active).await;
+        let mut f = Fixture::new(Some(TaskPhase::Planning), TaskStatus::Active).await;
+        f.interpreter.reply(interpretation(
+            json!({"type":"continue","instruction":"implement"}),
+        ));
         f.ordinary(ordinary_response("saved answer", true)).await;
         f.checker
-            .reply(checked(0, Some("stale proposal"), continue_decision()));
+            .reply(checked(1, Some("stale proposal"), continue_decision()));
         let database = f._directory.path().join("workflow.sqlite3");
         *f.checker.before_reply.lock().unwrap() = Some(Box::new(move || {
             if race == "version" {
                 Connection::open(database)
                     .unwrap()
                     .execute(
-                        "UPDATE workflow_tasks SET version=1,expected_action='competing session'",
+                        "UPDATE workflow_tasks SET version=2,expected_action='competing session'",
                         [],
                     )
                     .unwrap();
             } else {
                 DialogStore::open(&database)
                     .unwrap()
-                    .lease_processing(1, 0, ProcessingLeaseMode::Recovery)
+                    .lease_processing(1, 1, ProcessingLeaseMode::Recovery)
                     .unwrap();
             }
         }));
         let result = f.run("implement", |_| Ok(())).await.unwrap();
         assert_eq!(result.stop_reason, AutonomyStopReason::CheckerFailed);
-        assert_eq!(f.count("workflow_inputs"), 1);
+        assert_eq!(f.count("workflow_inputs"), 2);
         assert_eq!(f.count("task_transitions"), 0);
         if race == "version" {
             assert_eq!(
@@ -1530,7 +1778,7 @@ async fn human_routing_matrix_preserves_phase_status_and_stage_boundaries() {
             intent: Value::Null,
             kind: "managed",
             calls: 1,
-            target: Planning,
+            target: GoalDefinition,
             new_stage: true,
         },
         Case {
@@ -1600,7 +1848,7 @@ async fn human_routing_matrix_preserves_phase_status_and_stage_boundaries() {
             intent: json!({"type":"start_new_task","goal":"second goal"}),
             kind: "managed",
             calls: 1,
-            target: Planning,
+            target: GoalDefinition,
             new_stage: true,
         },
         Case {
@@ -1678,10 +1926,10 @@ async fn human_routing_matrix_preserves_phase_status_and_stage_boundaries() {
             phase: Some(Done),
             paused: false,
             intent: json!({"type":"replan_current","change_request":"revise design"}),
-            kind: "managed",
-            calls: 1,
-            target: Planning,
-            new_stage: true,
+            kind: "rejected",
+            calls: 0,
+            target: Done,
+            new_stage: false,
         },
         Case {
             name: "done continue",
@@ -1757,7 +2005,7 @@ async fn human_routing_matrix_preserves_phase_status_and_stage_boundaries() {
         );
         assert_eq!(
             f.checker.calls(),
-            if case.kind == "managed" {
+            if case.kind == "managed" && case.target != GoalDefinition {
                 case.calls
             } else {
                 0
@@ -2195,7 +2443,7 @@ async fn failed_ordinary_turn_keeps_only_the_committed_input() {
         assert!(result.is_err(), "{failure}");
         let state = f.current().unwrap();
         assert_eq!(state.version, 0);
-        assert_eq!(state.phase, TaskPhase::Planning);
+        assert_eq!(state.phase, TaskPhase::GoalDefinition);
         assert_eq!(f.count("messages"), 1, "{failure}");
         assert_eq!(f.count("response_processing"), 0, "{failure}");
         assert_eq!(f.history.messages().len(), 1);
@@ -3351,6 +3599,6 @@ async fn legacy_dialog_starts_its_first_task_without_interpreter_or_old_context(
     let requests = f.server.received_requests().await.unwrap();
     let body: Value = requests[0].body_json().unwrap();
     assert!(!body["messages"].to_string().contains("LEGACY"));
-    assert_eq!(body["messages"].as_array().unwrap().len(), 3);
-    assert_eq!(body["messages"][2]["content"], "new managed goal");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 4);
+    assert_eq!(body["messages"][3]["content"], "new managed goal");
 }

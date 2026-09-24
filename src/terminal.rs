@@ -60,15 +60,26 @@ impl TerminalUi {
         let current_step = status.current_step_id.as_deref().unwrap_or("none");
         let expected_action = status.expected_action.as_deref().unwrap_or("none");
         let processing = status.processing.map_or("none", processing_status_name);
+        let goal_label = if status.phase == crate::workflow::TaskPhase::GoalDefinition {
+            "working"
+        } else {
+            "approved"
+        };
+        let proposal = status
+            .goal_proposal_message_id
+            .map_or_else(|| "none".to_owned(), |id| id.to_string());
         self.write_block(
             writer,
             BlockStyle::System,
             &format!(
-                "Workflow task #{} · ID: {}\nPhase: {} · status: {}\nPlan revision: {} · current step: {}\nExpected action: {}\nStage sequence: {} · processing: {}",
+                "Workflow task #{} · ID: {}\nPhase: {} · status: {}\nGoal ({goal_label}, revision {}): {}\nCurrent proposal message: {}\nPlan revision: {} · current step: {}\nExpected action: {}\nStage sequence: {} · processing: {}",
                 status.ordinal,
                 status.task_id.0,
                 task_phase_name(status.phase),
                 task_status_name(status.status),
+                status.goal_revision,
+                status.goal,
+                proposal,
                 status.plan_revision,
                 current_step,
                 expected_action,
@@ -387,6 +398,7 @@ impl TerminalUi {
 
 fn task_phase_name(phase: crate::workflow::TaskPhase) -> &'static str {
     match phase {
+        crate::workflow::TaskPhase::GoalDefinition => "goal_definition",
         crate::workflow::TaskPhase::Planning => "planning",
         crate::workflow::TaskPhase::Execution => "execution",
         crate::workflow::TaskPhase::Validation => "validation",

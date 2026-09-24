@@ -782,6 +782,7 @@ fn memory_address_label(scope: &RequestScope, layer: DurableMemoryScope) -> Stri
 
 fn task_phase_name(phase: TaskPhase) -> &'static str {
     match phase {
+        TaskPhase::GoalDefinition => "goal_definition",
         TaskPhase::Planning => "planning",
         TaskPhase::Execution => "execution",
         TaskPhase::Validation => "validation",

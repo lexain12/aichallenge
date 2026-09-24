@@ -11,6 +11,13 @@ pub const MAX_CHECKPOINT_ITEMS: usize = 128;
 pub const MAX_EVIDENCE_ITEMS: usize = 32;
 pub const MAX_EVIDENCE_ITEM_CHARS: usize = 2_048;
 
+fn legacy_goal_revision() -> u32 {
+    1
+}
+fn is_legacy_goal_revision(value: &u32) -> bool {
+    *value == 1
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WorkflowTaskId(pub i64);
@@ -22,6 +29,7 @@ pub struct StageRunId(pub i64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPhase {
+    GoalDefinition,
     Planning,
     Execution,
     Validation,
@@ -77,6 +85,13 @@ pub struct WorkflowTaskState {
     pub phase: TaskPhase,
     pub status: TaskStatus,
     pub goal: String,
+    #[serde(
+        default = "legacy_goal_revision",
+        skip_serializing_if = "is_legacy_goal_revision"
+    )]
+    pub goal_revision: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_proposal: Option<GoalProposal>,
     pub plan: TaskPlan,
     pub current_step_id: Option<String>,
     pub expected_action: Option<String>,
@@ -99,9 +114,11 @@ impl WorkflowTaskState {
             id,
             dialog_id,
             ordinal,
-            phase: TaskPhase::Planning,
+            phase: TaskPhase::GoalDefinition,
             status: TaskStatus::Active,
             goal,
+            goal_revision: 0,
+            goal_proposal: None,
             plan: TaskPlan {
                 revision: 0,
                 steps: Vec::new(),
@@ -140,6 +157,26 @@ impl WorkflowTaskState {
             return Err(WorkflowError::DoneTaskPaused);
         }
         validate_required_text(&self.goal, "goal", MAX_WORKFLOW_TEXT_CHARS)?;
+        if self.phase == TaskPhase::GoalDefinition {
+            if !self.plan.steps.is_empty()
+                || !self.plan.acceptance_criteria.is_empty()
+                || self.current_step_id.is_some()
+                || self.expected_action.is_some()
+            {
+                return Err(WorkflowError::GoalDefinitionHasPlan);
+            }
+        } else if self.goal_revision == 0 {
+            return Err(WorkflowError::UnapprovedGoal);
+        }
+        if let Some(proposal) = &self.goal_proposal {
+            if self.phase != TaskPhase::GoalDefinition
+                || proposal.stage_run_id != self.current_stage_run_id
+            {
+                return Err(WorkflowError::StaleGoalProposal);
+            }
+            validate_required_text(&proposal.text, "goal proposal", MAX_WORKFLOW_TEXT_CHARS)?;
+            positive_id(proposal.assistant_message_id, "assistant message id")?;
+        }
         self.plan.validate()?;
         if let Some(step_id) = &self.current_step_id {
             validate_required_text(step_id, "current step id", MAX_WORKFLOW_TEXT_CHARS)?;
@@ -191,6 +228,10 @@ impl WorkflowTaskState {
             });
         }
         patch.validate()?;
+
+        if self.phase == TaskPhase::GoalDefinition && !patch.is_empty() {
+            return Err(WorkflowError::GoalDefinitionHasPlan);
+        }
 
         let mut projected = self.clone();
         if !patch.plan_append.is_empty() {
@@ -416,6 +457,10 @@ pub enum WorkflowIntent {
     StartNewTask {
         goal: String,
     },
+    ApproveGoal,
+    ReopenGoal {
+        change_request: String,
+    },
     ReplanCurrent {
         change_request: String,
     },
@@ -437,6 +482,8 @@ impl WorkflowIntent {
         match self {
             Self::Continue { .. } => "continue",
             Self::StartNewTask { .. } => "start_new_task",
+            Self::ApproveGoal => "approve_goal",
+            Self::ReopenGoal { .. } => "reopen_goal",
             Self::ReplanCurrent { .. } => "replan_current",
             Self::ProposeTransition { .. } => "propose_transition",
         }
@@ -449,6 +496,10 @@ impl WorkflowIntent {
             }
             Self::StartNewTask { goal } => {
                 validate_required_text(goal, "goal", MAX_WORKFLOW_TEXT_CHARS)
+            }
+            Self::ApproveGoal => Ok(()),
+            Self::ReopenGoal { change_request } => {
+                validate_required_text(change_request, "change request", MAX_WORKFLOW_TEXT_CHARS)
             }
             Self::ReplanCurrent { change_request } => {
                 validate_required_text(change_request, "change request", MAX_WORKFLOW_TEXT_CHARS)
@@ -500,6 +551,84 @@ pub enum StageChangeAuthorization {
     Replan(ReplanAuthorization),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GoalProposal {
+    pub text: String,
+    pub assistant_message_id: i64,
+    pub stage_run_id: StageRunId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalApprovalAuthorization {
+    pub task_id: WorkflowTaskId,
+    pub source_version: u64,
+    pub source_stage_run_id: StageRunId,
+    pub assistant_message_id: i64,
+    pub goal_text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalReopenAuthorization {
+    pub task_id: WorkflowTaskId,
+    pub source_version: u64,
+    pub source_stage_run_id: StageRunId,
+    pub next_plan_revision: u32,
+    pub change_request: String,
+}
+
+pub fn authorize_goal_approval(
+    state: &WorkflowTaskState,
+    source: &WorkflowInputSource,
+) -> Result<GoalApprovalAuthorization, WorkflowError> {
+    state.validate()?;
+    if source != &WorkflowInputSource::Human {
+        return Err(WorkflowError::GoalChangeRequiresHuman);
+    }
+    if state.phase != TaskPhase::GoalDefinition {
+        return Err(WorkflowError::GoalApprovalForbidden);
+    }
+    let proposal = state
+        .goal_proposal
+        .as_ref()
+        .ok_or(WorkflowError::MissingGoalProposal)?;
+    Ok(GoalApprovalAuthorization {
+        task_id: state.id,
+        source_version: state.version,
+        source_stage_run_id: state.current_stage_run_id,
+        assistant_message_id: proposal.assistant_message_id,
+        goal_text: proposal.text.clone(),
+    })
+}
+
+pub fn authorize_goal_reopen(
+    state: &WorkflowTaskState,
+    source: &WorkflowInputSource,
+    change_request: String,
+) -> Result<GoalReopenAuthorization, WorkflowError> {
+    state.validate()?;
+    if source != &WorkflowInputSource::Human {
+        return Err(WorkflowError::GoalChangeRequiresHuman);
+    }
+    if !matches!(
+        state.phase,
+        TaskPhase::Planning | TaskPhase::Execution | TaskPhase::Validation
+    ) {
+        return Err(WorkflowError::GoalReopenForbidden);
+    }
+    validate_required_text(&change_request, "change request", MAX_WORKFLOW_TEXT_CHARS)?;
+    Ok(GoalReopenAuthorization {
+        task_id: state.id,
+        source_version: state.version,
+        source_stage_run_id: state.current_stage_run_id,
+        next_plan_revision: state
+            .plan
+            .revision
+            .checked_add(1)
+            .ok_or(WorkflowError::PlanRevisionOverflow)?,
+        change_request: change_request.trim().to_owned(),
+    })
+}
+
 pub struct StateMachine;
 
 impl StateMachine {
@@ -525,7 +654,10 @@ impl StateMachine {
                     WorkflowIntent::Continue { .. } | WorkflowIntent::ProposeTransition { .. } => {
                         Ok(())
                     }
-                    WorkflowIntent::StartNewTask { .. } | WorkflowIntent::ReplanCurrent { .. } => {
+                    WorkflowIntent::StartNewTask { .. }
+                    | WorkflowIntent::ApproveGoal
+                    | WorkflowIntent::ReopenGoal { .. }
+                    | WorkflowIntent::ReplanCurrent { .. } => {
                         Err(WorkflowError::ControllerIntentForbidden {
                             intent: intent.kind(),
                         })
@@ -592,6 +724,9 @@ impl StateMachine {
         validate_required_text(&change_request, "change request", MAX_WORKFLOW_TEXT_CHARS)?;
         if source != &WorkflowInputSource::Human {
             return Err(WorkflowError::ReplanRequiresHuman);
+        }
+        if matches!(state.phase, TaskPhase::GoalDefinition | TaskPhase::Done) {
+            return Err(WorkflowError::ReplanForbidden { phase: state.phase });
         }
         Ok(ReplanAuthorization {
             from_phase: state.phase,
@@ -731,6 +866,16 @@ pub fn render_task_state(state: &WorkflowTaskState) -> String {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkflowError {
+    GoalDefinitionHasPlan,
+    UnapprovedGoal,
+    StaleGoalProposal,
+    MissingGoalProposal,
+    GoalApprovalForbidden,
+    GoalReopenForbidden,
+    GoalChangeRequiresHuman,
+    ReplanForbidden {
+        phase: TaskPhase,
+    },
     IllegalTransition {
         from: TaskPhase,
         event: TransitionEvent,
@@ -785,6 +930,24 @@ pub enum WorkflowError {
 impl fmt::Display for WorkflowError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::GoalDefinitionHasPlan => {
+                write!(formatter, "goal definition cannot contain an active plan")
+            }
+            Self::UnapprovedGoal => write!(formatter, "goal must be approved before planning"),
+            Self::StaleGoalProposal => {
+                write!(formatter, "goal proposal does not belong to current stage")
+            }
+            Self::MissingGoalProposal => write!(formatter, "no current goal proposal"),
+            Self::GoalApprovalForbidden => {
+                write!(formatter, "goal approval is not allowed in this phase")
+            }
+            Self::GoalReopenForbidden => {
+                write!(formatter, "goal reopening is not allowed in this phase")
+            }
+            Self::GoalChangeRequiresHuman => write!(formatter, "goal change requires human input"),
+            Self::ReplanForbidden { phase } => {
+                write!(formatter, "replan is not allowed in {phase:?}")
+            }
             Self::IllegalTransition { from, event } => {
                 write!(
                     formatter,
