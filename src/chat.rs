@@ -1,7 +1,89 @@
 use crate::client::TokenUsage;
 use crate::invariants::{invariant_id, invariant_text};
 use crate::memory::DurableMemoryScope;
+use crate::tool_calling::ModelToolCall;
 use serde::Serialize;
+
+/// Provider wire messages are separate from persisted conversation messages.
+#[derive(Clone, Debug, Serialize)]
+pub struct ProviderMessage {
+    role: ProviderRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ProviderToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProviderToolCall {
+    id: String,
+    r#type: &'static str,
+    function: ProviderFunctionCall,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProviderFunctionCall {
+    name: String,
+    arguments: String,
+}
+
+impl From<&Message> for ProviderMessage {
+    fn from(message: &Message) -> Self {
+        Self {
+            role: match message.role() {
+                Role::System => ProviderRole::System,
+                Role::User => ProviderRole::User,
+                Role::Assistant => ProviderRole::Assistant,
+            },
+            content: Some(message.content().to_owned()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+}
+
+impl ProviderMessage {
+    pub fn assistant_tool_calls(content: Option<String>, calls: &[ModelToolCall]) -> Self {
+        Self {
+            role: ProviderRole::Assistant,
+            content,
+            tool_calls: Some(
+                calls
+                    .iter()
+                    .map(|call| ProviderToolCall {
+                        id: call.id.clone(),
+                        r#type: "function",
+                        function: ProviderFunctionCall {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ProviderRole::Tool,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+        }
+    }
+}
 
 /// A role accepted by the DeepSeek Chat Completions API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

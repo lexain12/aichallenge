@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::time::Duration;
 
@@ -8,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-use crate::chat::Message;
+use crate::chat::{Message, ProviderMessage};
 use crate::config::Config;
+use crate::tool_calling::{ModelToolCall, ModelToolDefinition};
 
 const MAX_ERROR_BODY_BYTES: usize = 4096;
 const REDACTED: &str = "[REDACTED]";
@@ -67,6 +69,45 @@ impl DeepSeekClient {
         &self.model
     }
 
+    pub async fn stream_assistant_turn(
+        &self,
+        messages: &[ProviderMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<AssistantTurn, ClientError> {
+        let mut usage = None;
+        self.stream_assistant_turn_with_options(messages, tools, self.chat_options(), |event| {
+            if let StreamEvent::Usage(value) = event {
+                usage = Some(value);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|source| match usage {
+            Some(usage) => ClientError::WithUsage {
+                source: Box::new(source),
+                usage,
+            },
+            None => source,
+        })
+    }
+
+    fn chat_options(&self) -> RequestOptions<'_> {
+        RequestOptions {
+            model: &self.model,
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            thinking: if self.disable_thinking {
+                Some(Thinking { r#type: "disabled" })
+            } else {
+                self.thinking
+                    .as_deref()
+                    .map(|value| Thinking { r#type: value })
+            },
+            top_p: self.top_p,
+            stop: &self.stop,
+        }
+    }
+
     pub async fn stream_chat<F>(
         &self,
         messages: &[Message],
@@ -90,25 +131,8 @@ impl DeepSeekClient {
     where
         F: FnMut(StreamEvent<'_>) -> io::Result<()>,
     {
-        self.stream_chat_events_with_options(
-            messages,
-            RequestOptions {
-                model: &self.model,
-                temperature: self.temperature,
-                max_tokens: self.max_tokens,
-                thinking: if self.disable_thinking {
-                    Some(Thinking { r#type: "disabled" })
-                } else {
-                    self.thinking
-                        .as_deref()
-                        .map(|value| Thinking { r#type: value })
-                },
-                top_p: self.top_p,
-                stop: &self.stop,
-            },
-            on_event,
-        )
-        .await
+        self.stream_chat_events_with_options(messages, self.chat_options(), on_event)
+            .await
     }
 
     pub async fn summarize(
@@ -187,11 +211,32 @@ impl DeepSeekClient {
         &self,
         messages: &[Message],
         options: RequestOptions<'_>,
-        mut on_event: F,
+        on_event: F,
     ) -> Result<String, ClientError>
     where
         F: FnMut(StreamEvent<'_>) -> io::Result<()>,
     {
+        let messages: Vec<_> = messages.iter().map(ProviderMessage::from).collect();
+        match self
+            .stream_assistant_turn_with_options(&messages, &[], options, on_event)
+            .await?
+        {
+            AssistantTurn::FinalText { content, .. } => Ok(content),
+            AssistantTurn::ToolCalls { .. } => Err(ClientError::UnexpectedToolCalls),
+        }
+    }
+
+    async fn stream_assistant_turn_with_options<F>(
+        &self,
+        messages: &[ProviderMessage],
+        tools: &[ModelToolDefinition],
+        options: RequestOptions<'_>,
+        mut on_event: F,
+    ) -> Result<AssistantTurn, ClientError>
+    where
+        F: FnMut(StreamEvent<'_>) -> io::Result<()>,
+    {
+        let tools: Vec<_> = tools.iter().map(ProviderToolDefinition::from).collect();
         let response = self
             .http
             .post(self.endpoint.clone())
@@ -208,6 +253,7 @@ impl DeepSeekClient {
                 thinking: options.thinking,
                 top_p: options.top_p,
                 stop: options.stop,
+                tools: &tools,
             })
             .send()
             .await
@@ -221,6 +267,8 @@ impl DeepSeekClient {
 
         let mut events = response.bytes_stream().eventsource();
         let mut answer = String::new();
+        let mut usage = None;
+        let mut partial_calls = BTreeMap::<u32, PartialToolCall>::new();
         let mut saw_done = false;
         while let Some(event) = events.next().await {
             let event = event.map_err(|error| ClientError::Stream(error.to_string()))?;
@@ -231,8 +279,9 @@ impl DeepSeekClient {
 
             let chunk: StreamChunk =
                 serde_json::from_str(&event.data).map_err(ClientError::Json)?;
-            if let Some(usage) = chunk.usage {
-                on_event(StreamEvent::Usage(usage)).map_err(ClientError::Output)?;
+            if let Some(value) = chunk.usage {
+                usage = Some(value);
+                on_event(StreamEvent::Usage(value)).map_err(ClientError::Output)?;
             }
             for choice in chunk.choices {
                 let truncated = choice.finish_reason.as_deref() == Some("length");
@@ -245,15 +294,48 @@ impl DeepSeekClient {
                 if truncated {
                     return Err(ClientError::Truncated);
                 }
+                for delta in choice.delta.tool_calls.unwrap_or_default() {
+                    partial_calls.entry(delta.index).or_default().merge(delta)?;
+                }
             }
         }
 
-        if saw_done {
-            Ok(answer)
-        } else {
-            Err(ClientError::IncompleteStream)
+        if !saw_done {
+            return Err(ClientError::IncompleteStream);
         }
+        if partial_calls.is_empty() {
+            return Ok(AssistantTurn::FinalText {
+                content: answer,
+                usage,
+            });
+        }
+        let calls = partial_calls
+            .into_values()
+            .map(PartialToolCall::finish)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut ids = HashSet::new();
+        if calls.iter().any(|call| !ids.insert(&call.id)) {
+            return Err(ClientError::InvalidToolCall);
+        }
+        Ok(AssistantTurn::ToolCalls {
+            content: (!answer.is_empty()).then_some(answer),
+            calls,
+            usage,
+        })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AssistantTurn {
+    FinalText {
+        content: String,
+        usage: Option<TokenUsage>,
+    },
+    ToolCalls {
+        content: Option<String>,
+        calls: Vec<ModelToolCall>,
+        usage: Option<TokenUsage>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -323,7 +405,7 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
-    messages: &'a [Message],
+    messages: &'a [ProviderMessage],
     temperature: f64,
     max_tokens: u32,
     stream: bool,
@@ -335,6 +417,35 @@ struct ChatRequest<'a> {
     stop: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<Thinking<'a>>,
+    #[serde(skip_serializing_if = "<[ProviderToolDefinition<'_>]>::is_empty")]
+    tools: &'a [ProviderToolDefinition<'a>],
+}
+
+#[derive(Serialize)]
+struct ProviderToolDefinition<'a> {
+    r#type: &'static str,
+    function: ProviderFunctionDefinition<'a>,
+}
+
+#[derive(Serialize)]
+struct ProviderFunctionDefinition<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    parameters: &'a serde_json::Map<String, serde_json::Value>,
+}
+
+impl<'a> From<&'a ModelToolDefinition> for ProviderToolDefinition<'a> {
+    fn from(tool: &'a ModelToolDefinition) -> Self {
+        Self {
+            r#type: "function",
+            function: ProviderFunctionDefinition {
+                name: &tool.name,
+                description: tool.description.as_deref(),
+                parameters: &tool.parameters,
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -385,6 +496,68 @@ struct Choice {
 #[derive(Default, Deserialize)]
 struct Delta {
     content: Option<String>,
+    tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+#[derive(Deserialize)]
+struct ToolCallDelta {
+    index: u32,
+    id: Option<String>,
+    r#type: Option<String>,
+    function: Option<FunctionDelta>,
+}
+
+#[derive(Deserialize)]
+struct FunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+    declared: bool,
+}
+
+impl PartialToolCall {
+    fn merge(&mut self, delta: ToolCallDelta) -> Result<(), ClientError> {
+        if let Some(kind) = delta.r#type {
+            // The type marks a declaration, not a string fragment. A second
+            // declaration at this index cannot start a different call.
+            if kind != "function" || self.declared {
+                return Err(ClientError::InvalidToolCall);
+            }
+            self.declared = true;
+        }
+        if let Some(id) = delta.id {
+            self.id.push_str(&id);
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                self.name.push_str(&name);
+            }
+            if let Some(arguments) = function.arguments {
+                self.arguments.push_str(&arguments);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ModelToolCall, ClientError> {
+        if self.id.trim().is_empty()
+            || self.name.trim().is_empty()
+            || serde_json::from_str::<serde_json::Value>(&self.arguments).is_err()
+        {
+            return Err(ClientError::InvalidToolCall);
+        }
+        Ok(ModelToolCall {
+            id: self.id,
+            name: self.name,
+            arguments: self.arguments,
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -416,6 +589,10 @@ pub enum ClientError {
     Output(#[source] io::Error),
     #[error("DeepSeek stream closed before the [DONE] event")]
     IncompleteStream,
+    #[error("invalid tool call in DeepSeek stream")]
+    InvalidToolCall,
+    #[error("unexpected tool calls in a text-only DeepSeek request")]
+    UnexpectedToolCalls,
 }
 
 impl ClientError {
@@ -458,6 +635,14 @@ impl ClientError {
             },
             Self::EmptyAnswer => ProviderErrorMetadata {
                 kind: "empty_response",
+                status: None,
+            },
+            Self::InvalidToolCall => ProviderErrorMetadata {
+                kind: "invalid_tool_call",
+                status: None,
+            },
+            Self::UnexpectedToolCalls => ProviderErrorMetadata {
+                kind: "unexpected_tool_calls",
                 status: None,
             },
             Self::Output(_) => ProviderErrorMetadata {

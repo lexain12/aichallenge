@@ -1,8 +1,9 @@
 use std::io::{self, Write};
 
-use deepseek_cli::chat::{ChatHistory, Message, Role};
-use deepseek_cli::client::{ClientError, DeepSeekClient, StreamEvent, TokenUsage};
+use deepseek_cli::chat::{ChatHistory, Message, ProviderMessage, Role};
+use deepseek_cli::client::{AssistantTurn, ClientError, DeepSeekClient, StreamEvent, TokenUsage};
 use deepseek_cli::config::Config;
+use deepseek_cli::tool_calling::{ModelToolCall, ModelToolDefinition};
 use serde_json::json;
 use tempfile::NamedTempFile;
 use wiremock::matchers::{body_json, header, method, path};
@@ -42,6 +43,217 @@ fn successful_sse() -> String {
     ]
     .join("\n\n")
         + "\n\n"
+}
+
+fn tool_definitions() -> Vec<ModelToolDefinition> {
+    vec![ModelToolDefinition {
+        name: "telegram__read_chat".into(),
+        description: Some("Read a chat".into()),
+        parameters:
+            json!({"type":"object","properties":{"chat":{"type":"string"}},"required":["chat"]})
+                .as_object()
+                .unwrap()
+                .clone(),
+        read_only: true,
+    }]
+}
+
+fn tool_sse(deltas: Vec<serde_json::Value>, done: bool) -> String {
+    let mut body = deltas
+        .into_iter()
+        .map(|delta| {
+            format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":delta}]})
+            )
+        })
+        .collect::<String>();
+    // Repeated usage snapshots must not be summed for a single request.
+    body.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n");
+    body.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n");
+    if done {
+        body.push_str("data: [DONE]\n\n");
+    }
+    body
+}
+
+async fn tool_client(body: String) -> (MockServer, DeepSeekClient) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+    let client = DeepSeekClient::new(&config_for(&server, "test-key")).unwrap();
+    (server, client)
+}
+
+// Catches provider envelopes leaking local metadata or dropping tool result IDs.
+#[tokio::test]
+async fn tool_request_serializes_provider_messages_and_function_envelope() {
+    let (server, client) = tool_client(successful_sse()).await;
+    let call = ModelToolCall {
+        id: "call_1".into(),
+        name: "telegram__read_chat".into(),
+        arguments: r#"{"chat":"me"}"#.into(),
+    };
+    let mut messages: Vec<_> = request_messages()
+        .iter()
+        .map(ProviderMessage::from)
+        .collect();
+    messages.push(ProviderMessage::from(&Message::for_request(
+        Role::Assistant,
+        "Looking.",
+    )));
+    messages.push(ProviderMessage::assistant_tool_calls(None, &[call]));
+    messages.push(ProviderMessage::tool_result("call_1", "chat contents"));
+    let turn = client
+        .stream_assistant_turn(&messages, &tool_definitions())
+        .await
+        .unwrap();
+    assert!(
+        matches!(turn, AssistantTurn::FinalText { content, usage: Some(usage) } if content == "Hello world" && usage.total_tokens == 4)
+    );
+    let requests = server.received_requests().await.unwrap();
+    let actual: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        actual,
+        json!({
+            "model":"test-model", "temperature":0.5, "max_tokens":128, "stream":true,
+            "stream_options":{"include_usage":true},
+            "messages":[
+                {"role":"system","content":"Be concise."},
+                {"role":"user","content":"Hello"},
+                {"role":"assistant","content":"Looking."},
+                {"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"telegram__read_chat","arguments":"{\"chat\":\"me\"}"}}]},
+                {"role":"tool","content":"chat contents","tool_call_id":"call_1"}
+            ],
+            "tools":[{"type":"function","function":{"name":"telegram__read_chat","description":"Read a chat","parameters":{"type":"object","properties":{"chat":{"type":"string"}},"required":["chat"]}}}]
+        })
+    );
+}
+
+// Catches arrival-order assembly, eager JSON parsing, and overwritten fragments.
+#[tokio::test]
+async fn reassembles_fragmented_tool_calls_by_index() {
+    let body = tool_sse(
+        vec![
+            json!({"content":null,"tool_calls":[{"index":9,"id":"call_","type":"function","function":{"name":"telegram__send_","arguments":"{\"chat\":"}}]}),
+            json!({"content":"","tool_calls":[{"index":2,"id":"call_","type":"function","function":{"name":"telegram__","arguments":"{\"chat\":\""}},{"index":9,"id":"send","function":{"name":"message","arguments":"\"me\",\"text\":"}}]}),
+            json!({"tool_calls":[{"index":9,"function":{"arguments":"\"hi\"}"}},{"index":2,"id":"read","function":{"name":"read_chat","arguments":"me\"}"}}]}),
+        ],
+        true,
+    );
+    let (_server, client) = tool_client(body).await;
+    let AssistantTurn::ToolCalls {
+        content,
+        calls,
+        usage,
+    } = client
+        .stream_assistant_turn(&[], &tool_definitions())
+        .await
+        .unwrap()
+    else {
+        panic!("expected tool calls")
+    };
+    assert_eq!(content, None);
+    assert_eq!(
+        calls,
+        vec![
+            ModelToolCall {
+                id: "call_read".into(),
+                name: "telegram__read_chat".into(),
+                arguments: r#"{"chat":"me"}"#.into()
+            },
+            ModelToolCall {
+                id: "call_send".into(),
+                name: "telegram__send_message".into(),
+                arguments: r#"{"chat":"me","text":"hi"}"#.into()
+            },
+        ]
+    );
+    assert_eq!(usage.unwrap().total_tokens, 5);
+}
+
+#[tokio::test]
+async fn tool_turn_retains_assistant_text_and_omits_empty_tools() {
+    let (_server, client) = tool_client(tool_sse(vec![json!({"content":"Checking.","tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{}"}}]})], true)).await;
+    assert!(
+        matches!(client.stream_assistant_turn(&[], &[]).await.unwrap(), AssistantTurn::ToolCalls { content: Some(content), .. } if content == "Checking.")
+    );
+    let requests = _server.received_requests().await.unwrap();
+    let request: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(request.get("tools").is_none());
+}
+
+// Catches silent acceptance of malformed calls; diagnostics must never echo payloads.
+#[tokio::test]
+async fn tool_stream_rejects_invalid_calls_without_payload_leakage() {
+    let cases = vec![
+        vec![json!({"index":0,"function":{"name":"read","arguments":"{}"}})],
+        vec![json!({"index":0,"id":"a","function":{"arguments":"{}"}})],
+        vec![json!({"index":0,"id":" ","function":{"name":"read","arguments":"{}"}})],
+        vec![json!({"index":0,"id":"a","function":{"name":" ","arguments":"{}"}})],
+        vec![json!({"index":0,"id":"a","function":{"name":"read","arguments":"SECRET test-key"}})],
+        vec![json!({"index":0,"id":"a","function":{"name":"read"}})],
+        vec![
+            json!({"index":0,"id":"a","type":"not_function","function":{"name":"read","arguments":"{}"}}),
+        ],
+        vec![
+            json!({"index":0,"id":"a","type":"function","function":{"name":"read","arguments":"{}"}}),
+            json!({"index":0,"id":"b","type":"function","function":{"name":"write","arguments":"{}"}}),
+        ],
+        vec![
+            json!({"index":0,"id":"same","function":{"name":"read","arguments":"{}"}}),
+            json!({"index":1,"id":"same","function":{"name":"read","arguments":"{}"}}),
+        ],
+    ];
+    for calls in cases {
+        let deltas = calls
+            .into_iter()
+            .map(|call| json!({"tool_calls":[call]}))
+            .collect();
+        let (_server, client) = tool_client(tool_sse(deltas, true)).await;
+        let error = client
+            .stream_assistant_turn(&[], &[])
+            .await
+            .expect_err("invalid tool call");
+        assert_eq!(error.operator_metadata().kind, "invalid_tool_call");
+        for diagnostic in [
+            error.to_string(),
+            error.raw_diagnostic(),
+            format!("{error:?}"),
+        ] {
+            assert!(!diagnostic.contains("SECRET") && !diagnostic.contains("test-key"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_arguments_are_validated_only_after_done() {
+    let (_server, client) = tool_client(tool_sse(
+        vec![
+            json!({"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{"}}]}),
+        ],
+        false,
+    ))
+    .await;
+    let error = client.stream_assistant_turn(&[], &[]).await.unwrap_err();
+    assert_eq!(error.operator_metadata().kind, "incomplete_stream");
+    assert_eq!(error.usage().unwrap().total_tokens, 5);
+}
+
+#[tokio::test]
+async fn text_only_wrapper_rejects_tool_calls() {
+    let (_server, client) = tool_client(tool_sse(vec![json!({"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{}"}}]})], true)).await;
+    let error = client
+        .stream_chat_events(&request_messages(), |_| Ok(()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.operator_metadata().kind, "unexpected_tool_calls");
 }
 
 #[tokio::test]
