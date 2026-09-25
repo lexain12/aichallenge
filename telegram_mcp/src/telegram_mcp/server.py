@@ -14,7 +14,8 @@ from telegram_mcp.telegram import TelegramGateway, TelegramToolFailure, Telethon
 
 
 _T = TypeVar("_T")
-Limit = Annotated[int, Field(ge=1, le=100)]
+ListLimit = Annotated[int, Field(ge=1, le=200)]
+ReadLimit = Annotated[int, Field(ge=1, le=100)]
 ChatName = Annotated[str, Field(min_length=1)]
 
 
@@ -46,11 +47,11 @@ def build_server(gateway: TelegramGateway) -> MCPServer:
     server = MCPServer("telegram-mcp")
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=True))
-    async def list_chats(query: str | None = None, limit: Limit = 20) -> ChatListResult:
+    async def list_chats(query: str | None = None, limit: ListLimit = 100) -> ChatListResult:
         return await _safe_call(gateway.list_chats(query, limit))
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=True))
-    async def read_chat(chat: ChatName, limit: Limit = 20) -> ReadChatResult:
+    async def read_chat(chat: ChatName, limit: ReadLimit = 20) -> ReadChatResult:
         return await _safe_call(gateway.read_chat(chat, limit))
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=False))

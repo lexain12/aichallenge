@@ -72,7 +72,8 @@ async def test_server_exposes_exactly_three_tools_with_expected_schemas(fake_gat
 
     assert set(tools["list_chats"].input_schema["properties"]) == {"query", "limit"}
     assert tools["list_chats"].input_schema["properties"]["limit"]["minimum"] == 1
-    assert tools["list_chats"].input_schema["properties"]["limit"]["maximum"] == 100
+    assert tools["list_chats"].input_schema["properties"]["limit"]["maximum"] == 200
+    assert tools["list_chats"].input_schema["properties"]["limit"]["default"] == 100
     assert set(tools["read_chat"].input_schema["properties"]) == {"chat", "limit"}
     assert tools["read_chat"].input_schema["properties"]["limit"]["minimum"] == 1
     assert tools["read_chat"].input_schema["properties"]["limit"]["maximum"] == 100
@@ -89,7 +90,7 @@ async def test_successful_tools_return_typed_structured_results(fake_gateway) ->
         sent = await client.call_tool("send_message", {"chat": "me", "text": "hello"})
 
     assert fake_gateway.calls == [
-        ("list_chats", "saved", 20),
+        ("list_chats", "saved", 100),
         ("read_chat", "me", 1),
         ("send_message", "me", "hello"),
     ]
@@ -105,9 +106,17 @@ async def test_successful_tools_return_typed_structured_results(fake_gateway) ->
     }
 
 
+async def test_list_chats_accepts_150_and_passes_it_to_gateway(fake_gateway) -> None:
+    async with Client(build_server(fake_gateway)) as client:
+        result = await client.call_tool("list_chats", {"limit": 150})
+
+    assert result.is_error is False
+    assert fake_gateway.calls == [("list_chats", None, 150)]
+
+
 @pytest.mark.parametrize("tool,args", [
     ("list_chats", {"limit": 0}),
-    ("list_chats", {"limit": 101}),
+    ("list_chats", {"limit": 201}),
     ("read_chat", {"chat": "me", "limit": 0}),
     ("read_chat", {"chat": "me", "limit": 101}),
     ("read_chat", {"chat": ""}),
