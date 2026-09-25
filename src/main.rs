@@ -190,8 +190,9 @@ async fn run() -> Result<(), AppError> {
                     != deepseek_cli::workflow_engine::AutonomyStopReason::AwaitUserAfterRestart
             }),
             Err(
-                error
-                @ (AgentError::Store(_) | AgentError::Workflow(WorkflowEngineError::Store(_))),
+                error @ (AgentError::Store(_)
+                | AgentError::ToolAudit(_)
+                | AgentError::Workflow(WorkflowEngineError::Store(_))),
             ) => return Err(error.into()),
             Err(_) => true,
         };
@@ -708,7 +709,9 @@ async fn run_prompt<W: io::Write, E: io::Write>(
         Ok(_) => Ok(()),
         // Stop on persistence errors: never continue an unsaved session silently.
         Err(
-            error @ (AgentError::Store(_) | AgentError::Workflow(WorkflowEngineError::Store(_))),
+            error @ (AgentError::Store(_)
+            | AgentError::ToolAudit(_)
+            | AgentError::Workflow(WorkflowEngineError::Store(_))),
         ) => Err(error.into()),
         Err(error) => {
             stderr_ui.write_block(
@@ -777,6 +780,9 @@ impl AppError {
         match self {
             Self::Mcp(McpRegistryError::InvalidToolName(_)) => {
                 "MCP server advertised an invalid tool name".to_owned()
+            }
+            Self::Mcp(McpRegistryError::NameCollision(_)) => {
+                "MCP tool catalog contains a name collision".to_owned()
             }
             Self::Agent(error) => error.operator_message(),
             Self::Client(error) => error.operator_message("chat"),

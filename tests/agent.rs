@@ -572,9 +572,83 @@ async fn tool_cancellation_does_not_commit_an_answer_or_repeat_a_dispatched_writ
             );
             let audit = store.tool_executions(agent.dialog_id().unwrap()).unwrap();
             assert_eq!(audit.len(), 1);
-            assert_eq!(audit[0].status, ToolExecutionStatus::Started);
+            assert_eq!(audit[0].status, ToolExecutionStatus::Uncertain);
+            assert_eq!(
+                audit[0].error_code.as_ref().unwrap().as_str(),
+                "delivery_unknown"
+            );
         }
     }
+}
+
+#[tokio::test]
+async fn tool_read_cancellation_is_audited_failed() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [tool_response(&[("read", "telegram__read_chat", "{}")])],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("tools.sqlite3");
+    let mut executor = FakeToolExecutor::success();
+    executor.hang = true;
+    let executor = Arc::new(executor);
+    let mut agent = Agent::with_store(&config(&server), DialogStore::open(&db).unwrap())
+        .unwrap()
+        .with_tool_executor(executor.clone());
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            agent.run_with_prompt("read")
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(executor.calls.lock().unwrap().len(), 1);
+    let audit = DialogStore::open(&db)
+        .unwrap()
+        .tool_executions(agent.dialog_id().unwrap())
+        .unwrap();
+    assert_eq!(audit[0].status, ToolExecutionStatus::Failed);
+    assert_eq!(audit[0].error_code.as_ref().unwrap().as_str(), "cancelled");
+}
+
+#[tokio::test]
+async fn tool_cancellation_cleanup_database_error_does_not_panic() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [tool_response(&[("write", "telegram__read_chat", "{}")])],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("tools.sqlite3");
+    let store = DialogStore::open(&db).unwrap();
+    rusqlite::Connection::open(&db).unwrap().execute_batch(
+        "CREATE TRIGGER fail_audit_cleanup BEFORE UPDATE ON tool_executions BEGIN SELECT RAISE(ABORT, 'SECRET_CLEANUP_FAILURE'); END;"
+    ).unwrap();
+    let mut executor = FakeToolExecutor::new(false, Err(ToolExecutionError::Timeout));
+    executor.hang = true;
+    let executor = Arc::new(executor);
+    let mut agent = Agent::with_store(&config(&server), store)
+        .unwrap()
+        .with_tool_executor(executor.clone());
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            agent.run_with_prompt("send")
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(executor.calls.lock().unwrap().len(), 1);
+    assert_eq!(agent.history().messages().len(), 1);
+    let store = DialogStore::open(&db).unwrap();
+    assert_eq!(
+        store.tool_executions(agent.dialog_id().unwrap()).unwrap()[0].status,
+        ToolExecutionStatus::Started
+    );
 }
 
 #[tokio::test]

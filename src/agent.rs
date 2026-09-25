@@ -75,6 +75,49 @@ struct DebugActiveProfile {
     updated_at: Option<String>,
 }
 
+/// Finalize a dispatched call even when its owning async turn is dropped.
+/// Keep the store borrowed so cleanup is synchronous and cannot outlive it.
+struct ToolAuditGuard<'a> {
+    store: &'a mut DialogStore,
+    id: i64,
+    cancellation: Option<ToolExecutionFinish>,
+}
+
+impl<'a> ToolAuditGuard<'a> {
+    fn start(
+        store: &'a mut DialogStore,
+        start: ToolExecutionStart<'_>,
+        read_only: bool,
+    ) -> Result<Self, ToolAuditError> {
+        let cancellation = if read_only {
+            ToolExecutionFinish::failed(ToolExecutionErrorCode::new("cancelled")?)
+        } else {
+            ToolExecutionFinish::uncertain(ToolExecutionErrorCode::new("delivery_unknown")?)
+        };
+        let id = store.start_tool_execution(start)?;
+        Ok(Self {
+            store,
+            id,
+            cancellation: Some(cancellation),
+        })
+    }
+
+    fn finish(&mut self, finish: ToolExecutionFinish) -> Result<(), ToolAuditError> {
+        self.store.finish_tool_execution(self.id, finish)?;
+        self.cancellation = None;
+        Ok(())
+    }
+}
+
+impl Drop for ToolAuditGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(finish) = self.cancellation.take() {
+            // Drop has no error channel: never panic or log database/remote data.
+            let _ = self.store.finish_tool_execution(self.id, finish);
+        }
+    }
+}
+
 /// An API client and its independent conversation, optionally backed by SQLite.
 pub struct Agent {
     client: DeepSeekClient,
@@ -793,23 +836,28 @@ impl Agent {
                 name: &call.name,
             },
         )?;
-        let audit_id = if let (Some(store), Some(input_message_id), Some(dialog_id)) =
+        let read_only = executor.is_read_only(&call.name) == Some(true);
+        let mut audit = if let (Some(store), Some(input_message_id), Some(dialog_id)) =
             (self.store.as_mut(), input_message_id, self.dialog_id)
         {
             let (server_name, tool_name) = call.name.split_once("__").unwrap_or(("", &call.name));
-            Some(store.start_tool_execution(ToolExecutionStart {
-                dialog_id,
-                input_message_id,
-                tool_call_id: &call.id,
-                server_name,
-                tool_name,
-                arguments_json: &call.arguments,
-            })?)
+            Some(ToolAuditGuard::start(
+                store,
+                ToolExecutionStart {
+                    dialog_id,
+                    input_message_id,
+                    tool_call_id: &call.id,
+                    server_name,
+                    tool_name,
+                    arguments_json: &call.arguments,
+                },
+                read_only,
+            )?)
         } else {
             None
         };
         let result = executor.call(call).await;
-        let uncertain = executor.is_read_only(&call.name) != Some(true)
+        let uncertain = !read_only
             && (matches!(
                 result,
                 Err(ToolExecutionError::Timeout | ToolExecutionError::Transport)
@@ -848,8 +896,8 @@ impl Agent {
                 ToolExecutionFinish::succeeded(),
             ),
         };
-        if let (Some(store), Some(audit_id)) = (self.store.as_mut(), audit_id) {
-            store.finish_tool_execution(audit_id, finish)?;
+        if let Some(audit) = audit.as_mut() {
+            audit.finish(finish)?;
         }
         emit_event(
             on_event,

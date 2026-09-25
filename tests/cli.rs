@@ -374,6 +374,113 @@ async fn mcp_invalid_remote_tool_name_is_not_printed() {
 }
 
 #[tokio::test]
+async fn mcp_duplicate_remote_tool_name_is_not_printed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/mcp")).respond_with(|request: &Request| {
+        let body: Value = request.body_json().unwrap();
+        let result = match body["method"].as_str().unwrap() {
+            "initialize" => json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"test","version":"1"}}),
+            "notifications/initialized" => return ResponseTemplate::new(202),
+            "tools/list" => json!({"tools":[
+                {"name":"SECRET_REMOTE_TOKEN","inputSchema":{"type":"object"}},
+                {"name":"SECRET_REMOTE_TOKEN","inputSchema":{"type":"object"}}
+            ]}),
+            other => panic!("unexpected MCP method: {other}"),
+        };
+        ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+    }).mount(&server).await;
+    let mut config = write_config(&server.uri());
+    writeln!(
+        config,
+        "\n[mcp]\nconnect_timeout_seconds=2\n[[mcp.servers]]\nname='telegram'\nurl='{}/mcp'",
+        server.uri()
+    )
+    .unwrap();
+    let output = run_cli(config.path(), "/exit\n");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("SECRET"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET"));
+    assert!(stderr.contains("MCP"), "{stderr}");
+}
+
+#[tokio::test]
+async fn mcp_tool_audit_persistence_failure_is_fatal_and_sanitized() {
+    for finalization in [true, false] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/mcp")).respond_with(|request: &Request| {
+            let body: Value = request.body_json().unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"test","version":"1"}}),
+                "notifications/initialized" => return ResponseTemplate::new(202),
+                "tools/list" => json!({"tools":[{"name":"send","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":false}}]}),
+                "tools/call" => json!({"content":[{"type":"text","text":"sent"}]}),
+                other => panic!("unexpected MCP method: {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+        }).mount(&server).await;
+        let tool_turn = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write_1","type":"function","function":{"name":"telegram__send","arguments":"{}"}}]},"finish_reason":"tool_calls"}]});
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {tool_turn}\n\ndata: [DONE]\n\n")),
+            )
+            .mount(&server)
+            .await;
+        let mut config = write_config(&server.uri());
+        writeln!(
+            config,
+            "\n[mcp]\nconnect_timeout_seconds=2\n[[mcp.servers]]\nname='telegram'\nurl='{}/mcp'",
+            server.uri()
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("tools.sqlite3");
+        drop(DialogStore::open(&db).unwrap());
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(if finalization {
+            "CREATE TRIGGER fail_audit BEFORE UPDATE ON tool_executions BEGIN SELECT RAISE(ABORT, 'SECRET_AUDIT_FAILURE'); END;"
+        } else {
+            "CREATE TRIGGER fail_audit BEFORE INSERT ON tool_executions BEGIN SELECT RAISE(ABORT, 'SECRET_AUDIT_FAILURE'); END;"
+        }).unwrap();
+        let output = run_cli_args(config.path(), &db, &[], "first\nsecond\n/exit\n");
+        assert!(
+            !output.status.success(),
+            "audit failure must terminate the CLI"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("tool audit failed"), "{stderr}");
+        assert!(!stderr.contains("SECRET"), "{stderr}");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path() == "/chat/completions")
+                .count(),
+            1,
+            "must not accept the second prompt"
+        );
+        let calls = requests
+            .iter()
+            .filter(|r| r.body_json::<Value>().unwrap()["method"] == "tools/call")
+            .count();
+        assert_eq!(
+            calls,
+            usize::from(finalization),
+            "finalization fails only after one real dispatch; start failure prevents dispatch"
+        );
+        let user_inputs: i64 = conn
+            .query_row("SELECT count(*) FROM messages WHERE role='user'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(user_inputs, 1);
+    }
+}
+
+#[tokio::test]
 async fn mcp_registry_is_connected_once_and_injected_into_new_and_resumed_agents() {
     for resumed in [false, true] {
         let server = MockServer::start().await;
