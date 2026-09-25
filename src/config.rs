@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -25,6 +26,9 @@ const DEFAULT_HANDOFF_MAX_TOKENS: u32 = 2048;
 const DEFAULT_MIN_CONFIDENCE: f32 = 0.80;
 const DEFAULT_MAX_AUTONOMOUS_TURNS: u32 = 8;
 const DEFAULT_MAX_AUTONOMOUS_TOKENS: u64 = 20_000;
+const DEFAULT_MCP_CONNECT_TIMEOUT_SECONDS: u64 = 10;
+const DEFAULT_MCP_CALL_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_MCP_MAX_TOOL_ROUNDS: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +83,23 @@ struct RawWorkflowConfig {
     max_autonomous_tokens: Option<u64>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawMcpConfig {
+    connect_timeout_seconds: Option<u64>,
+    call_timeout_seconds: Option<u64>,
+    max_tool_rounds: Option<u32>,
+    #[serde(default)]
+    servers: Vec<RawMcpServerConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcpServerConfig {
+    name: String,
+    url: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawInvariantConfig {
@@ -106,6 +127,8 @@ struct RawConfig {
     debug: RawDebugConfig,
     #[serde(default)]
     workflow: RawWorkflowConfig,
+    #[serde(default)]
+    mcp: RawMcpConfig,
     #[serde(default)]
     invariants: Vec<RawInvariantConfig>,
 }
@@ -179,6 +202,95 @@ pub struct WorkflowConfig {
     min_confidence: f32,
     max_autonomous_turns: u32,
     max_autonomous_tokens: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpConfig {
+    pub connect_timeout: Duration,
+    pub call_timeout: Duration,
+    pub max_tool_rounds: u32,
+    pub servers: Vec<McpServerConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub url: Url,
+}
+
+impl McpConfig {
+    fn from_raw(raw: RawMcpConfig) -> Result<Self, ConfigError> {
+        let connect_timeout_seconds = raw
+            .connect_timeout_seconds
+            .unwrap_or(DEFAULT_MCP_CONNECT_TIMEOUT_SECONDS);
+        let call_timeout_seconds = raw
+            .call_timeout_seconds
+            .unwrap_or(DEFAULT_MCP_CALL_TIMEOUT_SECONDS);
+        let max_tool_rounds = raw.max_tool_rounds.unwrap_or(DEFAULT_MCP_MAX_TOOL_ROUNDS);
+
+        for (field, value) in [
+            ("mcp.connect_timeout_seconds", connect_timeout_seconds),
+            ("mcp.call_timeout_seconds", call_timeout_seconds),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::InvalidField {
+                    field,
+                    reason: "must be greater than zero",
+                });
+            }
+        }
+        if max_tool_rounds == 0 {
+            return Err(ConfigError::InvalidField {
+                field: "mcp.max_tool_rounds",
+                reason: "must be greater than zero",
+            });
+        }
+
+        let mut names = HashSet::new();
+        let mut servers = Vec::with_capacity(raw.servers.len());
+        for server in raw.servers {
+            if server.name.is_empty()
+                || server.name.len() > 64
+                || server.name.contains("__")
+                || !server
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Err(ConfigError::InvalidField {
+                    field: "mcp.servers.name",
+                    reason: "must contain 1..64 ASCII letters, digits, hyphens or single underscores",
+                });
+            }
+            if !names.insert(server.name.clone()) {
+                return Err(ConfigError::InvalidField {
+                    field: "mcp.servers.name",
+                    reason: "names must be unique",
+                });
+            }
+            let url = Url::parse(&server.url).map_err(|_| ConfigError::InvalidField {
+                field: "mcp.servers.url",
+                reason: "must be a valid HTTP(S) URL",
+            })?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(ConfigError::InvalidField {
+                    field: "mcp.servers.url",
+                    reason: "must use HTTP or HTTPS",
+                });
+            }
+            servers.push(McpServerConfig {
+                name: server.name,
+                url,
+            });
+        }
+
+        Ok(Self {
+            connect_timeout: Duration::from_secs(connect_timeout_seconds),
+            call_timeout: Duration::from_secs(call_timeout_seconds),
+            max_tool_rounds,
+            servers,
+        })
+    }
 }
 
 impl WorkflowConfig {
@@ -328,6 +440,7 @@ pub struct Config {
     context: ContextConfig,
     debug: DebugConfig,
     workflow: WorkflowConfig,
+    mcp: McpConfig,
     invariants: Vec<InvariantRule>,
 }
 
@@ -470,6 +583,7 @@ impl Config {
             });
         }
         let workflow = WorkflowConfig::from_raw(raw.workflow, &model)?;
+        let mcp = McpConfig::from_raw(raw.mcp)?;
         let mut invariant_ids = HashSet::new();
         let mut invariants = Vec::with_capacity(raw.invariants.len());
         for rule in raw.invariants {
@@ -518,6 +632,7 @@ impl Config {
                 log_payloads: raw.debug.log_payloads.unwrap_or(false),
             },
             workflow,
+            mcp,
             invariants,
         })
     }
@@ -545,6 +660,10 @@ impl Config {
 
     pub fn workflow(&self) -> &WorkflowConfig {
         &self.workflow
+    }
+
+    pub fn mcp(&self) -> &McpConfig {
+        &self.mcp
     }
 
     pub fn invariants(&self) -> &[InvariantRule] {

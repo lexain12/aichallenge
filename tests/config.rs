@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 
 use deepseek_cli::config::{Config, ContextStrategy};
 use tempfile::NamedTempFile;
@@ -322,5 +323,101 @@ fn workflow_rejects_zero_limits_and_confidence_outside_zero_to_one() {
         "api_key='key'\n[context]\nstrategy='summary'\n[workflow]\nmin_confidence=1.1",
     ] {
         assert!(Config::from_toml(source, None).is_err());
+    }
+}
+
+#[test]
+fn mcp_is_optional_and_has_safe_defaults() {
+    let config = Config::from_toml("api_key='key'\n[context]\nstrategy='summary'", None)
+        .expect("legacy config loads without MCP");
+
+    assert!(config.mcp().servers.is_empty());
+    assert_eq!(config.mcp().connect_timeout, Duration::from_secs(10));
+    assert_eq!(config.mcp().call_timeout, Duration::from_secs(30));
+    assert_eq!(config.mcp().max_tool_rounds, 8);
+}
+
+#[test]
+fn mcp_reads_multiple_streamable_http_servers_and_overrides() {
+    let config = Config::from_toml(
+        r#"
+api_key = "key"
+[context]
+strategy = "summary"
+[mcp]
+connect_timeout_seconds = 3
+call_timeout_seconds = 12
+max_tool_rounds = 4
+[[mcp.servers]]
+name = "telegram"
+url = "http://127.0.0.1:8000/mcp"
+[[mcp.servers]]
+name = "search-2"
+url = "https://example.com/mcp"
+"#,
+        None,
+    )
+    .expect("valid MCP servers load");
+
+    let mcp = config.mcp();
+    assert_eq!(mcp.connect_timeout, Duration::from_secs(3));
+    assert_eq!(mcp.call_timeout, Duration::from_secs(12));
+    assert_eq!(mcp.max_tool_rounds, 4);
+    assert_eq!(mcp.servers.len(), 2);
+    assert_eq!(mcp.servers[0].name, "telegram");
+    assert_eq!(mcp.servers[0].url.as_str(), "http://127.0.0.1:8000/mcp");
+    assert_eq!(mcp.servers[1].name, "search-2");
+    assert_eq!(mcp.servers[1].url.as_str(), "https://example.com/mcp");
+}
+
+#[test]
+fn mcp_rejects_duplicate_or_invalid_server_names_without_exposing_values() {
+    for servers in [
+        "[[mcp.servers]]\nname='telegram'\nurl='https://one.example/mcp'\n[[mcp.servers]]\nname='telegram'\nurl='https://two.example/mcp'",
+        "[[mcp.servers]]\nname='bad.name'\nurl='https://example.com/mcp'",
+        "[[mcp.servers]]\nname='bad__name'\nurl='https://example.com/mcp'",
+        "[[mcp.servers]]\nname='  '\nurl='https://example.com/mcp'",
+    ] {
+        let source =
+            format!("api_key='secret-key'\n[context]\nstrategy='summary'\n[mcp]\n{servers}");
+        let error = Config::from_toml(&source, None)
+            .expect_err("unsafe server name must fail")
+            .to_string();
+        assert!(error.contains("mcp.servers.name"), "{error}");
+        assert!(!error.contains("secret-key"), "{error}");
+        assert!(!error.contains("bad.name"), "{error}");
+        assert!(!error.contains("bad__name"), "{error}");
+    }
+}
+
+#[test]
+fn mcp_rejects_zero_limits_without_exposing_values() {
+    for field in [
+        "connect_timeout_seconds",
+        "call_timeout_seconds",
+        "max_tool_rounds",
+    ] {
+        let source =
+            format!("api_key='secret-key'\n[context]\nstrategy='summary'\n[mcp]\n{field}=0");
+        let error = Config::from_toml(&source, None)
+            .expect_err("zero MCP limit must fail")
+            .to_string();
+        assert!(error.contains(field), "{error}");
+        assert!(!error.contains("secret-key"), "{error}");
+    }
+}
+
+#[test]
+fn mcp_rejects_non_http_server_urls_without_exposing_values() {
+    for url in ["not-a-url", "ftp://secret-host.example/mcp"] {
+        let source = format!(
+            "api_key='secret-key'\n[context]\nstrategy='summary'\n[[mcp.servers]]\nname='telegram'\nurl='{url}'"
+        );
+        let error = Config::from_toml(&source, None)
+            .expect_err("non-HTTP MCP URL must fail")
+            .to_string();
+        assert!(error.contains("mcp.servers.url"), "{error}");
+        assert!(!error.contains("secret-key"), "{error}");
+        assert!(!error.contains("secret-host"), "{error}");
     }
 }

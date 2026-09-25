@@ -31,6 +31,15 @@ min_confidence = 0.80
 max_autonomous_turns = 8
 max_autonomous_tokens = 20000
 
+# Optional Streamable HTTP MCP servers. Leave commented to start without tools.
+# [mcp]
+# connect_timeout_seconds = 10
+# call_timeout_seconds = 30
+# max_tool_rounds = 8
+# [[mcp.servers]]
+# name = "telegram"
+# url = "http://127.0.0.1:8000/mcp"
+
 # These rules apply to every user and task opened with this config. They are
 # read-only in the CLI; /invariant add manages additional task-scoped rules.
 # [[invariants]]
