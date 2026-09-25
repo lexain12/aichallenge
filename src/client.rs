@@ -82,6 +82,12 @@ impl DeepSeekClient {
             Ok(())
         })
         .await
+        .and_then(|turn| match &turn {
+            AssistantTurn::FinalText { content, .. } if content.trim().is_empty() => {
+                Err(ClientError::EmptyAnswer)
+            }
+            _ => Ok(turn),
+        })
         .map_err(|source| match usage {
             Some(usage) => ClientError::WithUsage {
                 source: Box::new(source),

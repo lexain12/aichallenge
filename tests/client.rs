@@ -179,6 +179,31 @@ async fn reassembles_fragmented_tool_calls_by_index() {
 }
 
 #[tokio::test]
+async fn tool_turn_rejects_done_only_final_text_without_usage() {
+    let (_server, client) = tool_client("data: [DONE]\n\n".into()).await;
+    let error = client
+        .stream_assistant_turn(&[], &tool_definitions())
+        .await
+        .expect_err("a completed turn needs final text or tool calls");
+    assert!(matches!(error, ClientError::EmptyAnswer));
+    assert_eq!(error.usage(), None);
+}
+
+#[tokio::test]
+async fn tool_turn_rejects_whitespace_final_text_with_observed_usage() {
+    let (_server, client) = tool_client(tool_sse(vec![json!({"content":" \n\t "})], true)).await;
+    let error = client
+        .stream_assistant_turn(&[], &tool_definitions())
+        .await
+        .expect_err("whitespace is not a final answer");
+    assert_eq!(error.usage().unwrap().total_tokens, 5);
+    let ClientError::WithUsage { source, .. } = error else {
+        panic!("observed usage must be retained");
+    };
+    assert!(matches!(*source, ClientError::EmptyAnswer));
+}
+
+#[tokio::test]
 async fn tool_turn_retains_assistant_text_and_omits_empty_tools() {
     let (_server, client) = tool_client(tool_sse(vec![json!({"content":"Checking.","tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{}"}}]})], true)).await;
     assert!(
