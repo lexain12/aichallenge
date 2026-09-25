@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::chat::{ChatHistory, Message, Role};
+use crate::chat::{ChatHistory, Message, ProviderMessage, Role};
 use crate::client::{ClientError, DeepSeekClient, StreamEvent, TokenUsage};
 use crate::config::{Config, ContextConfig, ContextStrategy, WorkflowConfig};
 use crate::context::{
@@ -20,6 +20,14 @@ use crate::memory::{
 };
 use crate::profile::{ProfileRepository, UserProfile};
 use crate::system_context::{CompactionPolicy, ContextScope, SystemBlock, SystemBlockMetadata};
+use crate::tool_audit::{
+    ToolAuditError, ToolExecutionErrorCode, ToolExecutionFinish, ToolExecutionStart,
+    ToolExecutionStatus,
+};
+use crate::tool_calling::{
+    ConversationStep, ModelToolCall, ToolConversation, ToolExecutionError, ToolExecutor,
+    ToolLoopError, ToolResultMessage,
+};
 use crate::workflow::{TaskPhase, TaskStatus, WorkflowTaskId, WorkflowTaskState};
 use crate::workflow_engine::{
     RecoveredProcessing, WorkflowEngine, WorkflowEngineError, WorkflowModels, WorkflowSession,
@@ -85,6 +93,8 @@ pub struct Agent {
     workflow_config: Option<WorkflowConfig>,
     workflow_models: Option<WorkflowModels>,
     requires_invariant_store: bool,
+    tool_executor: Option<Arc<dyn ToolExecutor>>,
+    max_tool_rounds: usize,
 }
 
 impl Agent {
@@ -242,6 +252,8 @@ impl Agent {
             workflow_config: Some(config.workflow().clone()),
             workflow_models: Some(workflow_models),
             requires_invariant_store: !config.invariants().is_empty(),
+            tool_executor: None,
+            max_tool_rounds: config.mcp().max_tool_rounds as usize,
         })
     }
 
@@ -264,11 +276,23 @@ impl Agent {
             workflow_config: None,
             workflow_models: None,
             requires_invariant_store: false,
+            tool_executor: None,
+            max_tool_rounds: crate::tool_calling::DEFAULT_MAX_TOOL_ROUNDS,
         }
     }
 
     pub fn with_workflow_models(mut self, models: WorkflowModels) -> Self {
         self.workflow_models = Some(models);
+        self
+    }
+
+    /// Enable tools for legacy turns; managed workflow turns keep their own pipeline.
+    pub fn with_tool_executor(self, executor: Arc<dyn ToolExecutor>) -> Self {
+        self.with_optional_tool_executor(Some(executor))
+    }
+
+    pub fn with_optional_tool_executor(mut self, executor: Option<Arc<dyn ToolExecutor>>) -> Self {
+        self.tool_executor = executor;
         self
     }
 
@@ -559,19 +583,26 @@ impl Agent {
             return Err(AgentError::EmptyPrompt);
         }
         let persistent = self.store.is_some();
+        let mut input_message_id = None;
         if let Some(store) = &mut self.store {
             match self.dialog_id {
                 Some(id) => {
-                    store.append_message(id, self.persisted_message_count, Role::User, prompt)?
+                    input_message_id = Some(store.append_message_with_id(
+                        id,
+                        self.persisted_message_count,
+                        Role::User,
+                        prompt,
+                    )?);
                 }
                 None => {
-                    let id = store.start_dialog_in_scope(
+                    let (id, message_id) = store.start_dialog_in_scope_with_message_id(
                         &self.scope,
                         self.history.system_prompt(),
                         prompt,
                     )?;
                     self.dialog_id = Some(id);
                     self.scope = self.scope.with_dialog_id(Some(id));
+                    input_message_id = Some(message_id);
                 }
             }
             self.persisted_message_count += 1;
@@ -641,21 +672,32 @@ impl Agent {
         {
             emit_event(&mut on_event, AgentEvent::DebugLogFailed { error })?;
         }
-        let mut usage = None;
-        let result = self
-            .client
-            .stream_chat_events(prepared.messages(), |event| {
-                if let StreamEvent::Usage(value) = &event {
-                    usage = Some(*value);
-                }
-                match event {
-                    StreamEvent::Text(text) => on_event(AgentEvent::Text(text)),
-                    StreamEvent::Usage(value) => on_event(AgentEvent::Usage(value)),
-                }
-            })
-            .await;
-        self.last_usage = usage;
-        let answer = result?;
+        let answer = if let Some(executor) = self.tool_executor.clone() {
+            self.run_tool_conversation(
+                prepared.messages(),
+                input_message_id,
+                executor.as_ref(),
+                &mut on_event,
+            )
+            .await?
+        } else {
+            let mut usage = None;
+            let result = self
+                .client
+                .stream_chat_events(prepared.messages(), |event| {
+                    if let StreamEvent::Usage(value) = &event {
+                        usage = Some(*value);
+                    }
+                    match event {
+                        StreamEvent::Text(text) => on_event(AgentEvent::Text(text)),
+                        StreamEvent::Usage(value) => on_event(AgentEvent::Usage(value)),
+                    }
+                })
+                .await;
+            self.last_usage = usage;
+            result?
+        };
+        let usage = self.last_usage;
         if answer.trim().is_empty() {
             return Err(ClientError::EmptyAnswer.into());
         }
@@ -677,6 +719,154 @@ impl Agent {
         self.maybe_compact(&additional_blocks, usage, &mut on_event)
             .await?;
         Ok(answer)
+    }
+
+    async fn run_tool_conversation<F>(
+        &mut self,
+        messages: &[Message],
+        input_message_id: Option<i64>,
+        executor: &dyn ToolExecutor,
+        on_event: &mut F,
+    ) -> Result<String, AgentError>
+    where
+        F: FnMut(AgentEvent<'_>) -> io::Result<()>,
+    {
+        let mut conversation = ToolConversation::new(
+            messages.iter().map(ProviderMessage::from).collect(),
+            executor.definitions().to_vec(),
+            self.max_tool_rounds,
+        );
+        loop {
+            let turn = self
+                .client
+                .stream_assistant_turn(conversation.messages(), conversation.definitions())
+                .await;
+            let usage = match &turn {
+                Ok(
+                    crate::client::AssistantTurn::FinalText { usage, .. }
+                    | crate::client::AssistantTurn::ToolCalls { usage, .. },
+                ) => *usage,
+                Err(error) => error.usage(),
+            };
+            if let Some(usage) = usage {
+                self.last_usage = Some(add_tool_usage(self.last_usage.unwrap_or_default(), usage));
+                emit_event(on_event, AgentEvent::Usage(self.last_usage.unwrap()))?;
+            }
+            match conversation.accept_assistant_turn(turn?)? {
+                ConversationStep::Complete { content, .. } => {
+                    emit_event(on_event, AgentEvent::Text(&content))?;
+                    return Ok(content);
+                }
+                ConversationStep::Execute {
+                    assistant_message,
+                    calls,
+                    ..
+                } => {
+                    let mut results = Vec::with_capacity(calls.len());
+                    for call in calls {
+                        results.push(
+                            self.execute_tool(&call, input_message_id, executor, on_event)
+                                .await?,
+                        );
+                    }
+                    conversation.accept_tool_results(assistant_message, results)?;
+                }
+            }
+        }
+    }
+
+    async fn execute_tool<F>(
+        &mut self,
+        call: &ModelToolCall,
+        input_message_id: Option<i64>,
+        executor: &dyn ToolExecutor,
+        on_event: &mut F,
+    ) -> Result<ToolResultMessage, AgentError>
+    where
+        F: FnMut(AgentEvent<'_>) -> io::Result<()>,
+    {
+        // A failed output callback must stop before dispatching another tool.
+        emit_event(
+            on_event,
+            AgentEvent::ToolStarted {
+                call_id: &call.id,
+                name: &call.name,
+            },
+        )?;
+        let audit_id = if let (Some(store), Some(input_message_id), Some(dialog_id)) =
+            (self.store.as_mut(), input_message_id, self.dialog_id)
+        {
+            let (server_name, tool_name) = call.name.split_once("__").unwrap_or(("", &call.name));
+            Some(store.start_tool_execution(ToolExecutionStart {
+                dialog_id,
+                input_message_id,
+                tool_call_id: &call.id,
+                server_name,
+                tool_name,
+                arguments_json: &call.arguments,
+            })?)
+        } else {
+            None
+        };
+        let result = executor.call(call).await;
+        let uncertain = executor.is_read_only(&call.name) != Some(true)
+            && (matches!(
+                result,
+                Err(ToolExecutionError::Timeout | ToolExecutionError::Transport)
+            ) || result
+                .as_ref()
+                .is_ok_and(|output| output.delivery_uncertain));
+        let code = if uncertain {
+            Some("delivery_unknown")
+        } else {
+            match &result {
+                Err(ToolExecutionError::UnknownTool) => Some("unknown_tool"),
+                Err(ToolExecutionError::InvalidArguments) => Some("invalid_arguments"),
+                Err(ToolExecutionError::Timeout) => Some("timeout"),
+                Err(ToolExecutionError::Transport) => Some("transport"),
+                Ok(output) if output.is_error || output.delivery_uncertain => {
+                    Some(match output.error_code.as_deref() {
+                        Some("unsupported_content") => "unsupported_content",
+                        Some("mcp_tool_error") => "mcp_tool_error",
+                        _ => "tool_error",
+                    })
+                }
+                Ok(_) => None,
+            }
+        };
+        let (status, finish) = match code {
+            Some(code) if uncertain => (
+                ToolExecutionStatus::Uncertain,
+                ToolExecutionFinish::uncertain(ToolExecutionErrorCode::new(code)?),
+            ),
+            Some(code) => (
+                ToolExecutionStatus::Failed,
+                ToolExecutionFinish::failed(ToolExecutionErrorCode::new(code)?),
+            ),
+            None => (
+                ToolExecutionStatus::Succeeded,
+                ToolExecutionFinish::succeeded(),
+            ),
+        };
+        if let (Some(store), Some(audit_id)) = (self.store.as_mut(), audit_id) {
+            store.finish_tool_execution(audit_id, finish)?;
+        }
+        emit_event(
+            on_event,
+            AgentEvent::ToolFinished {
+                call_id: &call.id,
+                name: &call.name,
+                status,
+                code,
+            },
+        )?;
+        Ok(match (code, result) {
+            (Some(code), _) => {
+                ToolResultMessage::error(&call.id, serde_json::json!({"error":code}).to_string())
+            }
+            (None, Ok(output)) => ToolResultMessage::success(&call.id, output.content),
+            (None, Err(_)) => unreachable!("executor errors always have a safe code"),
+        })
     }
 
     pub fn history(&self) -> &ChatHistory {
@@ -1063,7 +1253,41 @@ where
     Ok(())
 }
 
+fn add_tool_usage(mut total: TokenUsage, incoming: TokenUsage) -> TokenUsage {
+    total.prompt_tokens = total.prompt_tokens.saturating_add(incoming.prompt_tokens);
+    total.completion_tokens = total
+        .completion_tokens
+        .saturating_add(incoming.completion_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(incoming.total_tokens);
+    let prior = total
+        .completion_tokens_details
+        .and_then(|details| details.reasoning_tokens);
+    let next = incoming
+        .completion_tokens_details
+        .and_then(|details| details.reasoning_tokens);
+    if prior.is_some() || next.is_some() {
+        total.completion_tokens_details = Some(crate::client::CompletionTokenDetails {
+            reasoning_tokens: Some(
+                prior
+                    .unwrap_or_default()
+                    .saturating_add(next.unwrap_or_default()),
+            ),
+        });
+    }
+    total
+}
+
 pub enum AgentEvent<'a> {
+    ToolStarted {
+        call_id: &'a str,
+        name: &'a str,
+    },
+    ToolFinished {
+        call_id: &'a str,
+        name: &'a str,
+        status: ToolExecutionStatus,
+        code: Option<&'a str>,
+    },
     Workflow(crate::workflow_engine::WorkflowTurnEvent),
     Text(&'a str),
     Usage(TokenUsage),
@@ -1097,6 +1321,10 @@ pub enum AgentEvent<'a> {
 
 #[derive(Debug, Error)]
 pub enum AgentError {
+    #[error("tool conversation failed")]
+    ToolLoop(#[from] ToolLoopError),
+    #[error("tool audit failed")]
+    ToolAudit(#[from] ToolAuditError),
     #[error("workflow requires enabled configuration and a persistent store")]
     WorkflowUnavailable,
     #[error(transparent)]

@@ -10,6 +10,11 @@ use deepseek_cli::dialog::DialogStore;
 use deepseek_cli::invariants::InvariantRepository;
 use deepseek_cli::memory::{DurableMemoryScope, RequestScope};
 use deepseek_cli::profile::ProfileRepository;
+use deepseek_cli::tool_audit::ToolExecutionStatus;
+use deepseek_cli::tool_calling::{
+    ModelToolCall, ModelToolDefinition, ToolExecutionError, ToolExecutionResult, ToolExecutor,
+    ToolFuture,
+};
 use deepseek_cli::workflow::{TaskPhase, TaskStatus};
 use deepseek_cli::workflow_engine::{
     AutonomyStopReason, WorkflowEngineError, WorkflowModels, WorkflowTurnEvent,
@@ -32,6 +37,574 @@ fn config(server: &MockServer) -> Config {
     )
     .unwrap();
     Config::load(file.path(), None).unwrap()
+}
+
+struct FakeToolExecutor {
+    definitions: Vec<ModelToolDefinition>,
+    calls: Mutex<Vec<ModelToolCall>>,
+    result: Result<ToolExecutionResult, ToolExecutionError>,
+    hang: bool,
+    audit_db: Option<std::path::PathBuf>,
+}
+
+impl FakeToolExecutor {
+    fn new(read_only: bool, result: Result<ToolExecutionResult, ToolExecutionError>) -> Self {
+        Self {
+            definitions: vec![ModelToolDefinition {
+                name: "telegram__read_chat".into(),
+                description: None,
+                parameters: serde_json::from_value(json!({"type":"object"})).unwrap(),
+                read_only,
+            }],
+            calls: Mutex::new(vec![]),
+            result,
+            hang: false,
+            audit_db: None,
+        }
+    }
+    fn success() -> Self {
+        Self::new(
+            true,
+            Ok(ToolExecutionResult {
+                content: "SECRET_RESULT".into(),
+                is_error: false,
+                error_code: None,
+                delivery_uncertain: false,
+            }),
+        )
+    }
+}
+
+impl ToolExecutor for FakeToolExecutor {
+    fn definitions(&self) -> &[ModelToolDefinition] {
+        &self.definitions
+    }
+    fn is_read_only(&self, name: &str) -> Option<bool> {
+        self.definitions
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.read_only)
+    }
+    fn call<'a>(&'a self, call: &'a ModelToolCall) -> ToolFuture<'a> {
+        Box::pin(async move {
+            if let Some(db) = &self.audit_db {
+                let status: String = rusqlite::Connection::open(db)
+                    .unwrap()
+                    .query_row(
+                        "SELECT status FROM tool_executions WHERE tool_call_id=?1",
+                        [&call.id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(status, "started", "audit must commit before dispatch");
+            }
+            self.calls.lock().unwrap().push(call.clone());
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            self.result.clone()
+        })
+    }
+}
+
+fn tool_response(calls: &[(&str, &str, &str)]) -> ResponseTemplate {
+    let calls: Vec<_> = calls.iter().enumerate().map(|(index, (id, name, arguments))| json!({"index":index,"id":id,"type":"function","function":{"name":name,"arguments":arguments}})).collect();
+    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string(format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}})))
+}
+
+#[tokio::test]
+async fn legacy_agent_tool_executes_then_persists_only_final_text() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            tool_response(&[("call_1", "telegram__read_chat", r#"{"chat":"SECRET_ARG"}"#)]),
+            sse("Done", 7, 2, 9),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("tools.sqlite3");
+    let mut executor = FakeToolExecutor::success();
+    executor.audit_db = Some(db.clone());
+    let executor = Arc::new(executor);
+    let mut agent = Agent::with_store(&config(&server), DialogStore::open(&db).unwrap())
+        .unwrap()
+        .with_tool_executor(executor.clone());
+    let mut events = vec![];
+    let answer = agent
+        .run_streaming("read saved messages", |event| {
+            match event {
+                AgentEvent::ToolStarted { call_id, name } => {
+                    events.push(format!("{call_id}:{name}:started"))
+                }
+                AgentEvent::ToolFinished {
+                    call_id,
+                    name,
+                    status,
+                    code,
+                } => events.push(format!("{call_id}:{name}:{status:?}:{code:?}")),
+                _ => {}
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(answer, "Done");
+    assert_eq!(executor.calls.lock().unwrap().len(), 1);
+    assert_eq!(agent.last_usage().unwrap().total_tokens, 14);
+    let store = DialogStore::open(&db).unwrap();
+    let saved = store.load(agent.dialog_id().unwrap()).unwrap();
+    assert_eq!(saved.messages.len(), 2);
+    assert_eq!(saved.messages[1].content(), "Done");
+    assert_eq!(saved.messages[1].usage().unwrap().total_tokens, 14);
+    let audit = store.tool_executions(saved.id).unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].status, ToolExecutionStatus::Succeeded);
+    assert_eq!(audit[0].tool_name, "read_chat");
+    let input_id: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT id FROM messages WHERE role='user'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(audit[0].input_message_id, input_id);
+    assert_eq!(
+        events,
+        [
+            "call_1:telegram__read_chat:started",
+            "call_1:telegram__read_chat:Succeeded:None"
+        ]
+    );
+    let requests = server.received_requests().await.unwrap();
+    let next: Value = requests[1].body_json().unwrap();
+    assert_eq!(next["messages"][2]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(
+        next["messages"][3],
+        json!({"role":"tool","tool_call_id":"call_1","content":"SECRET_RESULT"})
+    );
+}
+
+#[tokio::test]
+async fn tool_timed_out_write_is_not_retried_and_is_audited_uncertain() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            tool_response(&[("write_1", "telegram__read_chat", "{}")]),
+            sse("Delivery unknown", 2, 1, 3),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("tools.sqlite3");
+    let executor = Arc::new(FakeToolExecutor::new(
+        false,
+        Err(ToolExecutionError::Timeout),
+    ));
+    let mut agent = Agent::with_store(&config(&server), DialogStore::open(&db).unwrap())
+        .unwrap()
+        .with_tool_executor(executor.clone());
+    assert_eq!(
+        agent.run_with_prompt("send").await.unwrap(),
+        "Delivery unknown"
+    );
+    assert_eq!(executor.calls.lock().unwrap().len(), 1);
+    let audit = DialogStore::open(&db)
+        .unwrap()
+        .tool_executions(agent.dialog_id().unwrap())
+        .unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].status, ToolExecutionStatus::Uncertain);
+    assert_eq!(
+        audit[0].error_code.as_ref().unwrap().as_str(),
+        "delivery_unknown"
+    );
+    let requests = server.received_requests().await.unwrap();
+    let next: Value = requests[1].body_json().unwrap();
+    assert!(
+        next["messages"][3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("delivery_unknown")
+    );
+}
+
+#[tokio::test]
+async fn tool_round_limit_uses_config_and_stops_before_second_execution() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            tool_response(&[("c1", "telegram__read_chat", "{}")]),
+            tool_response(&[("c2", "telegram__read_chat", "{}")]),
+            sse("wrong", 1, 1, 2),
+        ],
+    )
+    .await;
+    let config = Config::from_toml(&format!("api_key='key'\nbase_url='{}'\n[workflow]\nenabled=false\n[context]\nstrategy='summary'\n[mcp]\nmax_tool_rounds=1", server.uri()), None).unwrap();
+    let executor = Arc::new(FakeToolExecutor::success());
+    let mut agent = Agent::new(&config)
+        .unwrap()
+        .with_tool_executor(executor.clone());
+    assert!(matches!(
+        agent.run_with_prompt("test").await,
+        Err(AgentError::ToolLoop(
+            deepseek_cli::tool_calling::ToolLoopError::RoundLimitExceeded
+        ))
+    ));
+    assert_eq!(executor.calls.lock().unwrap().len(), 1);
+    assert!(agent.history().messages().is_empty());
+    assert_eq!(agent.last_usage().unwrap().total_tokens, 10);
+}
+
+#[tokio::test]
+async fn tool_errors_are_safe_audited_and_returned_to_the_model() {
+    for (read_only, result, status, code) in [
+        (
+            true,
+            Err(ToolExecutionError::Timeout),
+            ToolExecutionStatus::Failed,
+            "timeout",
+        ),
+        (
+            true,
+            Err(ToolExecutionError::Transport),
+            ToolExecutionStatus::Failed,
+            "transport",
+        ),
+        (
+            false,
+            Err(ToolExecutionError::Transport),
+            ToolExecutionStatus::Uncertain,
+            "delivery_unknown",
+        ),
+        (
+            true,
+            Err(ToolExecutionError::UnknownTool),
+            ToolExecutionStatus::Failed,
+            "unknown_tool",
+        ),
+        (
+            true,
+            Err(ToolExecutionError::InvalidArguments),
+            ToolExecutionStatus::Failed,
+            "invalid_arguments",
+        ),
+        (
+            true,
+            Ok(ToolExecutionResult {
+                content: "SECRET_BODY".into(),
+                is_error: true,
+                error_code: Some("SECRET_CODE".into()),
+                delivery_uncertain: false,
+            }),
+            ToolExecutionStatus::Failed,
+            "tool_error",
+        ),
+        (
+            true,
+            Ok(ToolExecutionResult {
+                content: "SECRET_BODY".into(),
+                is_error: true,
+                error_code: Some("mcp_tool_error".into()),
+                delivery_uncertain: false,
+            }),
+            ToolExecutionStatus::Failed,
+            "mcp_tool_error",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        mount_sequence(
+            &server,
+            [
+                tool_response(&[("call", "telegram__read_chat", "{}")]),
+                sse("Done", 2, 1, 3),
+            ],
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("tools.sqlite3");
+        let executor = Arc::new(FakeToolExecutor::new(read_only, result));
+        let mut agent = Agent::with_store(&config(&server), DialogStore::open(&db).unwrap())
+            .unwrap()
+            .with_tool_executor(executor.clone());
+        let mut finished = None;
+        agent
+            .run_streaming("test", |event| {
+                if let AgentEvent::ToolFinished { status, code, .. } = event {
+                    finished = Some((status, code.map(str::to_owned)));
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(finished, Some((status, Some(code.into()))));
+        assert_eq!(executor.calls.lock().unwrap().len(), 1);
+        let audit = DialogStore::open(&db)
+            .unwrap()
+            .tool_executions(agent.dialog_id().unwrap())
+            .unwrap();
+        assert_eq!(audit[0].status, status);
+        assert_eq!(audit[0].error_code.as_ref().unwrap().as_str(), code);
+        let requests = server.received_requests().await.unwrap();
+        let next: Value = requests[1].body_json().unwrap();
+        assert_eq!(
+            next["messages"][3]["content"],
+            json!({"error": code}).to_string()
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_calls_are_ordered_and_resumed_audit_uses_current_input() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            tool_response(&[
+                ("one", "telegram__read_chat", r#"{"n":1}"#),
+                ("two", "telegram__read_chat", r#"{"n":2}"#),
+            ]),
+            sse("Done", 2, 1, 3),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("tools.sqlite3");
+    let mut store = DialogStore::open(&db).unwrap();
+    let (id, old_input) = store
+        .start_dialog_with_message_id("system", "earlier")
+        .unwrap();
+    store.append_answer(id, 1, "earlier answer", None).unwrap();
+    let executor = Arc::new(FakeToolExecutor::success());
+    let mut agent = Agent::from_dialog(&config(&server), store, id)
+        .unwrap()
+        .with_tool_executor(executor.clone());
+    agent.run_with_prompt("now").await.unwrap();
+    let calls = executor.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+    assert_eq!(calls[1].arguments, r#"{"n":2}"#);
+    let store = DialogStore::open(&db).unwrap();
+    let audit = store.tool_executions(id).unwrap();
+    assert_eq!(audit.len(), 2);
+    assert_ne!(audit[0].input_message_id, old_input);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let content: String = conn
+        .query_row(
+            "SELECT content FROM messages WHERE id=?1",
+            [audit[0].input_message_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(content, "now");
+    assert_eq!(audit[0].input_message_id, audit[1].input_message_id);
+    let requests = server.received_requests().await.unwrap();
+    let next: Value = requests[1].body_json().unwrap();
+    assert_eq!(next["messages"][5]["tool_call_id"], "one");
+    assert_eq!(next["messages"][6]["tool_call_id"], "two");
+    assert_eq!(store.load(id).unwrap().messages.len(), 4);
+}
+
+#[tokio::test]
+async fn tool_unknown_and_invalid_calls_fail_closed_before_execution_or_audit() {
+    for (name, arguments) in [
+        ("SECRET_TOOL", "{}"),
+        ("telegram__read_chat", "SECRET_ARGUMENT"),
+        ("telegram__read_chat", "[]"),
+    ] {
+        let server = MockServer::start().await;
+        mount_sequence(&server, [tool_response(&[("call", name, arguments)])]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("tools.sqlite3");
+        let executor = Arc::new(FakeToolExecutor::success());
+        let mut agent = Agent::with_store(&config(&server), DialogStore::open(&db).unwrap())
+            .unwrap()
+            .with_tool_executor(executor.clone());
+        let error = agent.run_with_prompt("test").await.unwrap_err();
+        assert!(!error.to_string().contains("SECRET"));
+        assert!(!error.operator_message().contains("SECRET"));
+        assert!(executor.calls.lock().unwrap().is_empty());
+        let store = DialogStore::open(&db).unwrap();
+        assert!(
+            store
+                .tool_executions(agent.dialog_id().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .load(agent.dialog_id().unwrap())
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_output_failure_preserves_persistent_input_and_in_memory_atomicity() {
+    for persistent in [false, true] {
+        let server = MockServer::start().await;
+        mount_sequence(
+            &server,
+            [
+                tool_response(&[("call", "telegram__read_chat", "{}")]),
+                sse("Done", 2, 1, 3),
+            ],
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("tools.sqlite3");
+        let mut agent = if persistent {
+            Agent::with_store(&config(&server), DialogStore::open(&db).unwrap()).unwrap()
+        } else {
+            Agent::from_client(DeepSeekClient::new(&config(&server)).unwrap(), "system")
+        }
+        .with_tool_executor(Arc::new(FakeToolExecutor::success()));
+        let error = agent
+            .run_streaming("test", |event| {
+                if matches!(event, AgentEvent::Text(_)) {
+                    return Err(std::io::Error::other("output closed"));
+                }
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::Client(ClientError::Output(_))));
+        assert_eq!(agent.history().messages().len(), usize::from(persistent));
+        assert_eq!(agent.last_usage().unwrap().total_tokens, 8);
+        if persistent {
+            let store = DialogStore::open(&db).unwrap();
+            assert_eq!(
+                store
+                    .load(agent.dialog_id().unwrap())
+                    .unwrap()
+                    .messages
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store.tool_executions(agent.dialog_id().unwrap()).unwrap()[0].status,
+                ToolExecutionStatus::Succeeded
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_finished_callback_failure_stops_remaining_calls() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [tool_response(&[
+            ("one", "telegram__read_chat", "{}"),
+            ("two", "telegram__read_chat", "{}"),
+        ])],
+    )
+    .await;
+    let executor = Arc::new(FakeToolExecutor::success());
+    let mut agent = Agent::new(&config(&server))
+        .unwrap()
+        .with_tool_executor(executor.clone());
+    assert!(
+        agent
+            .run_streaming("test", |event| {
+                if matches!(event, AgentEvent::ToolFinished { .. }) {
+                    Err(std::io::Error::other("closed"))
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(executor.calls.lock().unwrap().len(), 1);
+    assert!(agent.history().messages().is_empty());
+}
+
+#[tokio::test]
+async fn tool_cancellation_does_not_commit_an_answer_or_repeat_a_dispatched_write() {
+    for persistent in [false, true] {
+        let server = MockServer::start().await;
+        mount_sequence(
+            &server,
+            [tool_response(&[("write", "telegram__read_chat", "{}")])],
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("tools.sqlite3");
+        let mut executor = FakeToolExecutor::new(false, Err(ToolExecutionError::Timeout));
+        executor.hang = true;
+        if persistent {
+            executor.audit_db = Some(db.clone());
+        }
+        let executor = Arc::new(executor);
+        let mut agent = if persistent {
+            Agent::with_store(&config(&server), DialogStore::open(&db).unwrap()).unwrap()
+        } else {
+            Agent::new(&config(&server)).unwrap()
+        }
+        .with_tool_executor(executor.clone());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                agent.run_with_prompt("send")
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(executor.calls.lock().unwrap().len(), 1);
+        assert_eq!(agent.history().messages().len(), usize::from(persistent));
+        if persistent {
+            let store = DialogStore::open(&db).unwrap();
+            assert_eq!(
+                store
+                    .load(agent.dialog_id().unwrap())
+                    .unwrap()
+                    .messages
+                    .len(),
+                1
+            );
+            let audit = store.tool_executions(agent.dialog_id().unwrap()).unwrap();
+            assert_eq!(audit.len(), 1);
+            assert_eq!(audit[0].status, ToolExecutionStatus::Started);
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_intermediate_text_is_not_emitted_and_failed_final_round_retains_usage() {
+    let server = MockServer::start().await;
+    let intermediate = ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string(format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"content":"SECRET_INTERMEDIATE", "tool_calls":[{"index":0,"id":"call","type":"function","function":{"name":"telegram__read_chat","arguments":"{}"}}]},"finish_reason":"tool_calls"}], "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,"completion_tokens_details":{"reasoning_tokens":1}}})));
+    let truncated = ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string(format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"content":"PARTIAL"},"finish_reason":"length"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"completion_tokens_details":{"reasoning_tokens":2}}})));
+    mount_sequence(&server, [intermediate, truncated]).await;
+    let mut agent = Agent::new(&config(&server))
+        .unwrap()
+        .with_tool_executor(Arc::new(FakeToolExecutor::success()));
+    let mut output = String::new();
+    let error = agent
+        .run_streaming("test", |event| {
+            if let AgentEvent::Text(text) = event {
+                output.push_str(text);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AgentError::Client(_)));
+    assert!(output.is_empty());
+    assert!(agent.history().messages().is_empty());
+    let usage = agent.last_usage().unwrap();
+    assert_eq!(usage.total_tokens, 14);
+    assert_eq!(
+        usage.completion_tokens_details.unwrap().reasoning_tokens,
+        Some(3)
+    );
 }
 
 // Historical checker tests start with an already-approved goal so they can
@@ -2404,6 +2977,8 @@ fn seen(event: AgentEvent<'_>) -> Seen {
         AgentEvent::CompactionCompleted { .. } => Seen::CompactionCompleted,
         AgentEvent::CompactionFailed { .. } => Seen::CompactionFailed,
         AgentEvent::Text(_)
+        | AgentEvent::ToolStarted { .. }
+        | AgentEvent::ToolFinished { .. }
         | AgentEvent::Usage(_)
         | AgentEvent::FactsUpdateStarted { .. }
         | AgentEvent::FactsUpdateCompleted { .. }
@@ -3156,7 +3731,9 @@ async fn agents_do_not_share_history_and_forward_stream_events() {
                 | AgentEvent::FactsUpdateCompleted { .. }
                 | AgentEvent::FactsUpdateFailed { .. }
                 | AgentEvent::DebugLogFailed { .. }
-                | AgentEvent::Workflow(_) => {}
+                | AgentEvent::Workflow(_)
+                | AgentEvent::ToolStarted { .. }
+                | AgentEvent::ToolFinished { .. } => {}
             }
             Ok(())
         })

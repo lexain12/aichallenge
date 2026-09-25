@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Parser;
 use deepseek_cli::agent::{Agent, AgentError, AgentEvent};
@@ -9,8 +10,10 @@ use deepseek_cli::chat::{InputAction, InvariantAction, ProfileAction, Role, pars
 use deepseek_cli::client::ClientError;
 use deepseek_cli::config::{Config, ConfigError};
 use deepseek_cli::dialog::{DialogStore, StoreError};
+use deepseek_cli::mcp::{McpRegistry, McpRegistryError};
 use deepseek_cli::memory::{DEFAULT_TASK_ID, DEFAULT_USER_ID, DurableMemoryScope, RequestScope};
 use deepseek_cli::terminal::{BlockStyle, TerminalUi};
+use deepseek_cli::tool_calling::ToolExecutor;
 use deepseek_cli::workflow::TaskPhase;
 use deepseek_cli::workflow_engine::{WorkflowEngineError, WorkflowTurnEvent};
 use deepseek_cli::workflow_store::PauseOutcome;
@@ -116,7 +119,7 @@ async fn run() -> Result<(), AppError> {
     };
     let env_api_key = std::env::var("DEEPSEEK_API_KEY").ok();
     let config = Config::load(&args.config, env_api_key)?;
-    let mut agent = match resume {
+    let agent = match resume {
         Some(id) => {
             let agent = Agent::from_dialog(&config, store, id)?;
             if let Some(user) = args.user.as_deref()
@@ -147,6 +150,12 @@ async fn run() -> Result<(), AppError> {
             .expect("CLI identifiers and default scope are nonblank"),
         )?,
     };
+    let executor: Option<Arc<dyn ToolExecutor>> = if config.mcp().servers.is_empty() {
+        None
+    } else {
+        Some(Arc::new(McpRegistry::connect(config.mcp()).await?))
+    };
+    let mut agent = agent.with_optional_tool_executor(executor);
     if resume.is_some() {
         let recovery_ui = TerminalUi::stderr();
         let mut recovery_stderr = io::stderr();
@@ -571,7 +580,7 @@ async fn run_prompt<W: io::Write, E: io::Write>(
                 .as_mut()
                 .expect("compaction starts after ordinary response text")
                 .write_text(fragment),
-            AgentEvent::Usage(_) => Ok(()),
+            AgentEvent::Usage(_) | AgentEvent::ToolStarted { .. } | AgentEvent::ToolFinished { .. } => Ok(()),
             AgentEvent::Workflow(event) => match event {
                 WorkflowTurnEvent::AutonomousTurnStarted { number, phase } => {
                     block
@@ -739,6 +748,8 @@ fn write_interruption<W: io::Write>(
 
 #[derive(Debug, Error)]
 enum AppError {
+    #[error(transparent)]
+    Mcp(#[from] McpRegistryError),
     #[error("dialog belongs to user '{stored}', not requested user '{requested}'")]
     UserScopeMismatch { stored: String, requested: String },
     #[error("dialog belongs to task '{stored}', not requested task '{requested}'")]
@@ -764,6 +775,9 @@ enum AppError {
 impl AppError {
     fn operator_message(&self) -> String {
         match self {
+            Self::Mcp(McpRegistryError::InvalidToolName(_)) => {
+                "MCP server advertised an invalid tool name".to_owned()
+            }
             Self::Agent(error) => error.operator_message(),
             Self::Client(error) => error.operator_message("chat"),
             _ => self.to_string(),

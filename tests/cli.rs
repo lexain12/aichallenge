@@ -326,6 +326,128 @@ fn run_cli_args(config_path: &Path, database: &Path, args: &[&str], input: &str)
 }
 
 #[tokio::test]
+async fn mcp_unavailable_server_aborts_startup_with_safe_name() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("SECRET_REMOTE_ERROR"))
+        .mount(&server)
+        .await;
+    let mut config = write_config(&server.uri());
+    writeln!(
+        config,
+        "\n[mcp]\nconnect_timeout_seconds=1\n[[mcp.servers]]\nname='telegram'\nurl='{}/SECRET_URL'",
+        server.uri()
+    )
+    .unwrap();
+    let output = run_cli(config.path(), "/exit\n");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("MCP server telegram"), "{stderr}");
+    assert!(!stderr.contains("SECRET"), "{stderr}");
+}
+
+#[tokio::test]
+async fn mcp_invalid_remote_tool_name_is_not_printed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/mcp")).respond_with(|request: &Request| {
+        let body: Value = request.body_json().unwrap();
+        let result = match body["method"].as_str().unwrap() {
+            "initialize" => json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"test","version":"1"}}),
+            "notifications/initialized" => return ResponseTemplate::new(202),
+            "tools/list" => json!({"tools":[{"name":"https://SECRET.example/credential","inputSchema":{"type":"object"}}]}),
+            other => panic!("unexpected MCP method: {other}"),
+        };
+        ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+    }).mount(&server).await;
+    let mut config = write_config(&server.uri());
+    writeln!(
+        config,
+        "\n[mcp]\nconnect_timeout_seconds=2\n[[mcp.servers]]\nname='telegram'\nurl='{}/mcp'",
+        server.uri()
+    )
+    .unwrap();
+    let output = run_cli(config.path(), "/exit\n");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("SECRET"), "{stderr}");
+    assert!(stderr.contains("MCP"), "{stderr}");
+}
+
+#[tokio::test]
+async fn mcp_registry_is_connected_once_and_injected_into_new_and_resumed_agents() {
+    for resumed in [false, true] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/mcp")).respond_with(|request: &Request| {
+            let body: Value = request.body_json().unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"test","version":"1"}}),
+                "notifications/initialized" => return ResponseTemplate::new(202),
+                "tools/list" => json!({"tools":[{"name":"read_chat","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}),
+                other => panic!("unexpected MCP method: {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+        }).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse("Done", 2, 1, 3))
+            .mount(&server)
+            .await;
+        let mut config = write_config(&server.uri());
+        writeln!(
+            config,
+            "\n[mcp]\nconnect_timeout_seconds=2\n[[mcp.servers]]\nname='telegram'\nurl='{}/mcp'",
+            server.uri()
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("tools.sqlite3");
+        if resumed {
+            DialogStore::open(&db)
+                .unwrap()
+                .start_dialog("system", "prior")
+                .unwrap();
+        }
+        let output = run_cli_args(
+            config.path(),
+            &db,
+            if resumed { &["--resume-last"] } else { &[] },
+            "first\nsecond\n/exit\n",
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let requests = server.received_requests().await.unwrap();
+        let bodies: Vec<Value> = requests.iter().map(|r| r.body_json().unwrap()).collect();
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|b| b["method"] == "initialize")
+                .count(),
+            1
+        );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|b| b["method"] == "tools/list")
+                .count(),
+            1
+        );
+        let chats: Vec<_> = bodies
+            .iter()
+            .filter(|b| b.get("messages").is_some())
+            .collect();
+        assert_eq!(chats.len(), 2);
+        assert!(
+            chats
+                .iter()
+                .all(|b| b["tools"][0]["function"]["name"] == "telegram__read_chat")
+        );
+    }
+}
+
+#[tokio::test]
 async fn debug_command_prints_local_snapshot_without_creating_a_task_or_calling_api() {
     let server = MockServer::start().await;
     let mut config = NamedTempFile::new().unwrap();
