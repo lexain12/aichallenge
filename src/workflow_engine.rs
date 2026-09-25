@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::agent::AgentEvent;
-use crate::chat::{ChatHistory, Role};
-use crate::client::{ClientError, DeepSeekClient, StreamEvent, TokenUsage};
+use crate::agent::{AgentEvent, ToolAuditContext, add_tool_usage, execute_tool};
+use crate::chat::{ChatHistory, Message, ProviderMessage, Role};
+use crate::client::{AssistantTurn, ClientError, DeepSeekClient, StreamEvent, TokenUsage};
 use crate::config::{ContextConfig, ContextStrategy, WorkflowConfig};
 use crate::context::{ContextState, ContextSummary, prepare_request};
 use crate::debug_log::{WorkflowDebugEvent, WorkflowDebugMetadata, WorkflowDebugPayload};
@@ -21,6 +21,8 @@ use crate::invariants::{
 use crate::memory::{ContextError, ContextProvider, MemoryRepository, RequestScope};
 use crate::profile::ProfileRepository;
 use crate::system_context::SystemBlock;
+use crate::tool_audit::ToolAuditError;
+use crate::tool_calling::{ConversationStep, ToolConversation, ToolExecutor, ToolLoopError};
 use crate::workflow::{
     PatchContext, PlanAppend, StageChangeAuthorization, StateMachine, TaskPhase, TaskStatePatch,
     TaskStatus, TransitionEvent, WorkflowError, WorkflowInput, WorkflowInputSource, WorkflowIntent,
@@ -83,6 +85,7 @@ pub struct AutonomyBudget {
     tokens: u64,
     fingerprints: HashSet<StateFingerprint>,
     usage_complete: bool,
+    enforce_before_calls: bool,
 }
 
 impl AutonomyBudget {
@@ -94,6 +97,7 @@ impl AutonomyBudget {
             tokens: 0,
             fingerprints: HashSet::new(),
             usage_complete: true,
+            enforce_before_calls: false,
         }
     }
 
@@ -122,6 +126,15 @@ impl AutonomyBudget {
             return Err(AutonomyStopReason::TokenLimit);
         }
         Ok(())
+    }
+
+    // Legacy workflow behavior is unchanged unless tools are available.
+    fn before_call(&self) -> Result<(), AutonomyStopReason> {
+        if self.enforce_before_calls {
+            self.allow_provider_call()
+        } else {
+            Ok(())
+        }
     }
 
     fn check_turn(&self, fingerprint: &StateFingerprint) -> Result<(), AutonomyStopReason> {
@@ -175,6 +188,7 @@ struct BlockingObservation {
 
 #[derive(Debug)]
 pub enum PipelineOutcome {
+    BudgetStopped(AutonomyStopReason),
     AwaitUser {
         patch: TaskStatePatch,
     },
@@ -261,6 +275,12 @@ impl ResponsePipeline {
         for checker in &self.checkers {
             if checker.mode() != CheckerMode::Blocking {
                 break;
+            }
+            if budget.before_call().is_err() {
+                return BlockingCheckResult {
+                    outcome: BlockingOutcome::Unavailable,
+                    observations,
+                };
             }
             match checker
                 .check_observed(context, response, capture_payloads)
@@ -351,6 +371,12 @@ impl ResponsePipeline {
         for checker in &self.checkers {
             if checker.mode() == CheckerMode::Blocking {
                 continue;
+            }
+            if let Err(reason) = budget.before_call() {
+                return PipelineResult {
+                    outcome: PipelineOutcome::BudgetStopped(reason),
+                    observations,
+                };
             }
             match checker
                 .check_observed(context, response, capture_payloads)
@@ -854,6 +880,11 @@ impl WorkflowInputHandler<'_> {
                 let capture_payloads = diagnostics
                     .as_deref()
                     .is_some_and(|diagnostics| diagnostics.capture_payloads);
+                if let Some(budget) = budget.as_deref() {
+                    budget
+                        .before_call()
+                        .map_err(WorkflowEngineError::AutonomyStopped)?;
+                }
                 let handoff = match self
                     .handoff_builder
                     .build_observed(&authorization, preview, &messages, &input, capture_payloads)
@@ -1078,6 +1109,8 @@ pub struct WorkflowEngine<'a> {
     checker_model: String,
     diagnostics: Option<WorkflowDiagnostics<'a>>,
     session: WorkflowSession<'a>,
+    tool_executor: Option<Arc<dyn ToolExecutor>>,
+    max_tool_rounds: usize,
 }
 
 struct WorkflowDiagnostics<'a> {
@@ -1187,7 +1220,19 @@ impl<'a> WorkflowEngine<'a> {
             checker_model: models.checker.name().to_owned(),
             diagnostics: None,
             session,
+            tool_executor: None,
+            max_tool_rounds: crate::tool_calling::DEFAULT_MAX_TOOL_ROUNDS,
         }
+    }
+
+    pub fn with_optional_tool_executor(
+        mut self,
+        executor: Option<Arc<dyn ToolExecutor>>,
+        max_tool_rounds: usize,
+    ) -> Self {
+        self.tool_executor = executor;
+        self.max_tool_rounds = max_tool_rounds;
+        self
     }
 
     pub fn with_diagnostics(
@@ -1554,6 +1599,7 @@ impl<'a> WorkflowEngine<'a> {
     {
         *self.session.last_usage = None;
         let mut budget = AutonomyBudget::new(&self.workflow_config);
+        budget.enforce_before_calls = self.tool_executor.is_some();
         WorkflowIntent::human_continue(prompt)?;
         let rules = self.session.store.load_invariants(self.session.scope)?;
         if !rules.is_empty() {
@@ -1905,6 +1951,9 @@ impl<'a> WorkflowEngine<'a> {
         budget: &mut AutonomyBudget,
     ) -> Option<BlockingOutcome> {
         let checker = self.invariant_checker.as_ref()?;
+        if budget.before_call().is_err() {
+            return Some(BlockingOutcome::Unavailable);
+        }
         let (outcome, observation) = match checker.check_proposed_input(state, input).await {
             Ok((InvariantVerdict::Allow, usage)) => {
                 budget.record_usage(usage);
@@ -1976,6 +2025,9 @@ impl<'a> WorkflowEngine<'a> {
         budget: &mut AutonomyBudget,
     ) -> Option<BlockingOutcome> {
         let checker = self.invariant_checker.as_ref()?;
+        if budget.before_call().is_err() {
+            return Some(BlockingOutcome::Unavailable);
+        }
         let (outcome, usage, error_kind, http_status) = match checker
             .check_goal_candidate(state, goal)
             .await
@@ -2176,6 +2228,15 @@ impl<'a> WorkflowEngine<'a> {
             .await;
         let mut observations = pipeline.observations;
         let (patch, intent, protocol, confidence) = match pipeline.outcome {
+            PipelineOutcome::BudgetStopped(reason) => {
+                return self.complete_as_await(
+                    &task,
+                    &lease,
+                    &empty_patch(task.version),
+                    mode,
+                    reason,
+                );
+            }
             PipelineOutcome::FailedOpen { .. } | PipelineOutcome::Conflict { .. } => {
                 if let Err(error) = self.fail_advisory(
                     &task,
@@ -2701,6 +2762,9 @@ impl<'a> WorkflowEngine<'a> {
     where
         F: FnMut(AgentEvent<'_>) -> io::Result<()>,
     {
+        budget
+            .before_call()
+            .map_err(WorkflowEngineError::AutonomyStopped)?;
         let dialog_id = self
             .session
             .dialog_id
@@ -2765,26 +2829,75 @@ impl<'a> WorkflowEngine<'a> {
                 .as_ref()
                 .is_some_and(|state| state.phase == TaskPhase::GoalDefinition);
         let mut goal_proposal = None;
-        let mut usage = None;
-        let result = self
-            .client
-            .stream_chat_events(prepared.messages(), |event| match event {
-                StreamEvent::Text(text) if buffered => {
-                    let _ = text;
-                    Ok(())
+        let result = if let Some(executor) = self.tool_executor.clone() {
+            let context = if self.pipeline.has_blocking() {
+                let state =
+                    diagnostic_state
+                        .as_ref()
+                        .ok_or(WorkflowEngineError::InvalidInputContext(
+                            "blocking checker requires workflow task",
+                        ))?;
+                Some(CheckContext {
+                    task: state.clone(),
+                    stage_messages: self
+                        .session
+                        .store
+                        .load_stage_messages(state.current_stage_run_id)?
+                        .into_iter()
+                        .map(|row| row.message)
+                        .collect(),
+                    triggering_input: WorkflowInput {
+                        source: WorkflowInputSource::Human,
+                        intent: WorkflowIntent::Continue {
+                            instruction: prompt.to_owned(),
+                        },
+                    },
+                })
+            } else {
+                None
+            };
+            let input_message_id = match routing {
+                RoutingOutcome::Managed {
+                    input_message_id, ..
                 }
-                StreamEvent::Text(text) => on_event(AgentEvent::Text(text)),
-                StreamEvent::Usage(value) => {
-                    usage = Some(value);
-                    on_event(AgentEvent::Usage(value))
-                }
-            })
-            .await;
-        *self.session.last_usage = usage;
-        budget.record_usage(usage);
+                | RoutingOutcome::Unmanaged { input_message_id } => *input_message_id,
+                RoutingOutcome::Rejected { .. } => unreachable!(),
+            };
+            self.run_tool_conversation(
+                prepared.messages(),
+                input_message_id,
+                executor.as_ref(),
+                context.as_ref(),
+                budget,
+                on_event,
+            )
+            .await
+        } else {
+            let mut usage = None;
+            let result = self
+                .client
+                .stream_chat_events(prepared.messages(), |event| match event {
+                    StreamEvent::Text(_) if buffered => Ok(()),
+                    StreamEvent::Text(text) => on_event(AgentEvent::Text(text)),
+                    StreamEvent::Usage(value) => {
+                        usage = Some(value);
+                        on_event(AgentEvent::Usage(value))
+                    }
+                })
+                .await;
+            *self.session.last_usage = usage;
+            budget.record_usage(usage);
+            result.map_err(|error| WorkflowEngineError::provider("ordinary", error))
+        };
+        let usage = *self.session.last_usage;
         let answer = match result {
             Ok(answer) => answer,
             Err(error) => {
+                let provider_error = match &error {
+                    WorkflowEngineError::Provider { source, .. }
+                    | WorkflowEngineError::Client(source) => Some(source),
+                    _ => None,
+                };
                 self.record_service_diagnostic(
                     "ordinary",
                     "generation",
@@ -2792,9 +2905,9 @@ impl<'a> WorkflowEngine<'a> {
                     budget,
                     false,
                     "failed",
-                    Some(&error),
+                    provider_error,
                     None,
-                    usage.or(error.usage()),
+                    usage.or_else(|| provider_error.and_then(ClientError::usage)),
                     input_chars,
                     0,
                     stage_message_count,
@@ -2803,7 +2916,7 @@ impl<'a> WorkflowEngine<'a> {
                     model_prompt,
                     None,
                 );
-                return Err(WorkflowEngineError::provider("ordinary", error));
+                return Err(error);
             }
         };
         if answer.trim().is_empty() {
@@ -2918,6 +3031,8 @@ impl<'a> WorkflowEngine<'a> {
                     });
                 }
             }
+            emit(on_event, AgentEvent::Text(&answer))?;
+        } else if self.tool_executor.is_some() {
             emit(on_event, AgentEvent::Text(&answer))?;
         }
         let output_chars = answer.chars().count();
@@ -3057,6 +3172,124 @@ impl<'a> WorkflowEngine<'a> {
             answer,
             persisted_answer,
         })
+    }
+
+    async fn run_tool_conversation<F>(
+        &mut self,
+        messages: &[Message],
+        input_message_id: i64,
+        executor: &dyn ToolExecutor,
+        context: Option<&CheckContext>,
+        budget: &mut AutonomyBudget,
+        on_event: &mut F,
+    ) -> Result<String, WorkflowEngineError>
+    where
+        F: FnMut(AgentEvent<'_>) -> io::Result<()>,
+    {
+        *self.session.last_usage = None;
+        let mut conversation = ToolConversation::new(
+            messages.iter().map(ProviderMessage::from).collect(),
+            executor.definitions().to_vec(),
+            self.max_tool_rounds,
+        );
+        loop {
+            budget
+                .allow_provider_call()
+                .map_err(WorkflowEngineError::AutonomyStopped)?;
+            let turn = self
+                .client
+                .stream_assistant_turn(conversation.messages(), conversation.definitions())
+                .await;
+            let usage = match &turn {
+                Ok(
+                    AssistantTurn::FinalText { usage, .. } | AssistantTurn::ToolCalls { usage, .. },
+                ) => *usage,
+                Err(error) => error.usage(),
+            };
+            budget.record_usage(usage);
+            if let Some(usage) = usage {
+                let total = add_tool_usage(self.session.last_usage.unwrap_or_default(), usage);
+                *self.session.last_usage = Some(total);
+                emit(on_event, AgentEvent::Usage(total))?;
+            }
+            match conversation.accept_assistant_turn(
+                turn.map_err(|error| WorkflowEngineError::provider("ordinary", error))?,
+            )? {
+                ConversationStep::Complete { content, .. } => return Ok(content),
+                ConversationStep::Execute {
+                    assistant_message,
+                    calls,
+                    ..
+                } => {
+                    let mut results = Vec::with_capacity(calls.len());
+                    for call in calls {
+                        budget
+                            .allow_provider_call()
+                            .map_err(WorkflowEngineError::AutonomyStopped)?;
+                        let blocked = if executor.is_read_only(&call.name) != Some(true)
+                            && let Some(context) = context
+                        {
+                            let (server, tool) = call
+                                .name
+                                .split_once("__")
+                                .ok_or(ToolLoopError::InvalidArguments)?;
+                            let arguments: serde_json::Value =
+                                serde_json::from_str(&call.arguments)
+                                    .map_err(|_| ToolLoopError::InvalidArguments)?;
+                            let action = serde_json::json!({
+                                "action":"external_tool_call", "server":server, "tool":tool, "arguments":arguments,
+                            }).to_string();
+                            let checked = self
+                                .pipeline
+                                .check_blocking_observed(
+                                    context,
+                                    &action,
+                                    budget,
+                                    self.capture_payloads(),
+                                )
+                                .await;
+                            for observation in checked.observations {
+                                self.record_blocking_observation(
+                                    "tool",
+                                    "candidate_action",
+                                    Some(&context.task),
+                                    budget,
+                                    observation,
+                                    action.chars().count(),
+                                    context.stage_messages.len(),
+                                );
+                            }
+                            checked.outcome != BlockingOutcome::Allowed
+                        } else {
+                            false
+                        };
+                        if !blocked {
+                            budget
+                                .allow_provider_call()
+                                .map_err(WorkflowEngineError::AutonomyStopped)?;
+                        }
+                        results.push(
+                            execute_tool::<WorkflowEngineError, _>(
+                                &call,
+                                executor,
+                                Some(ToolAuditContext {
+                                    store: self.session.store,
+                                    dialog_id: self
+                                        .session
+                                        .dialog_id
+                                        .expect("tool input is persisted"),
+                                    input_message_id,
+                                }),
+                                blocked,
+                                on_event,
+                            )
+                            .await?,
+                        );
+                    }
+                    conversation.accept_tool_results(assistant_message, results)?;
+                }
+            }
+        }
     }
 
     async fn refresh_stage_facts<F>(
@@ -3587,6 +3820,10 @@ where
 
 #[derive(Debug, Error)]
 pub enum WorkflowEngineError {
+    #[error("tool conversation failed")]
+    ToolLoop(#[from] ToolLoopError),
+    #[error("tool audit failed")]
+    ToolAudit(#[from] ToolAuditError),
     #[error("blocking response checkers must precede advisory checkers")]
     BlockingCheckerAfterAdvisory,
     #[error("autonomous continuation stopped: {0:?}")]

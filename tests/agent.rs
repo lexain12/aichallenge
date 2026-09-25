@@ -1055,6 +1055,137 @@ fn await_check(version: u64) -> String {
     json!({"patch":{"expected_version":version,"plan_append":{"steps":[],"acceptance_criteria":[]},"step_updates":[],"current_step_id":null,"expected_action":null,"checkpoint":null},"decision":{"type":"await_user"}}).to_string()
 }
 
+// Break caught: the Agent loses its executor when it constructs a workflow engine for a new turn.
+#[tokio::test]
+async fn workflow_tool_agent_reuses_executor_across_resumed_turns() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        [
+            tool_response(&[("first", "telegram__read_chat", "{}")]),
+            response("First final", true),
+            tool_response(&[("second", "telegram__read_chat", "{}")]),
+            response("Second final", true),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("workflow-tools.sqlite3");
+    let (store, id) = approved_planning_store(&db);
+    let service = Arc::new(AgentWorkflowModel {
+        usage: Some(deepseek_cli::client::TokenUsage {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 3,
+            completion_tokens_details: None,
+        }),
+        ..Default::default()
+    });
+    service.responses.lock().unwrap().extend([
+        continue_interpretation(),
+        await_check(1),
+        continue_interpretation(),
+        await_check(3),
+    ]);
+    let tools = Arc::new(FakeToolExecutor {
+        audit_db: Some(db.clone()),
+        ..FakeToolExecutor::success()
+    });
+    let mut agent = Agent::from_dialog(&managed_config(&server), store, id)
+        .unwrap()
+        .with_workflow_models(injected_models(&service))
+        .with_tool_executor(tools.clone());
+    assert_eq!(
+        agent.run_with_prompt("read once").await.unwrap(),
+        "First final"
+    );
+    assert_eq!(agent.last_usage().unwrap().total_tokens, 8);
+    assert_eq!(
+        agent.run_with_prompt("read again").await.unwrap(),
+        "Second final"
+    );
+    assert_eq!(agent.last_usage().unwrap().total_tokens, 8);
+    assert_eq!(
+        tools
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    let store = DialogStore::open(&db).unwrap();
+    let audits = store.tool_executions(id).unwrap();
+    assert_eq!(
+        audits
+            .iter()
+            .map(|row| row.input_message_id)
+            .collect::<Vec<_>>(),
+        [2, 4]
+    );
+    assert!(
+        audits
+            .iter()
+            .all(|row| row.status == ToolExecutionStatus::Succeeded)
+    );
+    let requests = server.received_requests().await.unwrap();
+    let next: Value = requests[2].body_json().unwrap();
+    assert!(!next["messages"].to_string().contains("SECRET_RESULT"));
+    assert!(
+        next["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["role"] != "tool")
+    );
+}
+
+// Break caught: workflow audit errors stop being fatal at the Agent/CLI boundary.
+#[tokio::test]
+async fn workflow_tool_agent_audit_failures_remain_fatal_and_safe() {
+    for finish in [false, true] {
+        let server = MockServer::start().await;
+        mount_sequence(
+            &server,
+            [tool_response(&[("call", "telegram__read_chat", "{}")])],
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("audit-error.sqlite3");
+        let (store, id) = approved_planning_store(&db);
+        rusqlite::Connection::open(&db).unwrap().execute_batch(&format!(
+            "CREATE TRIGGER reject_audit BEFORE {} ON tool_executions BEGIN SELECT RAISE(ABORT, 'PRIVATE_DATABASE_ERROR'); END;",
+            if finish { "UPDATE" } else { "INSERT" }
+        )).unwrap();
+        let service = Arc::new(AgentWorkflowModel {
+            usage: Some(deepseek_cli::client::TokenUsage {
+                prompt_tokens: 2,
+                completion_tokens: 1,
+                total_tokens: 3,
+                completion_tokens_details: None,
+            }),
+            ..Default::default()
+        });
+        service
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(continue_interpretation());
+        let tools = Arc::new(FakeToolExecutor::success());
+        let mut agent = Agent::from_dialog(&managed_config(&server), store, id)
+            .unwrap()
+            .with_workflow_models(injected_models(&service))
+            .with_tool_executor(tools.clone());
+        let error = agent.run_with_prompt("read").await.unwrap_err();
+        assert!(matches!(error, AgentError::ToolAudit(_)), "{error:?}");
+        assert_eq!(error.operator_message(), "tool audit failed");
+        assert_eq!(tools.calls.lock().unwrap().len(), usize::from(finish));
+        assert_eq!(agent.history().messages().len(), 2);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
 fn hidden_controller_dialog(store: &mut DialogStore) -> i64 {
     use deepseek_cli::workflow::{TaskStatePatch, WorkflowIntent};
     use deepseek_cli::workflow_store::{ControllerInputCommit, ProcessingLeaseMode};

@@ -25,8 +25,8 @@ use crate::tool_audit::{
     ToolExecutionStatus,
 };
 use crate::tool_calling::{
-    ConversationStep, ModelToolCall, ToolConversation, ToolExecutionError, ToolExecutor,
-    ToolLoopError, ToolResultMessage,
+    ConversationStep, ModelToolCall, ToolConversation, ToolExecutionError, ToolExecutionResult,
+    ToolExecutor, ToolLoopError, ToolResultMessage,
 };
 use crate::workflow::{TaskPhase, TaskStatus, WorkflowTaskId, WorkflowTaskState};
 use crate::workflow_engine::{
@@ -437,7 +437,8 @@ impl Agent {
                     persisted_message_count: &mut self.persisted_message_count,
                     last_usage: &mut self.last_usage,
                 },
-            );
+            )
+            .with_optional_tool_executor(self.tool_executor.clone(), self.max_tool_rounds);
             if diagnostics_enabled {
                 let debug_log = &mut self.debug_log;
                 let warnings = &mut debug_warnings;
@@ -585,7 +586,8 @@ impl Agent {
                     persisted_message_count: &mut self.persisted_message_count,
                     last_usage: &mut self.last_usage,
                 },
-            );
+            )
+            .with_optional_tool_executor(self.tool_executor.clone(), self.max_tool_rounds);
             if diagnostics_enabled {
                 let debug_log = &mut self.debug_log;
                 let warnings = &mut debug_warnings;
@@ -808,113 +810,30 @@ impl Agent {
                     let mut results = Vec::with_capacity(calls.len());
                     for call in calls {
                         results.push(
-                            self.execute_tool(&call, input_message_id, executor, on_event)
-                                .await?,
+                            execute_tool::<AgentError, _>(
+                                &call,
+                                executor,
+                                self.store
+                                    .as_mut()
+                                    .zip(input_message_id)
+                                    .zip(self.dialog_id)
+                                    .map(|((store, input_message_id), dialog_id)| {
+                                        ToolAuditContext {
+                                            store,
+                                            input_message_id,
+                                            dialog_id,
+                                        }
+                                    }),
+                                false,
+                                on_event,
+                            )
+                            .await?,
                         );
                     }
                     conversation.accept_tool_results(assistant_message, results)?;
                 }
             }
         }
-    }
-
-    async fn execute_tool<F>(
-        &mut self,
-        call: &ModelToolCall,
-        input_message_id: Option<i64>,
-        executor: &dyn ToolExecutor,
-        on_event: &mut F,
-    ) -> Result<ToolResultMessage, AgentError>
-    where
-        F: FnMut(AgentEvent<'_>) -> io::Result<()>,
-    {
-        // A failed output callback must stop before dispatching another tool.
-        emit_event(
-            on_event,
-            AgentEvent::ToolStarted {
-                call_id: &call.id,
-                name: &call.name,
-            },
-        )?;
-        let read_only = executor.is_read_only(&call.name) == Some(true);
-        let mut audit = if let (Some(store), Some(input_message_id), Some(dialog_id)) =
-            (self.store.as_mut(), input_message_id, self.dialog_id)
-        {
-            let (server_name, tool_name) = call.name.split_once("__").unwrap_or(("", &call.name));
-            Some(ToolAuditGuard::start(
-                store,
-                ToolExecutionStart {
-                    dialog_id,
-                    input_message_id,
-                    tool_call_id: &call.id,
-                    server_name,
-                    tool_name,
-                    arguments_json: &call.arguments,
-                },
-                read_only,
-            )?)
-        } else {
-            None
-        };
-        let result = executor.call(call).await;
-        let uncertain = !read_only
-            && (matches!(
-                result,
-                Err(ToolExecutionError::Timeout | ToolExecutionError::Transport)
-            ) || result
-                .as_ref()
-                .is_ok_and(|output| output.delivery_uncertain));
-        let code = if uncertain {
-            Some("delivery_unknown")
-        } else {
-            match &result {
-                Err(ToolExecutionError::UnknownTool) => Some("unknown_tool"),
-                Err(ToolExecutionError::InvalidArguments) => Some("invalid_arguments"),
-                Err(ToolExecutionError::Timeout) => Some("timeout"),
-                Err(ToolExecutionError::Transport) => Some("transport"),
-                Ok(output) if output.is_error || output.delivery_uncertain => {
-                    Some(match output.error_code.as_deref() {
-                        Some("unsupported_content") => "unsupported_content",
-                        Some("mcp_tool_error") => "mcp_tool_error",
-                        _ => "tool_error",
-                    })
-                }
-                Ok(_) => None,
-            }
-        };
-        let (status, finish) = match code {
-            Some(code) if uncertain => (
-                ToolExecutionStatus::Uncertain,
-                ToolExecutionFinish::uncertain(ToolExecutionErrorCode::new(code)?),
-            ),
-            Some(code) => (
-                ToolExecutionStatus::Failed,
-                ToolExecutionFinish::failed(ToolExecutionErrorCode::new(code)?),
-            ),
-            None => (
-                ToolExecutionStatus::Succeeded,
-                ToolExecutionFinish::succeeded(),
-            ),
-        };
-        if let Some(audit) = audit.as_mut() {
-            audit.finish(finish)?;
-        }
-        emit_event(
-            on_event,
-            AgentEvent::ToolFinished {
-                call_id: &call.id,
-                name: &call.name,
-                status,
-                code,
-            },
-        )?;
-        Ok(match (code, result) {
-            (Some(code), _) => {
-                ToolResultMessage::error(&call.id, serde_json::json!({"error":code}).to_string())
-            }
-            (None, Ok(output)) => ToolResultMessage::success(&call.id, output.content),
-            (None, Err(_)) => unreachable!("executor errors always have a safe code"),
-        })
     }
 
     pub fn history(&self) -> &ChatHistory {
@@ -1301,7 +1220,119 @@ where
     Ok(())
 }
 
-fn add_tool_usage(mut total: TokenUsage, incoming: TokenUsage) -> TokenUsage {
+pub(crate) struct ToolAuditContext<'a> {
+    pub store: &'a mut DialogStore,
+    pub dialog_id: i64,
+    pub input_message_id: i64,
+}
+
+/// Shared execution and audit lifecycle for legacy and workflow turns.
+/// Policy is settled before entry; denied calls are recorded without dispatch.
+pub(crate) async fn execute_tool<E, F>(
+    call: &ModelToolCall,
+    executor: &dyn ToolExecutor,
+    context: Option<ToolAuditContext<'_>>,
+    blocked: bool,
+    on_event: &mut F,
+) -> Result<ToolResultMessage, E>
+where
+    E: From<ClientError> + From<ToolAuditError>,
+    F: FnMut(AgentEvent<'_>) -> io::Result<()>,
+{
+    on_event(AgentEvent::ToolStarted {
+        call_id: &call.id,
+        name: &call.name,
+    })
+    .map_err(ClientError::Output)?;
+    let read_only = executor.is_read_only(&call.name) == Some(true);
+    let mut audit = if let Some(context) = context {
+        let (server_name, tool_name) = call.name.split_once("__").unwrap_or(("", &call.name));
+        Some(ToolAuditGuard::start(
+            context.store,
+            ToolExecutionStart {
+                dialog_id: context.dialog_id,
+                input_message_id: context.input_message_id,
+                tool_call_id: &call.id,
+                server_name,
+                tool_name,
+                arguments_json: &call.arguments,
+            },
+            read_only || blocked,
+        )?)
+    } else {
+        None
+    };
+    let result = if blocked {
+        Ok(ToolExecutionResult {
+            content: String::new(),
+            is_error: true,
+            error_code: None,
+            delivery_uncertain: false,
+        })
+    } else {
+        executor.call(call).await
+    };
+    let uncertain = !read_only
+        && (matches!(
+            result,
+            Err(ToolExecutionError::Timeout | ToolExecutionError::Transport)
+        ) || result
+            .as_ref()
+            .is_ok_and(|output| output.delivery_uncertain));
+    let code = if blocked {
+        Some("blocked_by_invariant")
+    } else if uncertain {
+        Some("delivery_unknown")
+    } else {
+        match &result {
+            Err(ToolExecutionError::UnknownTool) => Some("unknown_tool"),
+            Err(ToolExecutionError::InvalidArguments) => Some("invalid_arguments"),
+            Err(ToolExecutionError::Timeout) => Some("timeout"),
+            Err(ToolExecutionError::Transport) => Some("transport"),
+            Ok(output) if output.is_error || output.delivery_uncertain => {
+                Some(match output.error_code.as_deref() {
+                    Some("unsupported_content") => "unsupported_content",
+                    Some("mcp_tool_error") => "mcp_tool_error",
+                    _ => "tool_error",
+                })
+            }
+            Ok(_) => None,
+        }
+    };
+    let (status, finish) = match code {
+        Some(code) if uncertain => (
+            ToolExecutionStatus::Uncertain,
+            ToolExecutionFinish::uncertain(ToolExecutionErrorCode::new(code)?),
+        ),
+        Some(code) => (
+            ToolExecutionStatus::Failed,
+            ToolExecutionFinish::failed(ToolExecutionErrorCode::new(code)?),
+        ),
+        None => (
+            ToolExecutionStatus::Succeeded,
+            ToolExecutionFinish::succeeded(),
+        ),
+    };
+    if let Some(audit) = audit.as_mut() {
+        audit.finish(finish)?;
+    }
+    on_event(AgentEvent::ToolFinished {
+        call_id: &call.id,
+        name: &call.name,
+        status,
+        code,
+    })
+    .map_err(ClientError::Output)?;
+    Ok(match (code, result) {
+        (Some(code), _) => {
+            ToolResultMessage::error(&call.id, serde_json::json!({"error":code}).to_string())
+        }
+        (None, Ok(output)) => ToolResultMessage::success(&call.id, output.content),
+        (None, Err(_)) => unreachable!("executor errors always have a safe code"),
+    })
+}
+
+pub(crate) fn add_tool_usage(mut total: TokenUsage, incoming: TokenUsage) -> TokenUsage {
     total.prompt_tokens = total.prompt_tokens.saturating_add(incoming.prompt_tokens);
     total.completion_tokens = total
         .completion_tokens
@@ -1376,7 +1407,7 @@ pub enum AgentError {
     #[error("workflow requires enabled configuration and a persistent store")]
     WorkflowUnavailable,
     #[error(transparent)]
-    Workflow(#[from] WorkflowEngineError),
+    Workflow(WorkflowEngineError),
     #[error("no default prompt configured; use with_prompt or run_with_prompt")]
     MissingPrompt,
     #[error("prompt must not be empty")]
@@ -1399,6 +1430,16 @@ pub enum AgentError {
     Client(#[from] ClientError),
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+impl From<WorkflowEngineError> for AgentError {
+    fn from(error: WorkflowEngineError) -> Self {
+        match error {
+            // The CLI already treats this shared persistence failure as fatal.
+            WorkflowEngineError::ToolAudit(error) => Self::ToolAudit(error),
+            error => Self::Workflow(error),
+        }
+    }
 }
 
 impl AgentError {
