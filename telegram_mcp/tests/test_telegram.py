@@ -145,7 +145,7 @@ async def test_lazy_client_is_constructed_once_and_connected_once(monkeypatch) -
     monkeypatch.setattr(
         telegram,
         "TelegramClient",
-        lambda session, api_id, api_hash: calls.append((session, api_id, api_hash)) or created,
+        lambda session, api_id, api_hash, **kwargs: calls.append((session, api_id, api_hash)) or created,
     )
     gateway = TelethonGateway(settings())
     assert calls == []
@@ -155,6 +155,25 @@ async def test_lazy_client_is_constructed_once_and_connected_once(monkeypatch) -
 
     assert calls == [(("session", "session-secret"), 123, "hash-secret")]
     assert created.connect_calls == 1
+
+
+async def test_real_client_disables_internal_send_retries(monkeypatch) -> None:
+    import telegram_mcp.telegram as telegram
+
+    created = FakeClient()
+    options = []
+    monkeypatch.setattr(telegram, "StringSession", lambda value: ("session", value))
+
+    def client_factory(session, api_id, api_hash, **kwargs):
+        options.append(kwargs)
+        return created
+
+    monkeypatch.setattr(telegram, "TelegramClient", client_factory)
+    gateway = TelethonGateway(settings())
+
+    await gateway.list_chats(None, 1)
+
+    assert options == [{"request_retries": 0, "flood_sleep_threshold": 0}]
 
 
 async def test_unauthorized_session_fails_before_reading_dialogs(fake_client) -> None:

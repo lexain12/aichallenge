@@ -97,6 +97,8 @@ class TelethonGateway:
                         StringSession(self._settings.session_string),
                         self._settings.api_id,
                         self._settings.api_hash,
+                        request_retries=0,
+                        flood_sleep_threshold=0,
                     )
                 if not self._client.is_connected():
                     await self._client.connect()
