@@ -51,8 +51,17 @@ pub enum ToolExecutionError {
 pub type ToolFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ToolExecutionResult, ToolExecutionError>> + Send + 'a>>;
 
+/// Exact dispatch identity. Provider aliases are opaque and must not be parsed
+/// to recover the server or original tool name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolRoute<'a> {
+    pub server_name: &'a str,
+    pub tool_name: &'a str,
+}
+
 pub trait ToolExecutor: Send + Sync {
     fn definitions(&self) -> &[ModelToolDefinition];
+    fn route(&self, name: &str) -> Option<ToolRoute<'_>>;
     fn is_read_only(&self, name: &str) -> Option<bool>;
     fn call<'a>(&'a self, call: &'a ModelToolCall) -> ToolFuture<'a>;
 }
@@ -114,6 +123,8 @@ impl ConversationStep {
 pub enum ToolLoopError {
     #[error("Tool conversation is already complete")]
     AlreadyComplete,
+    #[error("Previous ordinary turn is not complete")]
+    IncompleteTurn,
     #[error("Tool results are pending")]
     PendingToolResults,
     #[error("No tool results are expected")]
@@ -143,7 +154,7 @@ struct PendingRound {
     call_ids: Vec<String>,
 }
 
-/// One request's provider transcript and tool-loop bookkeeping.
+/// One user request's tool limits and the current ordinary turn's transcript.
 pub struct ToolConversation {
     messages: Vec<ProviderMessage>,
     definitions: Vec<ModelToolDefinition>,
@@ -194,6 +205,18 @@ impl ToolConversation {
 
     pub fn usage(&self) -> TokenUsage {
         self.usage
+    }
+
+    /// Start another ordinary answer within the same user request. Keep the
+    /// consumed round allowance and call IDs while replacing transient context.
+    pub fn begin_next_turn(&mut self, messages: Vec<ProviderMessage>) -> Result<(), ToolLoopError> {
+        if !self.complete {
+            return Err(ToolLoopError::IncompleteTurn);
+        }
+        self.messages = messages;
+        self.usage = TokenUsage::default();
+        self.complete = false;
+        Ok(())
     }
 
     pub fn accept_assistant_turn(

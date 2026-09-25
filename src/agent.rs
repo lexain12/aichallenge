@@ -1236,9 +1236,12 @@ pub(crate) async fn execute_tool<E, F>(
     on_event: &mut F,
 ) -> Result<ToolResultMessage, E>
 where
-    E: From<ClientError> + From<ToolAuditError>,
+    E: From<ClientError> + From<ToolAuditError> + From<ToolLoopError>,
     F: FnMut(AgentEvent<'_>) -> io::Result<()>,
 {
+    let route = executor
+        .route(&call.name)
+        .ok_or_else(|| ToolLoopError::UnknownTool(call.name.clone()))?;
     on_event(AgentEvent::ToolStarted {
         call_id: &call.id,
         name: &call.name,
@@ -1246,15 +1249,14 @@ where
     .map_err(ClientError::Output)?;
     let read_only = executor.is_read_only(&call.name) == Some(true);
     let mut audit = if let Some(context) = context {
-        let (server_name, tool_name) = call.name.split_once("__").unwrap_or(("", &call.name));
         Some(ToolAuditGuard::start(
             context.store,
             ToolExecutionStart {
                 dialog_id: context.dialog_id,
                 input_message_id: context.input_message_id,
                 tool_call_id: &call.id,
-                server_name,
-                tool_name,
+                server_name: route.server_name,
+                tool_name: route.tool_name,
                 arguments_json: &call.arguments,
             },
             read_only || blocked,

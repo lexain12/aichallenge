@@ -20,7 +20,7 @@ use crate::{
     config::McpConfig,
     tool_calling::{
         ModelToolCall, ModelToolDefinition, ToolExecutionError, ToolExecutionResult, ToolExecutor,
-        ToolFuture,
+        ToolFuture, ToolRoute,
     },
 };
 
@@ -95,6 +95,7 @@ pub enum McpRegistryError {
 
 struct Route {
     client_index: usize,
+    server_name: String,
     original_name: String,
     read_only: bool,
 }
@@ -168,6 +169,7 @@ impl McpRegistry {
                     name.clone(),
                     Route {
                         client_index,
+                        server_name: server_name.clone(),
                         original_name: tool.name.into_owned(),
                         read_only,
                     },
@@ -188,6 +190,13 @@ impl McpRegistry {
 impl ToolExecutor for McpRegistry {
     fn definitions(&self) -> &[ModelToolDefinition] {
         &self.definitions
+    }
+
+    fn route(&self, name: &str) -> Option<ToolRoute<'_>> {
+        self.routes.get(name).map(|route| ToolRoute {
+            server_name: &route.server_name,
+            tool_name: &route.original_name,
+        })
     }
 
     fn is_read_only(&self, name: &str) -> Option<bool> {

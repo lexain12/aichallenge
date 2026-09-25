@@ -7,7 +7,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::agent::{AgentEvent, ToolAuditContext, add_tool_usage, execute_tool};
-use crate::chat::{ChatHistory, Message, ProviderMessage, Role};
+use crate::chat::{ChatHistory, ProviderMessage, Role};
 use crate::client::{AssistantTurn, ClientError, DeepSeekClient, StreamEvent, TokenUsage};
 use crate::config::{ContextConfig, ContextStrategy, WorkflowConfig};
 use crate::context::{ContextState, ContextSummary, prepare_request};
@@ -1600,6 +1600,7 @@ impl<'a> WorkflowEngine<'a> {
         *self.session.last_usage = None;
         let mut budget = AutonomyBudget::new(&self.workflow_config);
         budget.enforce_before_calls = self.tool_executor.is_some();
+        let mut tool_conversation = None;
         WorkflowIntent::human_continue(prompt)?;
         let rules = self.session.store.load_invariants(self.session.scope)?;
         if !rules.is_empty() {
@@ -1859,7 +1860,13 @@ impl<'a> WorkflowEngine<'a> {
         }
         loop {
             let turn = self
-                .run_one_ordinary_turn(&routing, prompt, &mut budget, &mut on_event)
+                .run_one_ordinary_turn(
+                    &routing,
+                    prompt,
+                    &mut budget,
+                    &mut tool_conversation,
+                    &mut on_event,
+                )
                 .await?;
             let Some(ref persisted) = turn.persisted_answer else {
                 return self.finish(
@@ -2757,6 +2764,7 @@ impl<'a> WorkflowEngine<'a> {
         routing: &RoutingOutcome,
         prompt: &str,
         budget: &mut AutonomyBudget,
+        tool_conversation: &mut Option<ToolConversation>,
         on_event: &mut F,
     ) -> Result<OrdinaryTurn, WorkflowEngineError>
     where
@@ -2829,7 +2837,7 @@ impl<'a> WorkflowEngine<'a> {
                 .as_ref()
                 .is_some_and(|state| state.phase == TaskPhase::GoalDefinition);
         let mut goal_proposal = None;
-        let result = if let Some(executor) = self.tool_executor.clone() {
+        let (result, usage) = if let Some(executor) = self.tool_executor.clone() {
             let context = if self.pipeline.has_blocking() {
                 let state =
                     diagnostic_state
@@ -2863,8 +2871,24 @@ impl<'a> WorkflowEngine<'a> {
                 | RoutingOutcome::Unmanaged { input_message_id } => *input_message_id,
                 RoutingOutcome::Rejected { .. } => unreachable!(),
             };
+            let messages = prepared
+                .messages()
+                .iter()
+                .map(ProviderMessage::from)
+                .collect();
+            if let Some(conversation) = tool_conversation.as_mut() {
+                conversation.begin_next_turn(messages)?;
+            } else {
+                *tool_conversation = Some(ToolConversation::new(
+                    messages,
+                    executor.definitions().to_vec(),
+                    self.max_tool_rounds,
+                ));
+            }
             self.run_tool_conversation(
-                prepared.messages(),
+                tool_conversation
+                    .as_mut()
+                    .expect("request conversation initialized"),
                 input_message_id,
                 executor.as_ref(),
                 context.as_ref(),
@@ -2887,9 +2911,11 @@ impl<'a> WorkflowEngine<'a> {
                 .await;
             *self.session.last_usage = usage;
             budget.record_usage(usage);
-            result.map_err(|error| WorkflowEngineError::provider("ordinary", error))
+            (
+                result.map_err(|error| WorkflowEngineError::provider("ordinary", error)),
+                usage,
+            )
         };
-        let usage = *self.session.last_usage;
         let answer = match result {
             Ok(answer) => answer,
             Err(error) => {
@@ -3176,22 +3202,18 @@ impl<'a> WorkflowEngine<'a> {
 
     async fn run_tool_conversation<F>(
         &mut self,
-        messages: &[Message],
+        conversation: &mut ToolConversation,
         input_message_id: i64,
         executor: &dyn ToolExecutor,
         context: Option<&CheckContext>,
         budget: &mut AutonomyBudget,
         on_event: &mut F,
-    ) -> Result<String, WorkflowEngineError>
+    ) -> (Result<String, WorkflowEngineError>, Option<TokenUsage>)
     where
         F: FnMut(AgentEvent<'_>) -> io::Result<()>,
     {
-        *self.session.last_usage = None;
-        let mut conversation = ToolConversation::new(
-            messages.iter().map(ProviderMessage::from).collect(),
-            executor.definitions().to_vec(),
-            self.max_tool_rounds,
-        );
+        let mut answer_usage = None;
+        let result = async {
         loop {
             budget
                 .allow_provider_call()
@@ -3208,6 +3230,7 @@ impl<'a> WorkflowEngine<'a> {
             };
             budget.record_usage(usage);
             if let Some(usage) = usage {
+                answer_usage = Some(add_tool_usage(answer_usage.unwrap_or_default(), usage));
                 let total = add_tool_usage(self.session.last_usage.unwrap_or_default(), usage);
                 *self.session.last_usage = Some(total);
                 emit(on_event, AgentEvent::Usage(total))?;
@@ -3229,15 +3252,13 @@ impl<'a> WorkflowEngine<'a> {
                         let blocked = if executor.is_read_only(&call.name) != Some(true)
                             && let Some(context) = context
                         {
-                            let (server, tool) = call
-                                .name
-                                .split_once("__")
-                                .ok_or(ToolLoopError::InvalidArguments)?;
+                            let route = executor.route(&call.name)
+                                .ok_or_else(|| ToolLoopError::UnknownTool(call.name.clone()))?;
                             let arguments: serde_json::Value =
                                 serde_json::from_str(&call.arguments)
                                     .map_err(|_| ToolLoopError::InvalidArguments)?;
                             let action = serde_json::json!({
-                                "action":"external_tool_call", "server":server, "tool":tool, "arguments":arguments,
+                                "action":"external_tool_call", "server":route.server_name, "tool":route.tool_name, "arguments":arguments,
                             }).to_string();
                             let checked = self
                                 .pipeline
@@ -3290,6 +3311,8 @@ impl<'a> WorkflowEngine<'a> {
                 }
             }
         }
+        }.await;
+        (result, answer_usage)
     }
 
     async fn refresh_stage_facts<F>(

@@ -13,7 +13,7 @@ use deepseek_cli::profile::ProfileRepository;
 use deepseek_cli::tool_audit::ToolExecutionStatus;
 use deepseek_cli::tool_calling::{
     ModelToolCall, ModelToolDefinition, ToolExecutionError, ToolExecutionResult, ToolExecutor,
-    ToolFuture,
+    ToolFuture, ToolRoute,
 };
 use deepseek_cli::workflow::{TaskPhase, TaskStatus};
 use deepseek_cli::workflow_engine::{
@@ -78,6 +78,12 @@ impl FakeToolExecutor {
 impl ToolExecutor for FakeToolExecutor {
     fn definitions(&self) -> &[ModelToolDefinition] {
         &self.definitions
+    }
+    fn route(&self, name: &str) -> Option<ToolRoute<'_>> {
+        (name == "telegram__read_chat").then_some(ToolRoute {
+            server_name: "telegram",
+            tool_name: "read_chat",
+        })
     }
     fn is_read_only(&self, name: &str) -> Option<bool> {
         self.definitions

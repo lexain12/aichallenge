@@ -10,11 +10,12 @@ use deepseek_cli::config::Config;
 use deepseek_cli::context::ContextSummary;
 use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::invariants::{InvariantRepository, InvariantViolation};
+use deepseek_cli::mcp::{McpClient, McpFuture, McpRegistry};
 use deepseek_cli::memory::{DurableMemoryScope, MemoryRepository, RequestScope};
 use deepseek_cli::profile::ProfileRepository;
 use deepseek_cli::tool_audit::ToolExecutionStatus;
 use deepseek_cli::tool_calling::{
-    ModelToolCall, ModelToolDefinition, ToolExecutionResult, ToolExecutor, ToolFuture,
+    ModelToolCall, ModelToolDefinition, ToolExecutionResult, ToolExecutor, ToolFuture, ToolRoute,
 };
 use deepseek_cli::workflow::{
     PlanStepStatus, StepStatusUpdate, TaskPhase, TaskStatePatch, TaskStatus, TransitionEvent,
@@ -419,6 +420,13 @@ impl ToolExecutor for WorkflowTools {
         &self.definitions
     }
 
+    fn route(&self, name: &str) -> Option<ToolRoute<'_>> {
+        (name == "telegram__message").then_some(ToolRoute {
+            server_name: "telegram",
+            tool_name: "message",
+        })
+    }
+
     fn is_read_only(&self, _: &str) -> Option<bool> {
         self.read_only
     }
@@ -440,10 +448,20 @@ impl ToolExecutor for WorkflowTools {
 }
 
 fn workflow_tool_response(ids: &[&str], with_usage: bool) -> ResponseTemplate {
-    let calls: Vec<_> = ids.iter().enumerate().map(|(index, id)| json!({
-        "index":index,"id":id,"type":"function",
-        "function":{"name":"telegram__message","arguments":r#"{"chat":"me","text":"PRIVATE_ARGUMENT"}"#}
-    })).collect();
+    workflow_named_tool_response("telegram__message", ids, with_usage)
+}
+
+fn workflow_named_tool_response(name: &str, ids: &[&str], with_usage: bool) -> ResponseTemplate {
+    let calls: Vec<_> = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            json!({
+                "index":index,"id":id,"type":"function",
+                "function":{"name":name,"arguments":r#"{"chat":"me","text":"PRIVATE_ARGUMENT"}"#}
+            })
+        })
+        .collect();
     let mut chunk = json!({"choices":[{"delta":{"content":"PRIVATE_INTERMEDIATE","tool_calls":calls},"finish_reason":"tool_calls"}]});
     if with_usage {
         chunk["usage"] = serde_json::to_value(usage()).unwrap();
@@ -844,6 +862,139 @@ async fn workflow_tool_round_limit_allows_final_text_but_never_an_extra_executio
     }
 }
 
+// Break caught: autonomous continuations reset the request's tool-round allowance.
+#[tokio::test]
+async fn workflow_tool_round_limit_spans_autonomous_ordinary_turns() {
+    let (mut f, tools) = tool_fixture(Some(false), false).await;
+    f.config = Config::from_toml(
+        &format!(
+            "api_key='key'\nbase_url='{}'\n[mcp]\nmax_tool_rounds=1\n[context]\nstrategy='summary'",
+            f.server.uri()
+        ),
+        None,
+    )
+    .unwrap();
+    f.checker.reply(checked(1, None, continue_decision()));
+    f.checker
+        .reply(checked(2, None, json!({"type":"await_user"})));
+    workflow_tool_sequence(
+        &f,
+        vec![
+            workflow_tool_response(&["first"], true),
+            ordinary_response("First final", true),
+            workflow_tool_response(&["second"], true),
+            ordinary_response("Second final", true),
+        ],
+    )
+    .await;
+    let result = f.run("send", |_| Ok(())).await;
+    assert!(
+        matches!(
+            result,
+            Err(WorkflowEngineError::ToolLoop(
+                deepseek_cli::tool_calling::ToolLoopError::RoundLimitExceeded
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(tools.calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        f.store.tool_executions(f.dialog_id.unwrap()).unwrap().len(),
+        1
+    );
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 3);
+    assert_eq!(f.checker.calls(), 1);
+}
+
+// Break caught: controller input IDs allow the same write call ID to execute twice in one request.
+#[tokio::test]
+async fn workflow_tool_duplicate_write_id_spans_autonomous_ordinary_turns() {
+    let (mut f, tools) = tool_fixture(Some(false), false).await;
+    f.checker.reply(checked(1, None, continue_decision()));
+    f.checker
+        .reply(checked(2, None, json!({"type":"await_user"})));
+    workflow_tool_sequence(
+        &f,
+        vec![
+            workflow_tool_response(&["same_write"], true),
+            ordinary_response("First final", true),
+            workflow_tool_response(&["same_write"], true),
+            ordinary_response("Second final", true),
+        ],
+    )
+    .await;
+    let result = f.run("send", |_| Ok(())).await;
+    assert!(
+        matches!(result, Err(WorkflowEngineError::ToolLoop(deepseek_cli::tool_calling::ToolLoopError::DuplicateCallId(ref id))) if id == "same_write"),
+        "{result:?}"
+    );
+    assert_eq!(tools.calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        f.store.tool_executions(f.dialog_id.unwrap()).unwrap().len(),
+        1
+    );
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 3);
+}
+
+// Break caught: autonomous answers reset public usage or persist the request total twice.
+#[tokio::test]
+async fn workflow_tool_usage_spans_autonomous_answers_without_double_counting() {
+    let (mut f, _) = tool_fixture(Some(true), false).await;
+    f.checker.reply(checked(1, None, continue_decision()));
+    f.checker
+        .reply(checked(2, None, json!({"type":"await_user"})));
+    workflow_tool_sequence(
+        &f,
+        vec![
+            workflow_tool_response(&["first"], true),
+            ordinary_response("First final", true),
+            workflow_tool_response(&["second"], true),
+            ordinary_response("Second final", true),
+        ],
+    )
+    .await;
+    let mut reported = Vec::new();
+    let result = f
+        .run("read", |event| {
+            if let AgentEvent::Usage(usage) = event {
+                reported.push(usage.total_tokens);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.tokens, 21);
+    assert_eq!(result.autonomous_turns, 1);
+    assert_eq!(f.last_usage.unwrap().total_tokens, 12);
+    assert_eq!(reported, [3, 6, 9, 12]);
+    let saved = f.store.load(f.dialog_id.unwrap()).unwrap();
+    let answers: Vec<_> = saved
+        .messages
+        .iter()
+        .filter(|message| message.role() == deepseek_cli::chat::Role::Assistant)
+        .map(|message| (message.content(), message.usage().unwrap().total_tokens))
+        .collect();
+    assert_eq!(answers, [("First final", 6), ("Second final", 6)]);
+
+    // A new human request gets a fresh usage total and a fresh ID/round allowance.
+    f.server.reset().await;
+    f.interpreter.reply(interpretation(
+        json!({"type":"continue","instruction":"read again"}),
+    ));
+    f.checker
+        .reply(checked(3, None, json!({"type":"await_user"})));
+    workflow_tool_sequence(
+        &f,
+        vec![
+            workflow_tool_response(&["first"], true),
+            ordinary_response("New request", true),
+        ],
+    )
+    .await;
+    f.run("read again", |_| Ok(())).await.unwrap();
+    assert_eq!(f.last_usage.unwrap().total_tokens, 6);
+}
+
 // Break caught: one approval incorrectly authorizes all writes in a multi-call response.
 #[tokio::test]
 async fn workflow_tool_each_write_requires_its_own_policy_check() {
@@ -881,6 +1032,114 @@ async fn workflow_tool_each_write_requires_its_own_policy_check() {
     assert_eq!(
         audit[1].error_code.as_ref().unwrap().as_str(),
         "blocked_by_invariant"
+    );
+}
+
+type RoutedCalls = Arc<Mutex<Vec<(String, String, serde_json::Map<String, Value>)>>>;
+
+struct RoutedWriteClient {
+    server: &'static str,
+    calls: RoutedCalls,
+}
+
+impl McpClient for RoutedWriteClient {
+    fn list_tools(&self) -> McpFuture<'_, Vec<rmcp::model::Tool>> {
+        Box::pin(async {
+            Ok(vec![
+                serde_json::from_value(json!({
+                    "name":"message", "inputSchema":{"type":"object"},
+                    "annotations":{"readOnlyHint":false}
+                }))
+                .unwrap(),
+            ])
+        })
+    }
+
+    fn call_tool<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: serde_json::Map<String, Value>,
+    ) -> McpFuture<'a, rmcp::model::CallToolResult> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((self.server.into(), name.into(), arguments));
+            Ok(serde_json::from_value(json!({"content":[{"type":"text","text":"sent"}]})).unwrap())
+        })
+    }
+}
+
+// Break caught: the provider alias's delimiter hides the true server from policy and audit.
+#[tokio::test]
+async fn workflow_tool_trailing_underscore_route_matches_policy_audit_and_dispatch() {
+    let (mut f, _) = tool_fixture(Some(false), true).await;
+    let calls: RoutedCalls = Arc::default();
+    let registry = McpRegistry::from_clients(
+        vec![
+            (
+                "telegram".into(),
+                Box::new(RoutedWriteClient {
+                    server: "telegram",
+                    calls: calls.clone(),
+                }) as Box<dyn McpClient>,
+            ),
+            (
+                "telegram_".into(),
+                Box::new(RoutedWriteClient {
+                    server: "telegram_",
+                    calls: calls.clone(),
+                }) as Box<dyn McpClient>,
+            ),
+        ],
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    f.tool_executor = Some(Arc::new(registry));
+    f.checker.reply(json!({"type":"allow"}));
+    f.checker.reply(json!({"type":"allow"}));
+    f.checker
+        .reply(checked(1, None, json!({"type":"await_user"})));
+    workflow_tool_sequence(
+        &f,
+        vec![
+            workflow_named_tool_response("telegram___message", &["write"], true),
+            ordinary_response("Sent", true),
+        ],
+    )
+    .await;
+    f.run("send", |_| Ok(())).await.unwrap();
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![(
+            "telegram_".into(),
+            "message".into(),
+            json!({"chat":"me","text":"PRIVATE_ARGUMENT"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )]
+    );
+    let requests = f.checker.requests.lock().unwrap();
+    let candidate: Value =
+        serde_json::from_str(requests[0].messages.last().unwrap().content()).unwrap();
+    let action: Value =
+        serde_json::from_str(candidate["subject"]["candidate_response"].as_str().unwrap()).unwrap();
+    let audit = f
+        .store
+        .tool_executions(f.dialog_id.unwrap())
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        (
+            action["server"].as_str().unwrap(),
+            action["tool"].as_str().unwrap(),
+            audit.server_name.as_str(),
+            audit.tool_name.as_str()
+        ),
+        ("telegram_", "message", "telegram_", "message"),
     );
 }
 

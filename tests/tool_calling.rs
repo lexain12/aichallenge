@@ -238,6 +238,47 @@ fn duplicate_ids_across_rounds_are_rejected_without_state_change() {
 }
 
 #[test]
+fn next_ordinary_turn_requires_completion_and_replaces_only_transcript_and_usage() {
+    let mut conversation = ToolConversation::new(base_messages(), definitions(), 8);
+    assert!(conversation.begin_next_turn(base_messages()).is_err());
+    let assistant = execute(
+        conversation
+            .accept_assistant_turn(tool_turn(vec![call("same")], Some(usage(2, 1))))
+            .unwrap(),
+    );
+    assert!(conversation.begin_next_turn(base_messages()).is_err());
+    conversation
+        .accept_tool_results(
+            assistant,
+            vec![ToolResultMessage::success("same", "PRIVATE_RESULT")],
+        )
+        .unwrap();
+    conversation
+        .accept_assistant_turn(AssistantTurn::FinalText {
+            content: "first final".into(),
+            usage: Some(usage(2, 1)),
+        })
+        .unwrap();
+    conversation.begin_next_turn(base_messages()).unwrap();
+    assert_eq!(
+        conversation
+            .messages()
+            .iter()
+            .map(envelope)
+            .collect::<Vec<_>>(),
+        base_messages().iter().map(envelope).collect::<Vec<_>>()
+    );
+    assert_eq!(conversation.usage(), TokenUsage::default());
+    assert_eq!(conversation.rounds(), 1);
+    assert_eq!(
+        conversation
+            .accept_assistant_turn(tool_turn(vec![call("same")], None))
+            .unwrap_err(),
+        ToolLoopError::DuplicateCallId("same".into())
+    );
+}
+
+#[test]
 fn usage_accumulates_across_tool_and_final_turns() {
     let mut conversation = ToolConversation::new(base_messages(), definitions(), 8);
     let assistant = execute(
