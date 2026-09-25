@@ -111,8 +111,8 @@ impl McpRegistry {
         let mut clients: Vec<(String, Box<dyn McpClient>)> = Vec::new();
         for server in &config.servers {
             // Session recovery replays ordinary POSTs, which may duplicate writes.
-            let transport = StreamableHttpClientTransport::with_client(
-                reqwest::Client::default(),
+            // Keep rmcp's no-redirect HTTP client so redirects cannot replay calls.
+            let transport = StreamableHttpClientTransport::from_config(
                 StreamableHttpClientTransportConfig::with_uri(server.url.as_str())
                     .reinit_on_expired_session(false),
             );

@@ -388,6 +388,81 @@ async fn expired_http_session_does_not_reinitialize_or_replay_tool_call() {
 }
 
 #[tokio::test]
+async fn http_307_redirect_does_not_replay_tool_call_to_another_origin() {
+    assert_tool_redirect_is_not_followed(307).await;
+}
+
+#[tokio::test]
+async fn http_308_redirect_does_not_replay_tool_call_to_another_origin() {
+    assert_tool_redirect_is_not_followed(308).await;
+}
+
+async fn assert_tool_redirect_is_not_followed(status: u16) {
+    use wiremock::{Mock, Request, ResponseTemplate, matchers::method};
+
+    let source = wiremock::MockServer::start().await;
+    let target = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("private target failure"))
+        .mount(&target)
+        .await;
+    let target_url = format!("{}/capture", target.uri());
+    Mock::given(method("POST"))
+        .respond_with(move |request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion":"2025-03-26", "capabilities":{"tools":{}}, "serverInfo":{"name":"fixture", "version":"1"}}),
+                "notifications/initialized" => return ResponseTemplate::new(202),
+                "tools/list" => json!({"tools":[{"name":"write_chat", "inputSchema":{}, "annotations":{"readOnlyHint":false}}]}),
+                "tools/call" => return ResponseTemplate::new(status)
+                    .insert_header("Location", target_url.as_str())
+                    .set_body_string("private redirect details"),
+                other => panic!("Unexpected MCP method: {other}"),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+        })
+        .mount(&source)
+        .await;
+    let config = McpConfig {
+        connect_timeout: Duration::from_secs(2),
+        call_timeout: Duration::from_secs(2),
+        max_tool_rounds: 1,
+        servers: vec![McpServerConfig {
+            name: "telegram".into(),
+            url: format!("{}/mcp", source.uri()).parse().unwrap(),
+        }],
+    };
+    let registry = McpRegistry::connect(&config).await.unwrap();
+    let error = registry
+        .call(&ModelToolCall {
+            id: "write-redirect".into(),
+            name: "telegram__write_chat".into(),
+            arguments: r#"{"text":"private message"}"#.into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error, ToolExecutionError::Transport);
+    assert!(!error.to_string().contains("private"));
+    assert!(!error.to_string().contains(&source.uri()));
+    assert!(!error.to_string().contains(&target.uri()));
+
+    let source_requests = source.received_requests().await.unwrap();
+    let source_calls = source_requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+        .filter(|body| body["method"] == "tools/call")
+        .count();
+    let target_requests = target.received_requests().await.unwrap();
+    assert_eq!(
+        (source_calls, target_requests.len()),
+        (1, 0),
+        "HTTP {status} must not replay a tool call to the redirect target"
+    );
+}
+
+#[tokio::test]
 async fn discovery_failure_or_timeout_fails_startup() {
     for hang in [false, true] {
         let mut fake = FakeMcpClient::one();
