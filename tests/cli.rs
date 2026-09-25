@@ -404,6 +404,108 @@ async fn mcp_duplicate_remote_tool_name_is_not_printed() {
     assert!(stderr.contains("MCP"), "{stderr}");
 }
 
+async fn cli_tool_lifecycle_output(tool_result: Value) -> Output {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"test","version":"1"}}),
+                "notifications/initialized" => return ResponseTemplate::new(202),
+                "tools/list" => json!({"tools":[{"name":"send_message","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":false}}]}),
+                "tools/call" => tool_result.clone(),
+                other => panic!("unexpected MCP method: {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+        })
+        .mount(&server)
+        .await;
+    let tool_turn = json!({"choices":[{"delta":{
+        "content":"PRIVATE_INTERMEDIATE_TEXT",
+        "tool_calls":[{"index":0,"id":"call_1","type":"function","function":{
+            "name":"telegram__send_message",
+            "arguments":json!({"chat":"PRIVATE_ARGUMENT_CHAT","text":"PRIVATE_ARGUMENT_MESSAGE"}).to_string()
+        }}]
+    },"finish_reason":"tool_calls"}]});
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequenceResponder {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {tool_turn}\n\ndata: [DONE]\n\n")),
+                sse("Final answer", 2, 1, 3),
+            ]))),
+        })
+        .mount(&server)
+        .await;
+    let mut config = write_config(&server.uri());
+    writeln!(
+        config,
+        "\n[mcp]\nconnect_timeout_seconds=2\n[[mcp.servers]]\nname='telegram'\nurl='{}/mcp'",
+        server.uri()
+    )
+    .unwrap();
+    let output = run_cli(config.path(), "perform synthetic operation\n/exit\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("assistant> Final answer\n"), "{stdout}");
+    assert_eq!(stdout.matches("assistant> ").count(), 1, "{stdout}");
+    assert!(!stdout.contains('\u{1b}'));
+    assert!(!stderr.contains('\u{1b}'));
+    assert!(!stdout.contains("PRIVATE_"), "{stdout}");
+    assert!(!stderr.contains("PRIVATE_"), "{stderr}");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.body_json::<Value>().unwrap()["method"] == "tools/call")
+            .count(),
+        1
+    );
+    output
+}
+
+#[tokio::test]
+async fn mcp_tool_success_lifecycle_is_visible_without_payloads() {
+    let output = cli_tool_lifecycle_output(
+        json!({"content":[{"type":"text","text":"PRIVATE_TOOL_RESULT"}]}),
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Tool started · telegram__send_message · call=call_1\nTool succeeded · telegram__send_message · call=call_1\n"
+    );
+}
+
+#[tokio::test]
+async fn mcp_tool_uncertain_and_failed_lifecycles_are_visible_without_payloads() {
+    for (result, finish) in [
+        (
+            serde_json::from_str(include_str!("fixtures/mcp_delivery_unknown.json")).unwrap(),
+            "Tool uncertain (delivery_unknown)",
+        ),
+        (
+            json!({"isError":true,"content":[{"type":"text","text":"PRIVATE_REMOTE_ERROR"}]}),
+            "Tool failed (mcp_tool_error)",
+        ),
+    ] {
+        let output = cli_tool_lifecycle_output(result).await;
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!(
+                "Tool started · telegram__send_message · call=call_1\n{finish} · telegram__send_message · call=call_1\n"
+            )
+        );
+    }
+}
+
 #[tokio::test]
 async fn mcp_tool_audit_persistence_failure_is_fatal_and_sanitized() {
     for finalization in [true, false] {

@@ -1,6 +1,7 @@
 """The MCP boundary uses the SDK's in-memory client, never a socket."""
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -152,6 +153,63 @@ async def test_known_gateway_failure_is_a_safe_tool_error(fake_gateway) -> None:
         "candidates": [CHAT.model_dump(mode="json")],
     }
     assert fake_gateway.calls == [("send_message", "Saved Messages", "hello")]
+
+
+async def test_ambiguous_candidates_remain_in_response_but_never_in_logs(fake_gateway, caplog) -> None:
+    private_chat = ChatSummary(
+        chat_id="-1009876543210123", title="PRIVATE_CANDIDATE_TITLE",
+        username="PRIVATE_CANDIDATE_USERNAME", kind="group", is_self=False,
+    )
+    fake_gateway.failure = TelegramToolFailure(
+        "ambiguous_chat", "Multiple chats match; choose a chat_id", [private_chat]
+    )
+    with caplog.at_level(logging.INFO):
+        async with Client(build_server(fake_gateway)) as client:
+            result = await client.call_tool("send_message", {
+                "chat": "PRIVATE_ARGUMENT_CHAT", "text": "PRIVATE_ARGUMENT_MESSAGE",
+            })
+
+    assert result.is_error is True
+    payload = json.loads(result.content[0].text.partition(": ")[2])
+    assert payload["candidates"] == [private_chat.model_dump(mode="json")]
+    assert payload["code"] == "ambiguous_chat"
+    assert caplog.records, "the SDK diagnostic should retain safe metadata"
+    for sentinel in [
+        private_chat.chat_id, private_chat.title, private_chat.username,
+        "PRIVATE_ARGUMENT_CHAT", "PRIVATE_ARGUMENT_MESSAGE", "candidates",
+    ]:
+        assert sentinel not in caplog.text
+    assert "send_message" in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("failure_source", ["gateway", "sdk_result_conversion"])
+async def test_unexpected_exceptions_never_log_details_or_tracebacks(
+    fake_gateway, caplog, monkeypatch, failure_source
+) -> None:
+    server = build_server(fake_gateway)
+    sentinel = "PRIVATE_UNEXPECTED_EXCEPTION_DETAIL"
+    if failure_source == "gateway":
+        fake_gateway.failure = RuntimeError(sentinel)
+    else:
+        tool = server._tool_manager.get_tool("read_chat")
+
+        def broken_conversion(self, result):
+            raise RuntimeError(sentinel)
+
+        monkeypatch.setattr(type(tool.fn_metadata), "convert_result", broken_conversion)
+
+    with caplog.at_level(logging.INFO):
+        async with Client(server) as client:
+            result = await client.call_tool("read_chat", {"chat": "me"})
+
+    assert result.is_error is True
+    assert sentinel not in result.content[0].text
+    assert caplog.records, "the SDK diagnostic should retain safe metadata"
+    assert sentinel not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "read_chat" in caplog.text
+    assert all(record.exc_info is None and record.exc_text is None for record in caplog.records)
 
 
 async def test_delivery_unknown_uses_the_shared_safe_mcp_error_envelope(fake_gateway) -> None:

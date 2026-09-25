@@ -500,6 +500,33 @@ impl<'a, W: Write> FullWidthBlock<'a, W> {
         self.writer.flush()
     }
 
+    /// Emit metadata on stderr without overwriting the pending response/loader
+    /// when both streams share a terminal. Pipes keep the two streams separate.
+    pub fn write_status<E: Write>(
+        &mut self,
+        ui: TerminalUi,
+        writer: &mut E,
+        text: &str,
+    ) -> io::Result<()> {
+        let restore_prefix = self.live_status && self.waiting_for_text && !self.closed;
+        if restore_prefix {
+            self.hide_live_status()?;
+            write!(self.writer, "\r\x1b[2K{RESET}")?;
+            self.writer.flush()?;
+        }
+        ui.write_block(writer, BlockStyle::System, text)?;
+        if restore_prefix {
+            self.column = 0;
+            self.last_was_newline = false;
+            write!(self.writer, "{}", self.ansi_style)?;
+            self.write_content("assistant> ")?;
+            self.flush_pending_grapheme()?;
+            self.draw_live_status()?;
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
     fn write_content(&mut self, text: &str) -> io::Result<()> {
         if !self.styled && !self.live_status {
             for character in text.chars() {
@@ -961,6 +988,53 @@ mod tests {
         block.write_text("Ответ").unwrap();
         block.finish().unwrap();
         assert_eq!(String::from_utf8(output).unwrap(), "assistant> Ответ\n");
+    }
+
+    #[test]
+    fn tool_status_keeps_its_line_and_restores_the_pending_answer_cursor() {
+        use std::cell::RefCell;
+        use std::io::{self, Write};
+        use std::rc::Rc;
+
+        #[derive(Clone, Default)]
+        struct SharedTerminal(Rc<RefCell<Vec<u8>>>);
+        impl Write for SharedTerminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let ui = TerminalUi {
+            styled: false,
+            interactive: true,
+            inline_images: false,
+        };
+        let mut stdout = SharedTerminal::default();
+        let mut stderr = stdout.clone();
+        let output = stdout.0.clone();
+        let mut block = ui.start_response(&mut stdout).unwrap();
+        let start = output.borrow().len();
+        block
+            .write_status(ui, &mut stderr, "Tool started · call=call_1")
+            .unwrap();
+        let after_status = output.borrow().len();
+        let status = String::from_utf8(output.borrow()[start..after_status].to_vec()).unwrap();
+        assert!(
+            status.contains("\r\x1b[2K\x1b[0mTool started · call=call_1\nassistant> "),
+            "{status:?}"
+        );
+        assert!(status.ends_with("\x1b[12G"), "{status:?}");
+
+        block.write_text("Final answer\n").unwrap();
+        block.finish().unwrap();
+        let answer = String::from_utf8(output.borrow()[after_status..].to_vec()).unwrap();
+        assert!(answer.contains("\x1b[12GFinal answer\n"), "{answer:?}");
+        assert!(!answer.contains("Думаю"));
+        assert!(!answer.contains("Tool started"));
     }
 
     #[test]

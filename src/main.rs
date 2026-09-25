@@ -13,6 +13,7 @@ use deepseek_cli::dialog::{DialogStore, StoreError};
 use deepseek_cli::mcp::{McpRegistry, McpRegistryError};
 use deepseek_cli::memory::{DEFAULT_TASK_ID, DEFAULT_USER_ID, DurableMemoryScope, RequestScope};
 use deepseek_cli::terminal::{BlockStyle, TerminalUi};
+use deepseek_cli::tool_audit::ToolExecutionStatus;
 use deepseek_cli::tool_calling::ToolExecutor;
 use deepseek_cli::workflow::TaskPhase;
 use deepseek_cli::workflow_engine::{WorkflowEngineError, WorkflowTurnEvent};
@@ -581,7 +582,27 @@ async fn run_prompt<W: io::Write, E: io::Write>(
                 .as_mut()
                 .expect("compaction starts after ordinary response text")
                 .write_text(fragment),
-            AgentEvent::Usage(_) | AgentEvent::ToolStarted { .. } | AgentEvent::ToolFinished { .. } => Ok(()),
+            AgentEvent::Usage(_) => Ok(()),
+            AgentEvent::ToolStarted { call_id, name } => block
+                .as_mut()
+                .expect("tool events belong to an ordinary response")
+                .write_status(stderr_ui, stderr, &format!(
+                    "Tool started · {name} · call={}", tool_call_label(call_id)
+                )),
+            AgentEvent::ToolFinished { call_id, name, status, code } => {
+                let status = match status {
+                    ToolExecutionStatus::Started => "started",
+                    ToolExecutionStatus::Succeeded => "succeeded",
+                    ToolExecutionStatus::Failed => "failed",
+                    ToolExecutionStatus::Uncertain => "uncertain",
+                };
+                let code = code.map_or_else(String::new, |code| format!(" ({code})"));
+                block.as_mut()
+                    .expect("tool events belong to an ordinary response")
+                    .write_status(stderr_ui, stderr, &format!(
+                        "Tool {status}{code} · {name} · call={}", tool_call_label(call_id)
+                    ))
+            }
             AgentEvent::Workflow(event) => match event {
                 WorkflowTurnEvent::AutonomousTurnStarted { number, phase } => {
                     block
@@ -724,6 +745,15 @@ async fn run_prompt<W: io::Write, E: io::Write>(
     }
 }
 
+fn tool_call_label(call_id: &str) -> String {
+    let mut characters = call_id.escape_debug();
+    let mut label: String = characters.by_ref().take(64).collect();
+    if characters.next().is_some() {
+        label.push('…');
+    }
+    label
+}
+
 fn write_interruption<W: io::Write>(
     ui: &TerminalUi,
     writer: &mut W,
@@ -837,6 +867,18 @@ mod tests {
                 assert!(error.to_string().contains("identifier must not be blank"));
             }
         }
+    }
+
+    #[test]
+    fn tool_call_metadata_cannot_inject_lines_or_grow_without_bound() {
+        assert_eq!(
+            super::tool_call_label("call\n\x1b[31m"),
+            "call\\n\\u{1b}[31m"
+        );
+        assert_eq!(
+            super::tool_call_label(&"x".repeat(1000)),
+            format!("{}…", "x".repeat(64))
+        );
     }
 
     #[test]

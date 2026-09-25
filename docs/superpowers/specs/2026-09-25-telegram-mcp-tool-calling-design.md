@@ -315,7 +315,7 @@ started_at
 finished_at
 ```
 
-Пара `(dialog_id, tool_call_id)` уникальна. До обращения к MCP сохраняется
+Ключ `(dialog_id, input_message_id, tool_call_id)` уникален. До обращения к MCP сохраняется
 `started`, после однозначного результата — `succeeded` или `failed`, после
 потери определённости для write-вызова — `uncertain`. Сырые arguments, tool
 results и прочитанные Telegram-сообщения в SQLite не сохраняются. Они могут

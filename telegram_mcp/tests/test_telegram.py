@@ -1,3 +1,5 @@
+import asyncio
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -173,7 +175,93 @@ async def test_real_client_disables_internal_send_retries(monkeypatch) -> None:
 
     await gateway.list_chats(None, 1)
 
-    assert options == [{"request_retries": 0, "flood_sleep_threshold": 0}]
+    assert options[0]["request_retries"] == 0
+    assert options[0]["flood_sleep_threshold"] == 0
+
+
+@pytest.mark.parametrize("cancel_waiter", [False, True])
+async def test_dispatched_write_is_not_requeued_after_connection_loss(monkeypatch, cancel_waiter) -> None:
+    """Catch transport replay even after the caller stops waiting for its write."""
+    import telegram_mcp.telegram as telegram
+    from telethon import TelegramClient
+    from telethon.tl.functions.messages import SendMessageRequest
+    from telethon.tl.types import User
+
+    class OfflineConnection:
+        def __init__(self):
+            self.connect_calls = 0
+            self.dispatched = []
+            self.sent = asyncio.Event()
+            self.receive_errors = asyncio.Queue()
+            self._connected = False
+
+        async def connect(self, **kwargs):
+            self.connect_calls += 1
+            self._connected = True
+
+        async def disconnect(self):
+            self._connected = False
+
+        async def send(self, data):
+            self.dispatched.append(data)
+            self.sent.set()
+
+        async def recv(self):
+            raise await self.receive_errors.get()
+
+    connection = OfflineConnection()
+
+    class OfflineTelegramClient(TelegramClient):
+        async def connect(self):
+            # Only authentication/handshake and the socket are replaced. The
+            # request, packer, send/receive loops and reconnect scheduler are real.
+            self._sender.auth_key.key = bytes([1]) * 256
+            await self._sender.connect(connection)
+
+        async def is_user_authorized(self):
+            return True
+
+        async def get_me(self, input_peer=False):
+            return User(7, is_self=True, first_name="Owner")
+
+    monkeypatch.setattr(telegram, "TelegramClient", OfflineTelegramClient)
+    gateway = TelethonGateway(Settings(123, "synthetic-hash", ""))
+    task = asyncio.create_task(gateway.send_message("me", "synthetic pending write"))
+    try:
+        await asyncio.wait_for(connection.sent.wait(), timeout=1)
+        sender = gateway._client._sender
+        pending = list(sender._pending_state.values())
+        assert len(pending) == 1
+        assert isinstance(pending[0].request, SendMessageRequest)
+        if cancel_waiter:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        receive_loop = sender._recv_loop_handle
+        connection.receive_errors.put_nowait(ConnectionError("synthetic lost response"))
+        await asyncio.wait_for(receive_loop, timeout=1)
+        await asyncio.wait_for(sender._reconnect_task, timeout=1)
+
+        assert connection.connect_calls == 1, "connection loss must not reconnect and replay"
+        assert len(connection.dispatched) == 1
+        assert not sender._pending_state
+        assert not sender._send_queue._deque
+        assert not gateway._client.is_connected()
+        if not cancel_waiter:
+            with pytest.raises(TelegramToolFailure) as caught:
+                await asyncio.wait_for(task, timeout=1)
+            assert caught.value.code == "delivery_unknown"
+            assert "synthetic lost response" not in str(caught.value)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, TelegramToolFailure):
+            await task
+        if gateway._client is not None:
+            await gateway._client._sender.disconnect()
+            # Consume the sender's terminal error without running client updates.
+            if gateway._client._sender._disconnected.done():
+                gateway._client._sender._disconnected.exception()
 
 
 async def test_unauthorized_session_fails_before_reading_dialogs(fake_client) -> None:

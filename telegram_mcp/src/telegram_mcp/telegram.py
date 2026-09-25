@@ -99,6 +99,9 @@ class TelethonGateway:
                         self._settings.api_hash,
                         request_retries=0,
                         flood_sleep_threshold=0,
+                        # RPC retries and transport replay are separate in
+                        # Telethon: reconnect would requeue pending writes.
+                        auto_reconnect=False,
                     )
                 if not self._client.is_connected():
                     await self._client.connect()
