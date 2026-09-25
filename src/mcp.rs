@@ -8,7 +8,9 @@ use rmcp::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ClientConfig, ContentBlock, Tool,
     },
     service::RunningService,
-    transport::StreamableHttpClientTransport,
+    transport::{
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -108,7 +110,12 @@ impl McpRegistry {
     pub async fn connect(config: &McpConfig) -> Result<Self, McpRegistryError> {
         let mut clients: Vec<(String, Box<dyn McpClient>)> = Vec::new();
         for server in &config.servers {
-            let transport = StreamableHttpClientTransport::from_uri(server.url.as_str());
+            // Session recovery replays ordinary POSTs, which may duplicate writes.
+            let transport = StreamableHttpClientTransport::with_client(
+                reqwest::Client::default(),
+                StreamableHttpClientTransportConfig::with_uri(server.url.as_str())
+                    .reinit_on_expired_session(false),
+            );
             let service = timeout(
                 config.connect_timeout,
                 ClientConfig::default().serve(transport),

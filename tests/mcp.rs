@@ -320,6 +320,74 @@ async fn http_adapter_discovers_all_pages_and_reuses_initialized_client() {
 }
 
 #[tokio::test]
+async fn expired_http_session_does_not_reinitialize_or_replay_tool_call() {
+    use wiremock::{Mock, Request, ResponseTemplate, matchers::method};
+
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(405))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion":"2025-03-26", "capabilities":{"tools":{}}, "serverInfo":{"name":"fixture", "version":"1"}}),
+                "notifications/initialized" => return ResponseTemplate::new(202),
+                "tools/list" => json!({"tools":[{"name":"write_chat", "inputSchema":{}, "annotations":{"readOnlyHint":false}}]}),
+                "tools/call" => return ResponseTemplate::new(404).set_body_string("private session failure details"),
+                other => panic!("Unexpected MCP method: {other}"),
+            };
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", "fixture-session")
+                .set_body_json(json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+        })
+        .mount(&server)
+        .await;
+    let config = McpConfig {
+        connect_timeout: Duration::from_secs(2),
+        call_timeout: Duration::from_secs(2),
+        max_tool_rounds: 1,
+        servers: vec![McpServerConfig {
+            name: "telegram".into(),
+            url: format!("{}/mcp", server.uri()).parse().unwrap(),
+        }],
+    };
+    let registry = McpRegistry::connect(&config).await.unwrap();
+    let error = registry
+        .call(&ModelToolCall {
+            id: "write-1".into(),
+            name: "telegram__write_chat".into(),
+            arguments: r#"{"text":"private message"}"#.into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error, ToolExecutionError::Transport);
+    assert!(!error.to_string().contains("private"));
+    assert!(!error.to_string().contains(&server.uri()));
+
+    let requests = server.received_requests().await.unwrap();
+    let bodies: Vec<Value> = requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    let initializations = bodies
+        .iter()
+        .filter(|body| body["method"] == "initialize")
+        .count();
+    let calls = bodies
+        .iter()
+        .filter(|body| body["method"] == "tools/call")
+        .count();
+    assert_eq!(
+        (initializations, calls),
+        (1, 1),
+        "expired sessions must not reinitialize or replay a write"
+    );
+}
+
+#[tokio::test]
 async fn discovery_failure_or_timeout_fails_startup() {
     for hang in [false, true] {
         let mut fake = FakeMcpClient::one();
