@@ -11,12 +11,12 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class Settings:
-    api_id: int
+    api_id: int = field(repr=False)
     api_hash: str = field(repr=False)
     session_string: str = field(repr=False)
-    host: str = "127.0.0.1"
-    port: int = 8000
-    path: str = "/mcp"
+    host: str = field(default="127.0.0.1", init=False)
+    port: int = field(default=8000, init=False)
+    path: str = field(default="/mcp", init=False)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> "Settings":
@@ -33,8 +33,8 @@ class Settings:
 
         try:
             api_id = int(env["TELEGRAM_API_ID"])
-        except ValueError as error:
-            raise ConfigError("TELEGRAM_API_ID must be an integer") from error
+        except ValueError:
+            raise ConfigError("TELEGRAM_API_ID must be an integer") from None
 
         return cls(
             api_id=api_id,
