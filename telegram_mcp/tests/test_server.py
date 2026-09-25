@@ -2,6 +2,7 @@
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from mcp.client import Client
@@ -151,6 +152,20 @@ async def test_known_gateway_failure_is_a_safe_tool_error(fake_gateway) -> None:
         "candidates": [CHAT.model_dump(mode="json")],
     }
     assert fake_gateway.calls == [("send_message", "Saved Messages", "hello")]
+
+
+async def test_delivery_unknown_uses_the_shared_safe_mcp_error_envelope(fake_gateway) -> None:
+    fake_gateway.failure = TelegramToolFailure(
+        "delivery_unknown", "private error details must not cross this boundary", [CHAT]
+    )
+    async with Client(build_server(fake_gateway)) as client:
+        result = await client.call_tool("send_message", {"chat": "me", "text": "synthetic"})
+
+    fixture = Path(__file__).resolve().parents[2] / "tests/fixtures/mcp_delivery_unknown.json"
+    assert result.model_dump(mode="json", by_alias=True, exclude_none=True) == json.loads(
+        fixture.read_text()
+    )
+    assert fake_gateway.calls == [("send_message", "me", "synthetic")]
 
 
 async def test_unexpected_gateway_failure_is_not_presented_as_known_error(fake_gateway) -> None:

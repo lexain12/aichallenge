@@ -1,0 +1,16 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Error executing tool send_message: {\"mcp_error\": {\"version\": 1, \"code\": \"delivery_unknown\"}}"
+    }
+  ],
+  "isError": true,
+  "resultType": "complete",
+  "_meta": {
+    "io.modelcontextprotocol/serverInfo": {
+      "name": "telegram-mcp",
+      "version": ""
+    }
+  }
+}

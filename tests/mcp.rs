@@ -157,14 +157,85 @@ async fn identical_original_names_on_different_servers_route_independently() {
 }
 
 #[tokio::test]
-async fn structured_content_wins_and_preserves_server_error_flag() {
+async fn unrecognized_structured_error_is_sanitized_before_content_conversion() {
     let mut fake = FakeMcpClient::one();
     fake.result = serde_json::from_value(json!({"structuredContent":{"answer":42}, "content":[{"type":"image", "data":"eA==", "mimeType":"image/png"}], "isError":true})).unwrap();
     let result = registry(fake).await.call(&call("{}")).await.unwrap();
-    assert_eq!(result.content, r#"{"answer":42}"#);
+    assert_eq!(result.content, r#"{"error":"mcp_tool_error"}"#);
     assert!(result.is_error);
     assert_eq!(result.error_code.as_deref(), Some("mcp_tool_error"));
     assert!(!result.delivery_uncertain);
+}
+
+#[tokio::test]
+async fn server_delivery_unknown_marks_a_write_uncertain_without_replaying_it() {
+    let mut fake = FakeMcpClient::new(json!([
+        {"name":"send_message","inputSchema":{},"annotations":{"readOnlyHint":false}}
+    ]));
+    fake.result = serde_json::from_str(include_str!("fixtures/mcp_delivery_unknown.json")).unwrap();
+    let observed = fake.clone();
+    let registry = registry(fake).await;
+    let result = registry
+        .call(&ModelToolCall {
+            id: "uncertain-write".into(),
+            name: "telegram__send_message".into(),
+            arguments: "{}".into(),
+        })
+        .await
+        .unwrap();
+    assert!(result.is_error);
+    assert!(result.delivery_uncertain);
+    assert_eq!(result.error_code.as_deref(), Some("delivery_unknown"));
+    assert_eq!(result.content, r#"{"error":"delivery_unknown"}"#);
+    assert_eq!(observed.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn claimed_delivery_unknown_on_a_read_remains_a_safe_generic_failure() {
+    let mut fake = FakeMcpClient::one();
+    fake.result = serde_json::from_value(json!({
+        "isError":true,
+        "structuredContent":{"mcp_error":{"version":1,"code":"delivery_unknown"}},
+        "content":[]
+    }))
+    .unwrap();
+    let result = registry(fake).await.call(&call("{}")).await.unwrap();
+    assert!(result.is_error);
+    assert!(!result.delivery_uncertain);
+    assert_eq!(result.error_code.as_deref(), Some("mcp_tool_error"));
+    assert_eq!(result.content, r#"{"error":"mcp_tool_error"}"#);
+}
+
+#[tokio::test]
+async fn untrusted_mcp_errors_never_expose_bodies_or_claim_uncertainty() {
+    for response in [
+        json!({"isError":true,"content":[{"type":"text","text":"private error details"}]}),
+        json!({"isError":true,"content":[{"type":"text","text":"delivery_unknown private error details"}]}),
+        json!({"isError":true,"structuredContent":{"mcp_error":{"version":2,"code":"delivery_unknown"}},"content":[]}),
+        json!({"isError":true,"structuredContent":{"mcp_error":{"version":1,"code":"private_secret"}},"content":[]}),
+        json!({"isError":true,"structuredContent":{"mcp_error":{"version":1,"code":"delivery_unknown","message":"private"}},"content":[]}),
+        json!({"isError":true,"structuredContent":{"mcp_error":{"version":1,"code":"delivery_unknown"},"extra":"private"},"content":[]}),
+        json!({"isError":true,"structuredContent":{"mcp_error":{"code":"delivery_unknown"}},"content":[]}),
+        json!({"isError":true,"content":[{"type":"text","text":"Error executing tool another: {\"mcp_error\":{\"version\":1,\"code\":\"delivery_unknown\"}}"}]}),
+        json!({"isError":true,"content":[{"type":"text","text":"{\"mcp_error\":{\"version\":1,\"version\":1,\"code\":\"delivery_unknown\"}}"}]}),
+        json!({"isError":true,"content":[{"type":"text","text":"{\"mcp_error\":{\"version\":1,\"code\":\"delivery_unknown\"}}"},{"type":"text","text":"private details"}]}),
+    ] {
+        let mut fake = FakeMcpClient::new(json!([{"name":"send_message","inputSchema":{}}]));
+        fake.result = serde_json::from_value(response).unwrap();
+        let result = registry(fake)
+            .await
+            .call(&ModelToolCall {
+                id: "write".into(),
+                name: "telegram__send_message".into(),
+                arguments: "{}".into(),
+            })
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(!result.delivery_uncertain);
+        assert_eq!(result.error_code.as_deref(), Some("mcp_tool_error"));
+        assert_eq!(result.content, r#"{"error":"mcp_tool_error"}"#);
+    }
 }
 
 #[tokio::test]

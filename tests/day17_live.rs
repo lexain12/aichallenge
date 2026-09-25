@@ -27,6 +27,8 @@ struct SavedMessagesOnlyExecutor {
     inner: Arc<dyn ToolExecutor>,
     marker: String,
     write_started: AtomicBool,
+    send_finished: AtomicBool,
+    post_send_marker_verified: AtomicBool,
 }
 
 impl SavedMessagesOnlyExecutor {
@@ -35,7 +37,13 @@ impl SavedMessagesOnlyExecutor {
             inner,
             marker,
             write_started: AtomicBool::new(false),
+            send_finished: AtomicBool::new(false),
+            post_send_marker_verified: AtomicBool::new(false),
         }
+    }
+
+    fn model_verified_marker_after_send(&self) -> bool {
+        self.post_send_marker_verified.load(Ordering::SeqCst)
     }
 }
 
@@ -87,7 +95,28 @@ impl ToolExecutor for SavedMessagesOnlyExecutor {
             }
             // Consume the one-write allowance before dispatch, including failed,
             // cancelled, or uncertain attempts. It is deliberately never reset.
-            self.inner.call(call).await
+            // Snapshot order before dispatch: a read started before the send
+            // finishes cannot become post-send evidence when it later returns.
+            let post_send_read = self.send_finished.load(Ordering::SeqCst)
+                && route.server_name == "telegram"
+                && route.tool_name == "read_chat"
+                && arguments.len() == 2
+                && arguments.get("chat").and_then(Value::as_str) == Some("me")
+                && arguments.get("limit").and_then(Value::as_u64) == Some(100);
+            let result = self.inner.call(call).await;
+            if is_write {
+                self.send_finished.store(true, Ordering::SeqCst);
+            } else if post_send_read
+                && result.as_ref().is_ok_and(|output| {
+                    !output.is_error
+                        && !output.delivery_uncertain
+                        && marker_occurrences(&output.content, &self.marker) == Ok(1)
+                })
+            {
+                // Store only a boolean, never the chat payload or message ID.
+                self.post_send_marker_verified.store(true, Ordering::SeqCst);
+            }
+            result
         })
     }
 }
@@ -307,29 +336,35 @@ log_payloads = false
     println!("saved_messages_write_attempted={write_started}; automatic_send_retry=false");
     // This is a read, even if the agent failed after starting a write. Never
     // rerun the agent or call send_message to repair an uncertain outcome.
-    let read = live_call(
-        executor.as_ref(),
-        "telegram__read_chat",
-        json!({"chat":"me","limit":100}),
-    )
-    .await;
-    let count = marker_occurrences(&read.content, &marker)
-        .unwrap_or_else(|safe_code| panic!("{safe_code}"));
-    println!("marker_matches_in_latest_100={count}; marker_not_deleted=true");
+    let diagnostic = registry
+        .call(&call("telegram__read_chat", r#"{"chat":"me","limit":100}"#))
+        .await;
+    match diagnostic {
+        Ok(read) if !read.is_error => match marker_occurrences(&read.content, &marker) {
+            Ok(count) => println!("diagnostic_marker_matches_in_latest_100={count}"),
+            Err(safe_code) => println!("diagnostic_marker_read={safe_code}"),
+        },
+        Ok(_) => println!("diagnostic_marker_read=mcp_tool_error"),
+        Err(safe_error) => println!("diagnostic_marker_read={safe_error}"),
+    }
+    println!(
+        "model_post_send_marker_verified={}; marker_not_deleted=true",
+        executor.model_verified_marker_after_send()
+    );
     assert!(
         completed,
         "deepseek_tool_loop_did_not_complete; do_not_retry_send"
     );
     assert!(write_started, "model_did_not_attempt_the_authorized_send");
     assert!(
+        executor.model_verified_marker_after_send(),
+        "model_did_not_verify_marker_after_send; do_not_retry_send"
+    );
+    assert!(
         ["telegram__list_chats", "telegram__read_chat", SEND_TOOL]
             .iter()
             .all(|name| succeeded.contains(*name)),
         "model_did_not_successfully_use_all_three_tools; do_not_retry_send"
-    );
-    assert_eq!(
-        count, 1,
-        "marker_not_verified_exactly_once; do_not_retry_send"
     );
 }
 
@@ -342,6 +377,187 @@ mod deterministic {
     use super::*;
 
     const MARKER: &str = "synthetic-acceptance-marker";
+
+    struct SequenceExecutor {
+        definitions: Vec<ModelToolDefinition>,
+        read_route: ToolRoute<'static>,
+        read_result: Result<ToolExecutionResult, ToolExecutionError>,
+    }
+
+    impl SequenceExecutor {
+        fn new() -> Self {
+            Self {
+                definitions: ["telegram__list_chats", "telegram__read_chat", SEND_TOOL]
+                    .into_iter()
+                    .map(|name| ModelToolDefinition {
+                        name: name.into(),
+                        description: None,
+                        parameters: json!({"type":"object"}).as_object().unwrap().clone(),
+                        read_only: name != SEND_TOOL,
+                    })
+                    .collect(),
+                read_route: ToolRoute {
+                    server_name: "telegram",
+                    tool_name: "read_chat",
+                },
+                read_result: Ok(ToolExecutionResult {
+                    content: json!({"messages":[{"text":MARKER}]}).to_string(),
+                    is_error: false,
+                    error_code: None,
+                    delivery_uncertain: false,
+                }),
+            }
+        }
+    }
+
+    impl ToolExecutor for SequenceExecutor {
+        fn definitions(&self) -> &[ModelToolDefinition] {
+            &self.definitions
+        }
+
+        fn route(&self, name: &str) -> Option<ToolRoute<'_>> {
+            match name {
+                "telegram__list_chats" => Some(ToolRoute {
+                    server_name: "telegram",
+                    tool_name: "list_chats",
+                }),
+                "telegram__read_chat" => Some(self.read_route),
+                SEND_TOOL => Some(ToolRoute {
+                    server_name: "telegram",
+                    tool_name: "send_message",
+                }),
+                _ => None,
+            }
+        }
+
+        fn is_read_only(&self, name: &str) -> Option<bool> {
+            self.definitions
+                .iter()
+                .find(|definition| definition.name == name)
+                .map(|definition| definition.read_only)
+        }
+
+        fn call<'a>(&'a self, call: &'a ModelToolCall) -> ToolFuture<'a> {
+            Box::pin(async move {
+                if call.name == "telegram__read_chat" {
+                    self.read_result.clone()
+                } else {
+                    Ok(ToolExecutionResult {
+                        content: "{}".into(),
+                        is_error: false,
+                        error_code: None,
+                        delivery_uncertain: false,
+                    })
+                }
+            })
+        }
+    }
+
+    async fn model_sequence(
+        probe: SequenceExecutor,
+        post_send_read: Option<Value>,
+    ) -> (Arc<SequenceExecutor>, SavedMessagesOnlyExecutor) {
+        let inner = Arc::new(probe);
+        let executor = SavedMessagesOnlyExecutor::new(inner.clone(), MARKER.into());
+        for request in [
+            call("telegram__list_chats", "{}"),
+            call("telegram__read_chat", r#"{"chat":"me","limit":100}"#),
+            send_call("me", MARKER),
+        ] {
+            let _ = executor.call(&request).await;
+        }
+        if let Some(arguments) = post_send_read {
+            let _ = executor
+                .call(&call("telegram__read_chat", &arguments.to_string()))
+                .await;
+        }
+        (inner, executor)
+    }
+
+    #[tokio::test]
+    async fn model_acceptance_rejects_pre_send_only_read_and_direct_diagnostic_read() {
+        let (inner, executor) = model_sequence(SequenceExecutor::new(), None).await;
+        assert!(!executor.model_verified_marker_after_send());
+        let diagnostic = inner
+            .call(&call("telegram__read_chat", r#"{"chat":"me","limit":100}"#))
+            .await
+            .unwrap();
+        assert_eq!(marker_occurrences(&diagnostic.content, MARKER), Ok(1));
+        assert!(!executor.model_verified_marker_after_send());
+    }
+
+    #[tokio::test]
+    async fn model_acceptance_requires_a_valid_post_send_marker_read() {
+        let (_, executor) = model_sequence(
+            SequenceExecutor::new(),
+            Some(json!({"chat":"me","limit":100})),
+        )
+        .await;
+        assert!(executor.model_verified_marker_after_send());
+    }
+
+    #[tokio::test]
+    async fn model_acceptance_rejects_wrong_post_send_chat_limit_or_route() {
+        for arguments in [
+            json!({"chat":"another","limit":100}),
+            json!({"chat":"me","limit":5}),
+            json!({"chat":"me","limit":"100"}),
+            json!({"chat":"me","limit":100,"extra":true}),
+        ] {
+            let (_, executor) = model_sequence(SequenceExecutor::new(), Some(arguments)).await;
+            assert!(!executor.model_verified_marker_after_send());
+        }
+        for read_route in [
+            ToolRoute {
+                server_name: "other",
+                tool_name: "read_chat",
+            },
+            ToolRoute {
+                server_name: "telegram",
+                tool_name: "another_read",
+            },
+        ] {
+            let mut probe = SequenceExecutor::new();
+            probe.read_route = read_route;
+            let (_, executor) = model_sequence(probe, Some(json!({"chat":"me","limit":100}))).await;
+            assert!(!executor.model_verified_marker_after_send());
+        }
+    }
+
+    #[tokio::test]
+    async fn model_acceptance_rejects_unsuccessful_or_nonmatching_post_send_results() {
+        for content in [
+            "not JSON".into(),
+            json!({"messages":[]}).to_string(),
+            json!({"messages":[{"text":format!("prefix {MARKER}")}]}).to_string(),
+            json!({"messages":[{"text":MARKER},{"text":MARKER}]}).to_string(),
+        ] {
+            let mut probe = SequenceExecutor::new();
+            probe.read_result.as_mut().unwrap().content = content;
+            let (_, executor) = model_sequence(probe, Some(json!({"chat":"me","limit":100}))).await;
+            assert!(!executor.model_verified_marker_after_send());
+        }
+        for failure in [
+            Err(ToolExecutionError::Timeout),
+            Ok(ToolExecutionResult {
+                content: json!({"messages":[{"text":MARKER}]}).to_string(),
+                is_error: true,
+                error_code: Some("mcp_tool_error".into()),
+                delivery_uncertain: false,
+            }),
+            Ok(ToolExecutionResult {
+                content: json!({"messages":[{"text":MARKER}]}).to_string(),
+                is_error: false,
+                error_code: None,
+                delivery_uncertain: true,
+            }),
+        ] {
+            let mut probe = SequenceExecutor::new();
+            probe.read_result = failure;
+            let (_, executor) = model_sequence(probe, Some(json!({"chat":"me","limit":100}))).await;
+            assert!(!executor.model_verified_marker_after_send());
+        }
+    }
 
     struct ProbeExecutor {
         definitions: Vec<ModelToolDefinition>,

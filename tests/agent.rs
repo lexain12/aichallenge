@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use deepseek_cli::agent::{Agent, AgentError, AgentEvent};
 use deepseek_cli::client::{ClientError, DeepSeekClient};
-use deepseek_cli::config::Config;
+use deepseek_cli::config::{Config, McpConfig, McpServerConfig};
 use deepseek_cli::dialog::DialogStore;
 use deepseek_cli::invariants::InvariantRepository;
+use deepseek_cli::mcp::McpRegistry;
 use deepseek_cli::memory::{DurableMemoryScope, RequestScope};
 use deepseek_cli::profile::ProfileRepository;
 use deepseek_cli::tool_audit::ToolExecutionStatus;
@@ -234,6 +235,104 @@ async fn tool_timed_out_write_is_not_retried_and_is_audited_uncertain() {
             .unwrap()
             .contains("delivery_unknown")
     );
+}
+
+#[tokio::test]
+async fn server_reported_delivery_unknown_survives_registry_agent_and_audit() {
+    let mcp = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(|request: &Request| {
+            let body: Value = request.body_json().unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}),
+                "notifications/initialized" => return ResponseTemplate::new(202),
+                "tools/list" => json!({"tools":[{"name":"send_message","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":false}}]}),
+                "tools/call" => serde_json::from_str(include_str!("fixtures/mcp_delivery_unknown.json")).unwrap(),
+                _ => panic!("unexpected fixture MCP method"),
+            };
+            ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+        })
+        .mount(&mcp)
+        .await;
+    let registry = McpRegistry::connect(&McpConfig {
+        connect_timeout: std::time::Duration::from_secs(2),
+        call_timeout: std::time::Duration::from_secs(2),
+        max_tool_rounds: 8,
+        servers: vec![McpServerConfig {
+            name: "fixture".into(),
+            url: format!("{}/mcp", mcp.uri()).parse().unwrap(),
+        }],
+    })
+    .await
+    .unwrap();
+    let provider = MockServer::start().await;
+    mount_sequence(
+        &provider,
+        [
+            tool_response(&[(
+                "server-uncertain",
+                "fixture__send_message",
+                r#"{"chat":"me","text":"synthetic-private-marker"}"#,
+            )]),
+            sse(
+                "Delivery unknown; inspect the chat before another send.",
+                2,
+                1,
+                3,
+            ),
+        ],
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("uncertain.sqlite3");
+    let mut agent = Agent::with_store(&config(&provider), DialogStore::open(&db).unwrap())
+        .unwrap()
+        .with_tool_executor(Arc::new(registry));
+    agent
+        .run_with_prompt("perform one synthetic send")
+        .await
+        .unwrap();
+    let audit = DialogStore::open(&db)
+        .unwrap()
+        .tool_executions(agent.dialog_id().unwrap())
+        .unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].status, ToolExecutionStatus::Uncertain);
+    assert_eq!(
+        audit[0].error_code.as_ref().unwrap().as_str(),
+        "delivery_unknown"
+    );
+    assert!(audit[0].is_error);
+    let provider_requests = provider.received_requests().await.unwrap();
+    let next: Value = provider_requests[1].body_json().unwrap();
+    let tool_message = next["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert_eq!(tool_message["content"], r#"{"error":"delivery_unknown"}"#);
+    let requests = mcp.received_requests().await.unwrap();
+    let calls: Vec<Value> = requests
+        .iter()
+        .filter_map(|request| request.body_json().ok())
+        .filter(|body: &Value| body["method"] == "tools/call")
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["params"]["name"], "send_message");
+    drop(agent);
+    let bytes = std::fs::read(db).unwrap();
+    for excluded in [
+        "synthetic-private-marker",
+        "Error executing tool",
+        "mcp_error",
+    ] {
+        assert!(
+            !bytes
+                .windows(excluded.len())
+                .any(|window| window == excluded.as_bytes())
+        );
+    }
 }
 
 #[tokio::test]

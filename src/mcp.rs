@@ -12,6 +12,7 @@ use rmcp::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::time::timeout;
@@ -218,13 +219,66 @@ impl ToolExecutor for McpRegistry {
             .await
             .map_err(|_| ToolExecutionError::Timeout)?
             .map_err(|_| ToolExecutionError::Transport)?;
-            Ok(convert_result(result))
+            Ok(convert_result(result, route))
         })
     }
 }
 
-fn convert_result(result: CallToolResult) -> ToolExecutionResult {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeToolErrorEnvelope {
+    mcp_error: SafeToolError,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeToolError {
+    version: u8,
+    code: SafeToolErrorCode,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SafeToolErrorCode {
+    DeliveryUnknown,
+}
+
+/// Accept only the versioned, allowlisted envelope, never free-form error
+/// messages. The Python SDK wraps ToolError in this exact original-name prefix.
+fn server_reports_delivery_unknown(result: &CallToolResult, original_name: &str) -> bool {
+    let envelope: Option<SafeToolErrorEnvelope> =
+        if let Some(structured) = &result.structured_content {
+            serde_json::from_value(structured.clone()).ok()
+        } else if let [ContentBlock::Text(content)] = result.content.as_slice() {
+            let prefix = format!("Error executing tool {original_name}: ");
+            let payload = content.text.strip_prefix(&prefix).unwrap_or(&content.text);
+            serde_json::from_str(payload).ok()
+        } else {
+            None
+        };
+    envelope.is_some_and(|envelope| {
+        envelope.mcp_error.version == 1
+            && matches!(envelope.mcp_error.code, SafeToolErrorCode::DeliveryUnknown)
+    })
+}
+
+fn convert_result(result: CallToolResult, route: &Route) -> ToolExecutionResult {
     let is_error = result.is_error.unwrap_or(false);
+    if is_error {
+        let delivery_uncertain =
+            !route.read_only && server_reports_delivery_unknown(&result, &route.original_name);
+        let code = if delivery_uncertain {
+            "delivery_unknown"
+        } else {
+            "mcp_tool_error"
+        };
+        return ToolExecutionResult {
+            content: serde_json::json!({"error":code}).to_string(),
+            is_error: true,
+            error_code: Some(code.into()),
+            delivery_uncertain,
+        };
+    }
     let content = if let Some(structured) = result.structured_content {
         structured.to_string()
     } else {

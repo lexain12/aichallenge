@@ -36,6 +36,12 @@ async def _safe_call(operation: Awaitable[_T]) -> _T:
     try:
         return await operation
     except TelegramToolFailure as error:
+        if error.code == "delivery_unknown":
+            # Service-neutral uncertainty contract: no remote message or
+            # candidates may be included in this strict versioned envelope.
+            raise ToolError(json.dumps({
+                "mcp_error": {"version": 1, "code": "delivery_unknown"},
+            })) from None
         raise ToolError(json.dumps({
             "code": error.code,
             "message": str(error),
