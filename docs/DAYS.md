@@ -19,9 +19,12 @@
 | `Day-12` | Свободный Markdown-профиль пользователя, автоматически подключаемый к запросам | `cargo run -- --user alice --task mobile-app` |
 | `day-13` | Workflow state machine, изоляция этапов, pause/resume и controller audit | `cargo run -- --user alice --task parser-project` |
 | `Day-14` | Хранимые отдельно инварианты и блокирующая проверка ответа/replan | `cargo run -- --user alice --task parser-project` |
+| `Day-15` | Обсуждение и явное утверждение цели перед planning | `cargo run -- --user alice --task parser-project` |
+| `Day-16` | Отдельный Streamable HTTP клиент: каталог MCP ВкусВилла | `cargo run --bin vkusvill_mcp` |
+| `Day-17` | Локальный Telegram MCP, общий tool loop DeepSeek, инварианты и аудит | `uv run --project telegram_mcp telegram-mcp`, затем `cargo run` в другом терминале |
 
 ```bash
-git switch Day-14
+git switch Day-17
 cargo run -- --user alice --task parser-project
 ```
 
@@ -34,10 +37,18 @@ cargo run -- --user alice --task parser-project
 Day 4 продолжает Day 3, Day 5 продолжает Day 4, Day 6 продолжает Day 5,
 Day 7 продолжает Day 6, Day 8 продолжает Day 7, Day 9 продолжает Day 8,
 Day 10 продолжает Day 9, Day 11 продолжает Day 10, Day 12 продолжает Day 11,
-Day 13 продолжает Day 12, Day 14 продолжает Day 13.
-[Результаты Day 13](day13-results.md), [результаты Day 14](day14-results.md).
+Day 13 продолжает Day 12, Day 14 продолжает Day 13, Day 15 продолжает Day 14,
+Day 16 продолжает Day 15, Day 17 продолжает Day 16.
+[Результаты Day 13](day13-results.md), [результаты Day 14](day14-results.md),
+[результаты и ограничения Day 17](day17-results.md).
 Поздние дни могут сохранять режимы предыдущих дней, но соответствующая ветка
 фиксирует свой этап.
+
+Для Day 17 сначала выполните `uv sync --project telegram_mcp --group dev`,
+подготовьте Telegram environment и включите `[mcp]` в локальном конфиге по
+[инструкции README](../README.md#день-17-telegram-mcp-и-tool-calling).
+Live-тест отправки запускается отдельно и только с разрешением на одно
+сообщение в собственное «Избранное»; обычный `cargo test` ничего не отправляет.
 
 Локальные `deepseek.toml`, `windows.toml`, `panels/`, `panels-day5/` и новые
 `reports/*.md`, а также базы `*.sqlite3` не коммитятся и остаются на диске при переключении веток.
