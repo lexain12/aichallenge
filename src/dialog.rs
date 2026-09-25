@@ -156,6 +156,7 @@ impl DialogStore {
             [],
         )?;
         crate::workflow_store::migrate(&mut connection)?;
+        crate::tool_audit::migrate(&connection)?;
         Ok(Self {
             connection,
             config_invariants: Vec::new(),
@@ -173,6 +174,17 @@ impl DialogStore {
         system_prompt: &str,
         prompt: &str,
     ) -> Result<i64, StoreError> {
+        self.start_dialog_in_scope_with_message_id(scope, system_prompt, prompt)
+            .map(|(dialog_id, _)| dialog_id)
+    }
+
+    /// Atomically create a scoped dialog and return its dialog and user-message IDs.
+    pub fn start_dialog_in_scope_with_message_id(
+        &mut self,
+        scope: &RequestScope,
+        system_prompt: &str,
+        prompt: &str,
+    ) -> Result<(i64, i64), StoreError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -186,20 +198,29 @@ impl DialogStore {
             "INSERT INTO dialog_scopes (dialog_id, user_id, task_id) VALUES (?1, ?2, ?3)",
             params![id, scope.user_id(), scope.task_id()],
         )?;
-        tx.execute(
-            "INSERT INTO messages (dialog_id, role, content) VALUES (?1, 'user', ?2)",
+        let message_id: i64 = tx.query_row(
+            "INSERT INTO messages (dialog_id, role, content) VALUES (?1, 'user', ?2) RETURNING id",
             params![id, prompt],
+            |row| row.get(0),
         )?;
         tx.execute(
             "UPDATE dialogs SET last_message_id = ?1 WHERE id = ?2",
-            params![tx.last_insert_rowid(), id],
+            params![message_id, id],
         )?;
         tx.commit()?;
-        Ok(id)
+        Ok((id, message_id))
     }
 
     pub fn start_dialog(&mut self, system_prompt: &str, prompt: &str) -> Result<i64, StoreError> {
         self.start_dialog_in_scope(&RequestScope::default(), system_prompt, prompt)
+    }
+
+    pub fn start_dialog_with_message_id(
+        &mut self,
+        system_prompt: &str,
+        prompt: &str,
+    ) -> Result<(i64, i64), StoreError> {
+        self.start_dialog_in_scope_with_message_id(&RequestScope::default(), system_prompt, prompt)
     }
 
     /// Raw branch checkpoints include hidden controller protocol rows.
@@ -225,6 +246,18 @@ impl DialogStore {
         role: Role,
         content: &str,
     ) -> Result<(), StoreError> {
+        self.append_message_with_id(id, expected_count, role, content)
+            .map(|_| ())
+    }
+
+    /// Append with the same stale-session protection and return the committed message ID.
+    pub fn append_message_with_id(
+        &mut self,
+        id: i64,
+        expected_count: usize,
+        role: Role,
+        content: &str,
+    ) -> Result<i64, StoreError> {
         self.append_with_usage(id, expected_count, role, content, None)
     }
 
@@ -237,6 +270,7 @@ impl DialogStore {
         usage: Option<TokenUsage>,
     ) -> Result<(), StoreError> {
         self.append_with_usage(id, expected_count, Role::Assistant, content, usage)
+            .map(|_| ())
     }
 
     fn append_with_usage(
@@ -246,7 +280,7 @@ impl DialogStore {
         role: Role,
         content: &str,
         usage: Option<TokenUsage>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<i64, StoreError> {
         let usage_json = usage
             .map(|value| serde_json::to_string(&value))
             .transpose()?;
@@ -274,11 +308,11 @@ impl DialogStore {
         if !exists {
             return Err(StoreError::NotFound(id));
         }
-        tx.execute(
-            "INSERT INTO messages (dialog_id, role, content) VALUES (?1, ?2, ?3)",
+        let message_id: i64 = tx.query_row(
+            "INSERT INTO messages (dialog_id, role, content) VALUES (?1, ?2, ?3) RETURNING id",
             params![id, role, content],
+            |row| row.get(0),
         )?;
-        let message_id = tx.last_insert_rowid();
         if let Some(usage_json) = usage_json {
             tx.execute(
                 "INSERT INTO message_usage (message_id, usage_json) VALUES (?1, ?2)",
@@ -287,7 +321,7 @@ impl DialogStore {
         }
         tx.execute("UPDATE dialogs SET last_message_id = ?1, updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = ?2", params![message_id, id])?;
         tx.commit()?;
-        Ok(())
+        Ok(message_id)
     }
 
     pub fn replace_context(
