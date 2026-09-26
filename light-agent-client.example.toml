@@ -1,0 +1,3 @@
+ssh_binary = "ssh"
+ssh_host = "light-agent-vm"
+remote_command = "/opt/light-agent/bin/light-agent serve-stdio"

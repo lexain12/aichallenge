@@ -1,0 +1,35 @@
+# Server-side only. Keep this file and any copy with real credentials on the VM.
+[provider]
+# api_key = "set via DEEPSEEK_API_KEY or place here"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+max_tokens = 4096
+timeout_seconds = 120
+
+[mcp]
+connect_timeout_seconds = 10
+call_timeout_seconds = 30
+max_tool_rounds = 8
+
+# [[mcp.servers]]
+# name = "telegram"
+# url = "http://127.0.0.1:8000/mcp"
+# bearer_token = "optional server-side secret"
+
+[scheduler]
+timezone = "Europe/Moscow"
+confirmation_timeout_minutes = 5
+run_timeout_seconds = 600
+lock_path = "/run/lock/light-agent-cron.lock"
+binary_path = "/opt/light-agent/bin/light-agent"
+
+[database]
+path = "/var/lib/light-agent/light-agent.sqlite3"
+
+[prompts]
+interactive_system = "You are a helpful assistant."
+cron_system = "You are a helpful assistant executing a scheduled task."
+
+[limits]
+provider_request_bytes = 524288
+message_bytes = 262144
