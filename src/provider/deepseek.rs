@@ -73,7 +73,11 @@ impl DeepSeekProvider {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = read_error_body(response, &self.api_key).await?;
-            return Err(ProviderError::http(status, body));
+            return Err(if is_context_length_error(&body) {
+                ProviderError::http_with_code("context_too_long", status, body)
+            } else {
+                ProviderError::http(status, body)
+            });
         }
 
         let mut events = response.bytes_stream().eventsource();
@@ -161,6 +165,33 @@ impl DeepSeekProvider {
             usage,
         })
     }
+}
+
+fn is_context_length_error(body: &str) -> bool {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let explicit_code = parsed.as_ref().and_then(|value| {
+        value
+            .pointer("/error/code")
+            .or_else(|| value.pointer("/code"))
+            .and_then(serde_json::Value::as_str)
+    });
+    if matches!(
+        explicit_code,
+        Some("context_length_exceeded" | "context_too_long" | "max_context_length_exceeded")
+    ) {
+        return true;
+    }
+    let message = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.pointer("/message"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    message.contains("maximum context length") || message.contains("context length exceeded")
 }
 
 #[derive(Clone, Copy)]

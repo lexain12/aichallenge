@@ -257,6 +257,45 @@ async fn bounds_and_redacts_error_body() {
     assert!(!metadata.contains("xxxxxxxx"));
 }
 
+#[tokio::test]
+async fn classifies_only_explicit_context_length_http_errors() {
+    let context_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded",
+                "message": "maximum context length exceeded"
+            }
+        })))
+        .mount(&context_server)
+        .await;
+    let context_error = provider(&context_server, "test-key")
+        .stream_turn(&[], &[], &mut |_| Ok(()))
+        .await
+        .unwrap_err();
+    assert_eq!(context_error.safe_code(), "context_too_long");
+    assert_eq!(context_error.operator_metadata().status, Some(400));
+
+    let invalid_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_tool_schema",
+                "message": "tool schema is invalid"
+            }
+        })))
+        .mount(&invalid_server)
+        .await;
+    let invalid_error = provider(&invalid_server, "test-key")
+        .stream_turn(&[], &[], &mut |_| Ok(()))
+        .await
+        .unwrap_err();
+    assert_eq!(invalid_error.safe_code(), "http");
+    assert_eq!(invalid_error.operator_metadata().status, Some(400));
+}
+
 // Catches accidentally sending an empty tools array or local tool metadata.
 #[tokio::test]
 async fn never_sends_tools_when_catalog_is_empty() {

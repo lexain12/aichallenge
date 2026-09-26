@@ -223,8 +223,12 @@ impl ProviderError {
     }
 
     pub(crate) fn http(status: u16, diagnostic: String) -> Self {
+        Self::http_with_code("http", status, diagnostic)
+    }
+
+    pub(crate) fn http_with_code(code: &'static str, status: u16, diagnostic: String) -> Self {
         Self {
-            code: "http",
+            code,
             status: Some(status),
             diagnostic: Some(diagnostic),
             usage: None,

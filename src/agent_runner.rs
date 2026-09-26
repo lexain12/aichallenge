@@ -365,9 +365,9 @@ impl InteractiveService {
 }
 
 fn map_provider_error(error: crate::provider::ProviderError) -> AgentError {
-    match (error.safe_code(), error.operator_metadata().status) {
-        ("output", _) => AgentError::Output,
-        ("context_length" | "context_too_long", _) | (_, Some(400)) => AgentError::ContextTooLong,
+    match error.safe_code() {
+        "output" => AgentError::Output,
+        "context_length" | "context_too_long" => AgentError::ContextTooLong,
         _ => AgentError::Provider,
     }
 }
