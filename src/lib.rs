@@ -22,6 +22,7 @@ pub mod system_context;
 pub mod terminal;
 pub mod tool_audit;
 pub mod tool_calling;
+pub mod tools;
 pub mod workflow;
 pub mod workflow_context;
 pub mod workflow_engine;
