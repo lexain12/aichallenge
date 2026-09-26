@@ -1,0 +1,1 @@
+restrict,command="/opt/light-agent/bin/light-agent serve-stdio",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-pty ssh-ed25519 REPLACE_WITH_PUBLIC_KEY_MATERIAL light-agent-client

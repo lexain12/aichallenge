@@ -576,6 +576,9 @@ impl CronSynchronizer {
             .and_then(|name| name.to_str())
             .ok_or(SchedulerError::InvalidPath)?;
         let lock_name_text = lock_name.to_str().ok_or(SchedulerError::InvalidPath)?;
+        if !is_safe_storage_filename(database_name) || !is_safe_storage_filename(lock_name_text) {
+            return Err(SchedulerError::InvalidPath);
+        }
         let coordinator_name = format!("{database_name}.runtime.lock");
         let owner_prefix = format!("{database_name}.runtime.owner.");
         let sqlite_sidecars = [
@@ -583,12 +586,13 @@ impl CronSynchronizer {
             format!("{database_name}-shm"),
             format!("{database_name}-journal"),
         ];
-        if lock_name_text == database_name
+        let normalized_lock_name = lock_name_text.to_ascii_lowercase();
+        if lock_name_text.eq_ignore_ascii_case(database_name)
             || sqlite_sidecars
                 .iter()
-                .any(|reserved| lock_name_text == reserved)
-            || lock_name_text == coordinator_name
-            || lock_name_text.starts_with(&owner_prefix)
+                .any(|reserved| lock_name_text.eq_ignore_ascii_case(reserved))
+            || lock_name_text.eq_ignore_ascii_case(&coordinator_name)
+            || normalized_lock_name.starts_with(&owner_prefix.to_ascii_lowercase())
         {
             return Err(SchedulerError::InvalidPath);
         }
@@ -855,6 +859,13 @@ fn validate_lock_path(path: &Path) -> Result<(), SchedulerError> {
         return Err(SchedulerError::InvalidPath);
     }
     Ok(())
+}
+
+fn is_safe_storage_filename(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 pub(crate) fn validate_rendered_path(path: &Path) -> Result<(), SchedulerError> {

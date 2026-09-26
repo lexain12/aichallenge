@@ -1,21 +1,8 @@
-//! Reusable components for the DeepSeek CLI.
+//! Reusable components for the Day 18 light agent and its terminal client.
 
-pub mod agent;
 pub mod agent_runner;
-pub mod chat;
-pub mod client;
-pub mod config;
-pub mod context;
-pub mod debug_log;
-pub mod dialog;
 pub mod domain;
-pub mod facts;
-pub mod goal_definition;
 pub mod inspection;
-pub mod invariants;
-pub mod mcp;
-pub mod memory;
-pub mod profile;
 pub mod protocol;
 pub mod provider;
 pub mod remote_client;
@@ -24,14 +11,5 @@ pub mod scheduler;
 pub mod server;
 pub mod settings;
 pub mod store;
-pub mod system_context;
-pub mod terminal;
 pub mod terminal_client;
-pub mod tool_audit;
-pub mod tool_calling;
 pub mod tools;
-pub mod workflow;
-pub mod workflow_context;
-pub mod workflow_engine;
-pub mod workflow_model;
-pub mod workflow_store;

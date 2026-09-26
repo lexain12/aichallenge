@@ -261,6 +261,34 @@ fn synchronizer_rejects_lock_outside_the_store_trusted_directory() {
     drop(store_dir);
 }
 
+#[test]
+fn synchronizer_rejects_non_ascii_storage_filenames_without_creating_a_lock() {
+    let dir = common::private_tempdir();
+    let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    let unsafe_lock = dir.path().join("cron-замок.lock");
+    let before = std::fs::read_dir(dir.path()).unwrap().count();
+    let result = CronSynchronizer::new(
+        store,
+        Arc::new(FakeBackend::success("")),
+        unsafe_lock.clone(),
+        PathBuf::from("/opt/light-agent/bin/light-agent"),
+    );
+    assert!(matches!(result, Err(SchedulerError::InvalidPath)));
+    assert!(!unsafe_lock.exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before);
+
+    let unicode_dir = common::private_tempdir();
+    let unicode_store = Store::open(unicode_dir.path().join("агент.sqlite")).unwrap();
+    let result = CronSynchronizer::new(
+        unicode_store,
+        Arc::new(FakeBackend::success("")),
+        unicode_dir.path().join("cron.lock"),
+        PathBuf::from("/opt/light-agent/bin/light-agent"),
+    );
+    assert!(matches!(result, Err(SchedulerError::InvalidPath)));
+    assert!(!unicode_dir.path().join("cron.lock").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn synchronizer_rejects_database_sqlite_sidecars_and_runtime_lock_collisions_without_mutation() {
@@ -304,6 +332,49 @@ fn synchronizer_rejects_database_sqlite_sidecars_and_runtime_lock_collisions_wit
         );
         assert_eq!(std::fs::read(&path).ok(), before, "mutated {name}");
     }
+
+    let entries_before = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    let wal_before = std::fs::read(dir.path().join("agent.sqlite-wal")).unwrap();
+    let shm_before = std::fs::read(dir.path().join("agent.sqlite-shm")).unwrap();
+    let journal_before = std::fs::read(&journal).unwrap();
+    for name in [
+        "AGENT.SQLITE",
+        "Agent.SQLite-WaL",
+        "AGENT.SQLITE-SHM",
+        "agent.SQLITE-JOURNAL",
+        "Agent.SQLite.Runtime.Lock",
+        "AGENT.SQLITE.RUNTIME.OWNER.future.lock",
+    ] {
+        let result = CronSynchronizer::new(
+            store.clone(),
+            Arc::new(FakeBackend::success("")),
+            dir.path().join(name),
+            PathBuf::from("/opt/light-agent/bin/light-agent"),
+        );
+        assert!(
+            matches!(result, Err(SchedulerError::InvalidPath)),
+            "accepted mixed-case colliding lock name {name}"
+        );
+    }
+    let entries_after = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(entries_after, entries_before, "created a mixed-case alias");
+    assert_eq!(
+        std::fs::read(dir.path().join("agent.sqlite-wal")).unwrap(),
+        wal_before,
+        "mutated active WAL"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("agent.sqlite-shm")).unwrap(),
+        shm_before,
+        "mutated active SHM"
+    );
+    assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
 
     for name in [
         "agent.sqlite-wal.lock",
