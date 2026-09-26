@@ -110,10 +110,23 @@ impl CronAgentService {
         job_id: JobId,
         cancellation: CancellationToken,
     ) -> Result<CronRunOutcome, CronRunError> {
-        let deadline = Instant::now() + self.timeout;
+        self.run_job_until(job_id, cancellation, Instant::now() + self.timeout)
+            .await
+    }
+
+    pub async fn run_job_until(
+        &self,
+        job_id: JobId,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<CronRunOutcome, CronRunError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(CronRunError::TimedOut);
+        }
         // Keep a meaningful part of even very short budgets for the durable
         // terminal write. Production timeouts cap this reservation at 100ms.
-        let reserve = std::cmp::min(Duration::from_millis(100), self.timeout / 2);
+        let reserve = std::cmp::min(Duration::from_millis(100), remaining / 2);
         let execution_deadline = deadline.checked_sub(reserve).unwrap_or(deadline);
         if cancellation.is_cancelled() {
             return Err(CronRunError::Interrupted);
@@ -182,12 +195,18 @@ impl CronAgentService {
                     self.finish_run_bounded(
                         run_id,
                         CronRunFinish::interrupted(SafeErrorCode::Interrupted),
-                        deadline,
+                        finalization_deadline(deadline),
+                        &CancellationToken::new(),
                     ).await?;
                     return Err(CronRunError::Interrupted);
                 }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(execution_deadline)) => {
-                    self.finish_run_bounded(run_id, CronRunFinish::timed_out(), deadline).await?;
+                    self.finish_run_bounded(
+                        run_id,
+                        CronRunFinish::timed_out(),
+                        deadline,
+                        &CancellationToken::new(),
+                    ).await?;
                     return Err(CronRunError::TimedOut);
                 }
                 _ = reconciler.reconcile(reconcile_time) => {}
@@ -219,14 +238,20 @@ impl CronAgentService {
                 self.finish_run_bounded(
                     run_id,
                     CronRunFinish::interrupted(SafeErrorCode::Interrupted),
-                    deadline,
+                    finalization_deadline(deadline),
+                    &CancellationToken::new(),
                 ).await?;
                 return Err(CronRunError::Interrupted);
             }
             _ = &mut deadline_sleep => {
                 run_cancellation.cancel();
                 let _ = execution.await;
-                self.finish_run_bounded(run_id, CronRunFinish::timed_out(), deadline).await?;
+                self.finish_run_bounded(
+                    run_id,
+                    CronRunFinish::timed_out(),
+                    deadline,
+                    &CancellationToken::new(),
+                ).await?;
                 return Err(CronRunError::TimedOut);
             }
             result = &mut execution => result,
@@ -234,23 +259,60 @@ impl CronAgentService {
 
         match result {
             Ok(outcome) => {
-                self.finish_run_bounded(run_id, CronRunFinish::completed(outcome.answer), deadline)
-                    .await?;
+                let finished = self
+                    .finish_run_bounded(
+                        run_id,
+                        CronRunFinish::completed(outcome.answer),
+                        deadline,
+                        &cancellation,
+                    )
+                    .await;
+                if finished == Err(CronRunError::Interrupted) {
+                    let _ = self
+                        .finish_run_bounded(
+                            run_id,
+                            CronRunFinish::interrupted(SafeErrorCode::Interrupted),
+                            finalization_deadline(deadline),
+                            &CancellationToken::new(),
+                        )
+                        .await;
+                    return Err(CronRunError::Interrupted);
+                }
+                finished?;
                 Ok(CronRunOutcome::Completed(run_id))
             }
             Err(AgentError::Interrupted) => {
                 self.finish_run_bounded(
                     run_id,
                     CronRunFinish::interrupted(SafeErrorCode::Interrupted),
-                    deadline,
+                    finalization_deadline(deadline),
+                    &CancellationToken::new(),
                 )
                 .await?;
                 Err(CronRunError::Interrupted)
             }
             Err(error) => {
                 let (run_error, code) = cron_error(error);
-                self.finish_run_bounded(run_id, CronRunFinish::failed(code), deadline)
-                    .await?;
+                let finished = self
+                    .finish_run_bounded(
+                        run_id,
+                        CronRunFinish::failed(code),
+                        deadline,
+                        &cancellation,
+                    )
+                    .await;
+                if finished == Err(CronRunError::Interrupted) {
+                    let _ = self
+                        .finish_run_bounded(
+                            run_id,
+                            CronRunFinish::interrupted(SafeErrorCode::Interrupted),
+                            finalization_deadline(deadline),
+                            &CancellationToken::new(),
+                        )
+                        .await;
+                    return Err(CronRunError::Interrupted);
+                }
+                finished?;
                 Err(run_error)
             }
         }
@@ -261,14 +323,33 @@ impl CronAgentService {
         run_id: RunId,
         finish: CronRunFinish,
         deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<(), CronRunError> {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
-            store.finish_run_with_deadline(run_id, finish, deadline)
-        })
-        .await
-        .map_err(|_| CronRunError::Store)?
-        .map_err(|_| CronRunError::Store)
+        let worker_cancellation = CancellationToken::new();
+        let blocking_cancellation = worker_cancellation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            store.finish_run_with_deadline(run_id, finish, deadline, &blocking_cancellation)
+        });
+        tokio::pin!(worker);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                worker_cancellation.cancel();
+                match worker.await {
+                    Ok(Ok(())) => Ok(()),
+                    _ => Err(CronRunError::Interrupted),
+                }
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                worker_cancellation.cancel();
+                let _ = worker.await;
+                Err(CronRunError::Store)
+            }
+            result = &mut worker => result
+                .map_err(|_| CronRunError::Store)?
+                .map_err(|_| CronRunError::Store),
+        }
     }
 
     async fn finish_late_claim(
@@ -278,11 +359,20 @@ impl CronAgentService {
         deadline: Instant,
     ) -> Result<(), CronRunError> {
         if let Ok(Ok(RunClaim::Claimed(claim))) = result {
-            self.finish_run_bounded(claim.run.id, finish, deadline)
-                .await?;
+            self.finish_run_bounded(
+                claim.run.id,
+                finish,
+                finalization_deadline(deadline),
+                &CancellationToken::new(),
+            )
+            .await?;
         }
         Ok(())
     }
+}
+
+fn finalization_deadline(deadline: Instant) -> Instant {
+    deadline.min(Instant::now() + Duration::from_millis(100))
 }
 
 fn cron_error(error: AgentError) -> (CronRunError, SafeErrorCode) {

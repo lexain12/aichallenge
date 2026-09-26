@@ -409,7 +409,7 @@ fn hanging_crontab(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
 
 #[cfg(unix)]
 async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if let Ok(contents) = std::fs::read_to_string(path)
             && let Ok(pid) = contents.parse()
@@ -420,7 +420,7 @@ async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
             tokio::time::Instant::now() < deadline,
             "child never wrote its pid"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 

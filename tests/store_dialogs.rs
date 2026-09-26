@@ -13,7 +13,7 @@ fn setup() -> (TempDir, Store, Connection) {
 }
 
 #[test]
-fn migration_creates_exact_v2_schema() {
+fn migration_creates_exact_v3_schema() {
     let (dir, store, db) = setup();
     let tables: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
         .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
@@ -24,6 +24,8 @@ fn migration_creates_exact_v2_schema() {
             "cron_runs",
             "dialogs",
             "messages",
+            "runtime_coordination",
+            "runtime_owners",
             "schema_version",
             "tool_runs",
             "turns"
@@ -33,7 +35,7 @@ fn migration_creates_exact_v2_schema() {
         db.query_row("SELECT version FROM schema_version", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     assert_eq!(
         db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
@@ -208,15 +210,24 @@ fn complete_turn_commits_assistant_and_status_atomically() {
 
 #[test]
 fn second_active_turn_in_same_dialog_is_busy() {
-    let (_dir, store, _) = setup();
+    let (_dir, store, db) = setup();
     let d = store.create_dialog("test").unwrap().id;
     store.begin_turn(d, "first").unwrap();
     assert!(matches!(
         store.clone().begin_turn(d, "second"),
         Err(StoreError::Busy)
     ));
-    assert_eq!(store.recover_pending_turns().unwrap(), 1);
-    assert_eq!(store.recover_pending_turns().unwrap(), 0);
+    let pending = db
+        .query_row("SELECT id FROM turns WHERE status='pending'", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    store
+        .interrupt_turn(
+            deepseek_cli::domain::TurnId::new(pending).unwrap(),
+            SafeErrorCode::Interrupted,
+        )
+        .unwrap();
     store.begin_turn(d, "after recovery").unwrap();
 }
 
@@ -368,11 +379,66 @@ fn incompatible_schemas_and_memory_databases_are_rejected() {
         Err(StoreError::InvalidPath)
     ));
     let (_new_dir, _store, db) = setup();
-    db.execute("UPDATE schema_version SET version=3", [])
+    db.execute("UPDATE schema_version SET version=4", [])
         .unwrap();
     // A future version must not be silently downgraded.
     assert!(matches!(
         Store::open(db.path().unwrap()),
         Err(StoreError::UnsupportedSchema)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn store_rejects_a_symlink_database_path_before_runtime_coordination() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("agent.sqlite3");
+    Store::open(&database).unwrap();
+    let alias = dir.path().join("alias.sqlite3");
+    std::os::unix::fs::symlink(&database, &alias).unwrap();
+
+    assert!(matches!(Store::open(alias), Err(StoreError::InvalidPath)));
+}
+
+#[cfg(unix)]
+#[test]
+fn store_rejects_a_hardlink_database_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("agent.sqlite3");
+    Store::open(&database).unwrap();
+    let alias = dir.path().join("alias.sqlite3");
+    std::fs::hard_link(&database, &alias).unwrap();
+
+    assert!(matches!(Store::open(alias), Err(StoreError::InvalidPath)));
+}
+
+#[cfg(unix)]
+#[test]
+fn opened_store_rejects_database_path_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("agent.sqlite3");
+    let displaced = dir.path().join("displaced.sqlite3");
+    let store = Store::open(&database).unwrap();
+    std::fs::rename(&database, &displaced).unwrap();
+    std::fs::File::create(&database).unwrap();
+
+    assert!(matches!(store.list_dialogs(), Err(StoreError::InvalidPath)));
+}
+
+#[cfg(unix)]
+#[test]
+fn store_rejects_a_group_or_world_writable_database() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("agent.sqlite3");
+    Store::open(&database).unwrap();
+    let mut permissions = std::fs::metadata(&database).unwrap().permissions();
+    permissions.set_mode(0o666);
+    std::fs::set_permissions(&database, permissions).unwrap();
+
+    assert!(matches!(
+        Store::open(database),
+        Err(StoreError::InvalidPath)
     ));
 }

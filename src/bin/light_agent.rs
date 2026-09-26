@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use deepseek_cli::agent_runner::{CronAgentService, CronRunOutcome};
@@ -100,7 +101,14 @@ async fn run(args: Args) -> Result<(), AppError> {
     let settings = Arc::new(load_settings(&args.config)?);
     match args.command {
         Command::ServeStdio => serve_stdio(settings).await,
-        Command::RunJob { job_id } => run_job(settings, job_id).await,
+        Command::RunJob { job_id } => {
+            let deadline = Instant::now() + settings.scheduler().run_timeout();
+            let (cancellation, signal) = signal_cancellation();
+            let result = run_job(settings, job_id, deadline, cancellation).await;
+            signal.abort();
+            let _ = signal.await;
+            result
+        }
         Command::CronSync => cron_sync(settings).await,
         Command::DbShell { readonly } => {
             debug_assert!(readonly, "clap requires --readonly");
@@ -124,6 +132,96 @@ async fn acquire_process_lease(store: &Store) -> Result<ProcessLease, AppError> 
         .await
         .map_err(|_| AppError::Store)?
         .map_err(|_| AppError::Store)
+}
+
+async fn open_store_until(
+    settings: &ServerSettings,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Store, AppError> {
+    let path = settings.database_path().to_owned();
+    let operation_cancellation = CancellationToken::new();
+    let worker_cancellation = operation_cancellation.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        Store::open_with_deadline(path, deadline, &worker_cancellation)
+    });
+    tokio::pin!(worker);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            operation_cancellation.cancel();
+            let _ = worker.await;
+            Err(AppError::Run)
+        }
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            operation_cancellation.cancel();
+            let _ = worker.await;
+            Err(AppError::Run)
+        }
+        result = &mut worker => result
+            .map_err(|_| AppError::Store)?
+            .map_err(|_| AppError::Store),
+    }
+}
+
+async fn acquire_process_lease_until(
+    store: &Store,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<ProcessLease, AppError> {
+    let store = store.clone();
+    let operation_cancellation = CancellationToken::new();
+    let worker_cancellation = operation_cancellation.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        ProcessLease::acquire_with_deadline(&store, deadline, &worker_cancellation)
+    });
+    tokio::pin!(worker);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            operation_cancellation.cancel();
+            let _ = worker.await;
+            Err(AppError::Run)
+        }
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            operation_cancellation.cancel();
+            let _ = worker.await;
+            Err(AppError::Run)
+        }
+        result = &mut worker => result
+            .map_err(|_| AppError::Store)?
+            .map_err(|_| AppError::Store),
+    }
+}
+
+async fn attach_runtime_owner_until(
+    store: Store,
+    owner_id: String,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Store, AppError> {
+    let operation_cancellation = CancellationToken::new();
+    let worker_cancellation = operation_cancellation.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        store.with_runtime_owner_until(&owner_id, deadline, &worker_cancellation)
+    });
+    tokio::pin!(worker);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            operation_cancellation.cancel();
+            let _ = worker.await;
+            Err(AppError::Run)
+        }
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            operation_cancellation.cancel();
+            let _ = worker.await;
+            Err(AppError::Run)
+        }
+        result = &mut worker => result
+            .map_err(|_| AppError::Store)?
+            .map_err(|_| AppError::Store),
+    }
 }
 
 fn synchronizer(
@@ -157,9 +255,35 @@ async fn runtime_catalog(
     Ok((provider, mcp))
 }
 
+async fn runtime_catalog_until(
+    settings: &ServerSettings,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(Arc<dyn Provider>, Arc<dyn ToolExecutor>), AppError> {
+    if Instant::now() >= deadline || cancellation.is_cancelled() {
+        return Err(AppError::Run);
+    }
+    let provider: Arc<dyn Provider> =
+        Arc::new(DeepSeekProvider::new(settings.provider()).map_err(|_| AppError::Provider)?);
+    let registry = McpRegistry::connect(settings.mcp());
+    tokio::pin!(registry);
+    let mcp = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(AppError::Run),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            return Err(AppError::Run);
+        }
+        result = &mut registry => result.map_err(|_| AppError::Mcp)?,
+    };
+    Ok((provider, Arc::new(mcp)))
+}
+
 async fn serve_stdio(settings: Arc<ServerSettings>) -> Result<(), AppError> {
     let store = open_store(&settings)?;
-    let _lease = acquire_process_lease(&store).await?;
+    let lease = acquire_process_lease(&store).await?;
+    let store = store
+        .with_runtime_owner(lease.owner_id())
+        .map_err(|_| AppError::Store)?;
     let (provider, mcp) = runtime_catalog(&settings).await?;
     let synchronizer = synchronizer(&settings, store.clone())?;
     let server = StdioServer::new(ServerDependencies {
@@ -208,10 +332,18 @@ async fn serve_transport(
         .map_err(|_| AppError::Protocol)
 }
 
-async fn run_job(settings: Arc<ServerSettings>, job_id: JobId) -> Result<(), AppError> {
-    let store = open_store(&settings)?;
-    let _lease = acquire_process_lease(&store).await?;
-    let (provider, mcp) = runtime_catalog(&settings).await?;
+async fn run_job(
+    settings: Arc<ServerSettings>,
+    job_id: JobId,
+    deadline: Instant,
+    cancellation: CancellationToken,
+) -> Result<(), AppError> {
+    let store = open_store_until(&settings, deadline, &cancellation).await?;
+    let lease = acquire_process_lease_until(&store, deadline, &cancellation).await?;
+    let store =
+        attach_runtime_owner_until(store, lease.owner_id().to_owned(), deadline, &cancellation)
+            .await?;
+    let (provider, mcp) = runtime_catalog_until(&settings, deadline, &cancellation).await?;
     let synchronizer = synchronizer(&settings, store.clone())?;
     let reconciler: Arc<dyn CronRunReconciler> = synchronizer;
     let service = CronAgentService::new(
@@ -225,10 +357,7 @@ async fn run_job(settings: Arc<ServerSettings>, job_id: JobId) -> Result<(), App
         settings.scheduler().run_timeout(),
         Some(reconciler),
     );
-    let (cancellation, signal) = signal_cancellation();
-    let result = service.run_job(job_id, cancellation).await;
-    signal.abort();
-    let _ = signal.await;
+    let result = service.run_job_until(job_id, cancellation, deadline).await;
     match result.map_err(|_| AppError::Run)? {
         CronRunOutcome::Inactive | CronRunOutcome::Skipped(_) | CronRunOutcome::Completed(_) => {
             Ok(())
@@ -238,7 +367,10 @@ async fn run_job(settings: Arc<ServerSettings>, job_id: JobId) -> Result<(), App
 
 async fn cron_sync(settings: Arc<ServerSettings>) -> Result<(), AppError> {
     let store = open_store(&settings)?;
-    let _lease = acquire_process_lease(&store).await?;
+    let lease = acquire_process_lease(&store).await?;
+    let store = store
+        .with_runtime_owner(lease.owner_id())
+        .map_err(|_| AppError::Store)?;
     let synchronizer = synchronizer(&settings, store)?;
     let (cancellation, signal) = signal_cancellation();
     let report = tokio::select! {

@@ -22,7 +22,13 @@ fn v1_database_migrates_jobs_and_runs_without_losing_dialogs() {
     drop(store);
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch(
-        "DROP TABLE cron_runs; DROP TABLE cron_jobs; UPDATE schema_version SET version=1;",
+        "DROP INDEX pending_turns_by_runtime_owner;
+         ALTER TABLE turns DROP COLUMN runtime_owner_id;
+         DROP TABLE runtime_owners;
+         DROP TABLE runtime_coordination;
+         DROP TABLE cron_runs;
+         DROP TABLE cron_jobs;
+         UPDATE schema_version SET version=1;",
     )
     .unwrap();
     drop(db);
@@ -35,7 +41,7 @@ fn v1_database_migrates_jobs_and_runs_without_losing_dialogs() {
             .query_row("SELECT version FROM schema_version", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     migrated.create_job(recurring(dialog)).unwrap();
 }

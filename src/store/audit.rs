@@ -72,25 +72,33 @@ impl Store {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (owner_kind, owner_id) = match start.owner {
             ToolOwner::InteractiveTurn(id) => {
-                let exists: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM turns WHERE id=?)",
-                    [id.get()],
-                    |r| r.get(0),
-                )?;
-                if !exists {
+                let (status, runtime_owner_id) = tx
+                    .query_row(
+                        "SELECT status,runtime_owner_id FROM turns WHERE id=?",
+                        [id.get()],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                    )
+                    .optional()?
+                    .ok_or(StoreError::InvalidOwner)?;
+                if status != "pending" {
                     return Err(StoreError::InvalidOwner);
                 }
+                self.require_runtime_owner(&tx, runtime_owner_id.as_deref())?;
                 ("interactive_turn", id.get())
             }
             ToolOwner::CronRun(id) => {
-                let exists: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM cron_runs WHERE id=?)",
-                    [id.get()],
-                    |r| r.get(0),
-                )?;
-                if !exists {
+                let (status, runtime_owner_id) = tx
+                    .query_row(
+                        "SELECT status,runtime_owner_id FROM cron_runs WHERE id=?",
+                        [id.get()],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                    )
+                    .optional()?
+                    .ok_or(StoreError::InvalidOwner)?;
+                if status != "pending" {
                     return Err(StoreError::InvalidOwner);
                 }
+                self.require_runtime_owner(&tx, runtime_owner_id.as_deref())?;
                 ("cron_run", id.get())
             }
         };
@@ -115,11 +123,18 @@ impl Store {
     pub fn finish_tool_run(&self, id: i64, finish: ToolRunFinish) -> Result<(), StoreError> {
         let mut db = self.connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (old_status, old_code) = tx
+        let (old_status, old_code, owner_kind, owner_id) = tx
             .query_row(
-                "SELECT status,safe_error_code FROM tool_runs WHERE id=?",
+                "SELECT status,safe_error_code,owner_kind,owner_id FROM tool_runs WHERE id=?",
                 [id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
@@ -137,6 +152,26 @@ impl Store {
                 Err(StoreError::Conflict)
             };
         }
+        let runtime_owner_id = match owner_kind.as_str() {
+            "interactive_turn" => tx
+                .query_row(
+                    "SELECT runtime_owner_id FROM turns WHERE id=?",
+                    [owner_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or(StoreError::InvalidOwner)?,
+            "cron_run" => tx
+                .query_row(
+                    "SELECT runtime_owner_id FROM cron_runs WHERE id=?",
+                    [owner_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or(StoreError::InvalidOwner)?,
+            _ => return Err(StoreError::InvalidOwner),
+        };
+        self.require_runtime_owner(&tx, runtime_owner_id.as_deref())?;
         execute_one(
             &tx,
             "UPDATE tool_runs SET status=?,safe_error_code=?,finished_at=? WHERE id=?",
@@ -144,14 +179,6 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
-    }
-
-    /// Only recover abandoned work after excluding live sessions/processes.
-    /// A mutating call may already have taken effect remotely: never retry it
-    /// automatically or classify it as definitely failed.
-    pub fn recover_pending_tool_runs(&self) -> Result<usize, StoreError> {
-        let db = self.connection()?;
-        Ok(db.execute("UPDATE tool_runs SET status=CASE WHEN read_only=1 THEN 'failed' ELSE 'uncertain' END,safe_error_code='process_interrupted',finished_at=? WHERE status='pending'", [now()])?)
     }
 
     pub fn list_tool_runs(&self) -> Result<Vec<ToolRun>, StoreError> {

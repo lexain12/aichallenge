@@ -163,6 +163,7 @@ impl Store {
     pub fn begin_turn(&self, id: DialogId, input: &str) -> Result<TurnStart, StoreError> {
         let mut db = self.connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.require_runtime_owner_for_creation(&tx)?;
         dialog_exists(&tx, id)?;
         let pending: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM turns WHERE dialog_id=? AND status='pending')",
@@ -175,8 +176,8 @@ impl Store {
         let timestamp = now();
         execute_one(
             &tx,
-            "INSERT INTO turns(dialog_id,status,started_at) VALUES(?,'pending',?)",
-            params![id.get(), timestamp],
+            "INSERT INTO turns(dialog_id,status,started_at,runtime_owner_id) VALUES(?,'pending',?,?)",
+            params![id.get(), timestamp, self.runtime_owner_id()],
         )?;
         let turn_id = TurnId::new(tx.last_insert_rowid()).map_err(|_| StoreError::Database)?;
         execute_one(
@@ -231,11 +232,17 @@ impl Store {
     pub fn complete_turn(&self, id: TurnId, answer: &str) -> Result<(), StoreError> {
         let mut db = self.connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (dialog_id, status) = tx
+        let (dialog_id, status, runtime_owner_id) = tx
             .query_row(
-                "SELECT dialog_id,status FROM turns WHERE id=?",
+                "SELECT dialog_id,status,runtime_owner_id FROM turns WHERE id=?",
                 [id.get()],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
@@ -253,6 +260,7 @@ impl Store {
                 Err(StoreError::Conflict)
             };
         }
+        self.require_runtime_owner(&tx, runtime_owner_id.as_deref())?;
         let timestamp = now();
         execute_one(
             &tx,
@@ -261,7 +269,7 @@ impl Store {
         )?;
         execute_one(
             &tx,
-            "UPDATE turns SET status='completed',finished_at=? WHERE id=?",
+            "UPDATE turns SET status='completed',finished_at=?,runtime_owner_id=NULL WHERE id=?",
             params![timestamp, id.get()],
         )?;
         execute_one(
@@ -289,15 +297,16 @@ impl Store {
     ) -> Result<(), StoreError> {
         let mut db = self.connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (old_status, old_code, dialog_id) = tx
+        let (old_status, old_code, dialog_id, runtime_owner_id) = tx
             .query_row(
-                "SELECT status,safe_error_code,dialog_id FROM turns WHERE id=?",
+                "SELECT status,safe_error_code,dialog_id,runtime_owner_id FROM turns WHERE id=?",
                 [id.get()],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, Option<String>>(1)?,
                         r.get::<_, i64>(2)?,
+                        r.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
@@ -315,10 +324,11 @@ impl Store {
                 Err(StoreError::Conflict)
             };
         }
+        self.require_runtime_owner(&tx, runtime_owner_id.as_deref())?;
         let timestamp = now();
         execute_one(
             &tx,
-            "UPDATE turns SET status=?,safe_error_code=?,finished_at=? WHERE id=?",
+            "UPDATE turns SET status=?,safe_error_code=?,finished_at=?,runtime_owner_id=NULL WHERE id=?",
             params![status, code.as_str(), timestamp, id.get()],
         )?;
         execute_one(
@@ -328,17 +338,5 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
-    }
-
-    /// Startup recovery requires the caller to ensure abandoned turns are no
-    /// longer executing. It must not run concurrently with active sessions.
-    pub fn recover_pending_turns(&self) -> Result<usize, StoreError> {
-        let mut db = self.connection()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let timestamp = now();
-        tx.execute("UPDATE dialogs SET updated_at=? WHERE id IN (SELECT dialog_id FROM turns WHERE status='pending')", [&timestamp])?;
-        let changed = tx.execute("UPDATE turns SET status='interrupted',safe_error_code='process_interrupted',finished_at=? WHERE status='pending'", [&timestamp])?;
-        tx.commit()?;
-        Ok(changed)
     }
 }

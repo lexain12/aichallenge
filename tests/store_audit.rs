@@ -1,4 +1,5 @@
 use deepseek_cli::domain::{RunId, ToolOwner, ToolRunStatus, TurnId};
+use deepseek_cli::runtime::ProcessLease;
 use deepseek_cli::store::{SafeErrorCode, Store, StoreError, ToolRunFinish, ToolRunStart};
 use rusqlite::Connection;
 
@@ -80,29 +81,58 @@ fn tool_run_stores_route_status_and_read_only_but_no_arguments() {
 
 #[test]
 fn write_recovery_becomes_uncertain() {
-    let (_dir, store, _, owner) = setup();
-    store.start_tool_run(start(owner, false)).unwrap();
-    assert_eq!(store.recover_pending_tool_runs().unwrap(), 1);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    let lease = ProcessLease::acquire(&store).unwrap();
+    let owned = store.with_runtime_owner(lease.owner_id()).unwrap();
+    let dialog = store.create_dialog("audit").unwrap();
+    let turn = owned.begin_turn(dialog.id, "question").unwrap();
+    owned
+        .start_tool_run(start(ToolOwner::InteractiveTurn(turn.turn_id), false))
+        .unwrap();
+    drop(lease);
+    let recovered = ProcessLease::acquire(&store).unwrap();
+    assert_eq!(recovered.recovery_report().tool_runs, 1);
     let row = &store.list_tool_runs().unwrap()[0];
     assert_eq!(row.status, ToolRunStatus::Uncertain);
     assert_eq!(row.safe_error_code, Some(SafeErrorCode::ProcessInterrupted));
     assert!(row.finished_at.is_some());
-    assert_eq!(store.recover_pending_tool_runs().unwrap(), 0);
+    drop(recovered);
+    assert_eq!(
+        ProcessLease::acquire(&store)
+            .unwrap()
+            .recovery_report()
+            .tool_runs,
+        0
+    );
 }
 
 #[test]
 fn read_only_recovery_becomes_failed() {
-    let (_dir, store, _, owner) = setup();
-    let id = store.start_tool_run(start(owner, true)).unwrap();
-    store.recover_pending_tool_runs().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    let lease = ProcessLease::acquire(&store).unwrap();
+    let owned = store.with_runtime_owner(lease.owner_id()).unwrap();
+    let dialog = store.create_dialog("audit").unwrap();
+    let turn = owned.begin_turn(dialog.id, "question").unwrap();
+    let id = owned
+        .start_tool_run(start(ToolOwner::InteractiveTurn(turn.turn_id), true))
+        .unwrap();
+    drop(lease);
+    let recovered = ProcessLease::acquire(&store).unwrap();
+    assert_eq!(recovered.recovery_report().tool_runs, 1);
     assert_eq!(
         store.list_tool_runs().unwrap()[0].status,
         ToolRunStatus::Failed
     );
     assert!(matches!(
-        store.finish_tool_run(id, ToolRunFinish::completed()),
+        recovered_store(&store, &recovered).finish_tool_run(id, ToolRunFinish::completed()),
         Err(StoreError::Conflict)
     ));
+}
+
+fn recovered_store(store: &Store, lease: &ProcessLease) -> Store {
+    store.with_runtime_owner(lease.owner_id()).unwrap()
 }
 
 #[test]

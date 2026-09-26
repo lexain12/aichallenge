@@ -352,6 +352,7 @@ dependencies = [
  "eventsource-stream",
  "fs2",
  "futures-util",
+ "libc",
  "reqwest",
  "rmcp",
  "rusqlite",

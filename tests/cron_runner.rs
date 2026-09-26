@@ -385,6 +385,40 @@ async fn locked_database_cannot_push_claim_past_the_whole_run_deadline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_interrupts_a_locked_claim_without_late_mutation() {
+    let fixture = fixture();
+    let job = recurring(&fixture, Moscow);
+    let blocker =
+        rusqlite::Connection::open(fixture._directory.path().join("agent.sqlite3")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let provider = FakeProvider::new([final_text("must not dispatch")]);
+    let now = Utc.with_ymd_and_hms(2026, 9, 26, 6, 30, 0).unwrap();
+    let service = service(&fixture, provider.clone(), now, Duration::from_secs(5));
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let mut task = tokio::spawn(async move { service.run_job(job.id, task_cancellation).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let cancelled_at = std::time::Instant::now();
+    cancellation.cancel();
+
+    let result = tokio::time::timeout(Duration::from_millis(300), &mut task).await;
+    if result.is_err() {
+        drop(blocker);
+        let _ = task.await;
+        panic!("locked claim ignored cancellation");
+    }
+    assert_eq!(
+        result.unwrap().unwrap().unwrap_err(),
+        CronRunError::Interrupted
+    );
+    assert!(cancelled_at.elapsed() < Duration::from_millis(300));
+    drop(blocker);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(fixture.store.list_runs(job.id).unwrap().is_empty());
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_finalization_is_bounded_and_next_exclusive_startup_recovers() {
     let fixture = fixture();
     let lease = ProcessLease::acquire(&fixture.store).unwrap();
@@ -393,7 +427,19 @@ async fn blocked_finalization_is_bounded_and_next_exclusive_startup_recovers() {
     let release = Arc::new(Notify::new());
     let provider = FakeProvider::gated(final_text("done"), entered.clone(), release.clone());
     let now = Utc.with_ymd_and_hms(2026, 9, 26, 6, 30, 0).unwrap();
-    let runner = service(&fixture, provider, now, Duration::from_millis(160));
+    let owned_store = fixture.store.with_runtime_owner(lease.owner_id()).unwrap();
+    let runner = CronAgentService::new(
+        owned_store,
+        provider,
+        FakeTools::mcp(),
+        "CRON SYSTEM",
+        8,
+        REQUEST_LIMIT,
+        MESSAGE_LIMIT,
+        Duration::from_millis(160),
+        Some(Arc::new(FailedReconciler)),
+    )
+    .with_clock(Arc::new(FixedClock(now)));
     let started = std::time::Instant::now();
     let task = tokio::spawn(async move { runner.run_job(job.id, CancellationToken::new()).await });
     entered.notified().await;
@@ -416,6 +462,62 @@ async fn blocked_finalization_is_bounded_and_next_exclusive_startup_recovers() {
         fixture.store.list_runs(job.id).unwrap()[0].status,
         CronRunStatus::Interrupted
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_interrupts_locked_finalization_without_late_mutation() {
+    let fixture = fixture();
+    let lease = ProcessLease::acquire(&fixture.store).unwrap();
+    let job = recurring(&fixture, Moscow);
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let provider = FakeProvider::gated(final_text("done"), entered.clone(), release.clone());
+    let owned_store = fixture.store.with_runtime_owner(lease.owner_id()).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 9, 26, 6, 30, 0).unwrap();
+    let runner = CronAgentService::new(
+        owned_store,
+        provider,
+        FakeTools::mcp(),
+        "CRON SYSTEM",
+        8,
+        REQUEST_LIMIT,
+        MESSAGE_LIMIT,
+        Duration::from_secs(5),
+        Some(Arc::new(FailedReconciler)),
+    )
+    .with_clock(Arc::new(FixedClock(now)));
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let mut task = tokio::spawn(async move { runner.run_job(job.id, task_cancellation).await });
+    entered.notified().await;
+    let blocker =
+        rusqlite::Connection::open(fixture._directory.path().join("agent.sqlite3")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    release.notify_one();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let cancelled_at = std::time::Instant::now();
+    cancellation.cancel();
+
+    let result = tokio::time::timeout(Duration::from_millis(300), &mut task).await;
+    if result.is_err() {
+        drop(blocker);
+        let _ = task.await;
+        panic!("locked finalization ignored cancellation");
+    }
+    assert_eq!(
+        result.unwrap().unwrap().unwrap_err(),
+        CronRunError::Interrupted
+    );
+    assert!(cancelled_at.elapsed() < Duration::from_millis(300));
+    drop(blocker);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        fixture.store.list_runs(job.id).unwrap()[0].status,
+        CronRunStatus::Pending
+    );
+    drop(lease);
+    let recovered = ProcessLease::acquire(&fixture.store).unwrap();
+    assert_eq!(recovered.recovery_report().cron_runs, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -484,7 +586,7 @@ async fn once_at_reconciliation_is_inside_the_run_wall_timeout() {
         8,
         REQUEST_LIMIT,
         MESSAGE_LIMIT,
-        Duration::from_millis(20),
+        Duration::from_millis(200),
         Some(Arc::new(PendingReconciler)),
     )
     .with_clock(Arc::new(FixedClock(at)));
@@ -554,7 +656,7 @@ async fn reconciliation_timeout_kills_the_crontab_preflight_process() {
         8,
         REQUEST_LIMIT,
         MESSAGE_LIMIT,
-        Duration::from_millis(20),
+        Duration::from_millis(200),
         Some(reconciler),
     )
     .with_clock(Arc::new(FixedClock(at)));
