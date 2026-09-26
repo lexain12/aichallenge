@@ -50,12 +50,18 @@ pub trait ToolExecutor: Send + Sync {
     fn call<'a>(&'a self, call: &'a ModelToolCall) -> ToolFuture<'a>;
 }
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Error, PartialEq, Eq)]
 pub enum ToolCatalogError {
-    #[error("Tool provider name collision: {0}")]
-    NameCollision(String),
-    #[error("Tool is missing a dispatch route: {0}")]
-    MissingRoute(String),
+    #[error("tool_catalog_name_collision")]
+    NameCollision,
+    #[error("tool_catalog_missing_route")]
+    MissingRoute,
+}
+
+impl std::fmt::Debug for ToolCatalogError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
 }
 
 struct CompositeRoute {
@@ -79,11 +85,11 @@ impl CompositeToolExecutor {
         for (executor_index, executor) in executors.iter().enumerate() {
             for definition in executor.definitions() {
                 if routes.contains_key(&definition.name) {
-                    return Err(ToolCatalogError::NameCollision(definition.name.clone()));
+                    return Err(ToolCatalogError::NameCollision);
                 }
                 let route = executor
                     .route(&definition.name)
-                    .ok_or_else(|| ToolCatalogError::MissingRoute(definition.name.clone()))?;
+                    .ok_or(ToolCatalogError::MissingRoute)?;
                 routes.insert(
                     definition.name.clone(),
                     CompositeRoute {

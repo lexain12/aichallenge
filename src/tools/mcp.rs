@@ -1,5 +1,8 @@
 //! Immutable discovery and dispatch for configured Streamable HTTP MCP servers.
 
+#[cfg(test)]
+mod tests;
+
 use std::{collections::HashMap, future::Future, pin::Pin, time::Duration};
 
 use rmcp::{
@@ -26,12 +29,12 @@ use crate::{
 /// The adapter boundary never exposes potentially sensitive remote diagnostics.
 #[derive(Clone, Copy, Debug, Error)]
 #[error("MCP client request failed")]
-pub struct McpClientError;
+struct McpClientError;
 
-pub type McpFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, McpClientError>> + Send + 'a>>;
+type McpFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, McpClientError>> + Send + 'a>>;
 
 /// An initialized client; implementations must return the complete tool catalog.
-pub trait McpClient: Send + Sync {
+trait McpClient: Send + Sync {
     fn list_tools(&self) -> McpFuture<'_, Vec<Tool>>;
     fn call_tool<'a>(
         &'a self,
@@ -76,20 +79,26 @@ impl McpClient for RmcpClient {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum McpRegistryError {
-    #[error("MCP server {0} failed to connect")]
-    ConnectFailed(String),
-    #[error("MCP server {0} connection timed out")]
-    ConnectTimeout(String),
-    #[error("MCP server {0} tool discovery failed")]
-    ListFailed(String),
-    #[error("MCP server {0} tool discovery timed out")]
-    ListTimeout(String),
-    #[error("MCP tool has an invalid provider name: {0}")]
-    InvalidToolName(String),
-    #[error("MCP tool name collision: {0}")]
-    NameCollision(String),
+    #[error("mcp_connect_failed")]
+    ConnectFailed,
+    #[error("mcp_connect_timeout")]
+    ConnectTimeout,
+    #[error("mcp_list_failed")]
+    ListFailed,
+    #[error("mcp_list_timeout")]
+    ListTimeout,
+    #[error("mcp_invalid_tool_name")]
+    InvalidToolName,
+    #[error("mcp_name_collision")]
+    NameCollision,
+}
+
+impl std::fmt::Debug for McpRegistryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
 }
 
 struct Route {
@@ -99,6 +108,21 @@ struct Route {
     read_only: bool,
 }
 
+/// Immutable catalog connected through validated settings. Adapter internals are private.
+///
+/// ```compile_fail
+/// use deepseek_cli::tools::mcp::McpClient;
+/// ```
+/// ```compile_fail
+/// use deepseek_cli::tools::mcp::McpClientError;
+/// ```
+/// ```compile_fail
+/// use deepseek_cli::tools::mcp::McpFuture;
+/// ```
+/// ```compile_fail
+/// use deepseek_cli::tools::mcp::McpRegistry;
+/// let _ = McpRegistry::from_clients;
+/// ```
 pub struct McpRegistry {
     clients: Vec<Box<dyn McpClient>>,
     definitions: Vec<ModelToolDefinition>,
@@ -124,17 +148,15 @@ impl McpRegistry {
                 ClientConfig::default().serve(transport),
             )
             .await
-            .map_err(|_| McpRegistryError::ConnectTimeout(server.name().to_owned()))?
-            .map_err(|_| McpRegistryError::ConnectFailed(server.name().to_owned()))?;
+            .map_err(|_| McpRegistryError::ConnectTimeout)?
+            .map_err(|_| McpRegistryError::ConnectFailed)?;
             clients.push((server.name().to_owned(), Box::new(RmcpClient { service })));
         }
         Self::from_clients(clients, config.connect_timeout(), config.call_timeout()).await
     }
 
-    /// Integration-test seam for initialized clients; production uses `connect`.
     /// Each catalog gets its own discovery deadline, separate from call timeouts.
-    #[doc(hidden)]
-    pub async fn from_clients(
+    async fn from_clients(
         clients: Vec<(String, Box<dyn McpClient>)>,
         list_timeout: Duration,
         call_timeout: Duration,
@@ -148,21 +170,25 @@ impl McpRegistry {
         for (server_name, client) in clients {
             let tools = timeout(list_timeout, client.list_tools())
                 .await
-                .map_err(|_| McpRegistryError::ListTimeout(server_name.clone()))?
-                .map_err(|_| McpRegistryError::ListFailed(server_name.clone()))?;
+                .map_err(|_| McpRegistryError::ListTimeout)?
+                .map_err(|_| McpRegistryError::ListFailed)?;
             let client_index = registry.clients.len();
             for tool in tools {
-                let name = format!("{server_name}__{}", tool.name);
-                if tool.name.is_empty()
-                    || name.len() > 64
-                    || !name
+                // Check each component before allocating the provider alias.
+                if server_name.is_empty()
+                    || tool.name.is_empty()
+                    || server_name.len() > 62
+                    || tool.name.len() > 62 - server_name.len()
+                    || !server_name
                         .bytes()
+                        .chain(tool.name.bytes())
                         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
                 {
-                    return Err(McpRegistryError::InvalidToolName(name));
+                    return Err(McpRegistryError::InvalidToolName);
                 }
+                let name = format!("{server_name}__{}", tool.name);
                 if registry.routes.contains_key(&name) {
-                    return Err(McpRegistryError::NameCollision(name));
+                    return Err(McpRegistryError::NameCollision);
                 }
                 let read_only = tool
                     .annotations

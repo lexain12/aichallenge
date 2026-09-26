@@ -58,34 +58,40 @@ impl ConversationStep {
     }
 }
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Error, PartialEq, Eq)]
 pub enum ToolLoopError {
-    #[error("Tool conversation is already complete")]
+    #[error("tool_already_complete")]
     AlreadyComplete,
-    #[error("Previous ordinary turn is not complete")]
+    #[error("tool_incomplete_turn")]
     IncompleteTurn,
-    #[error("Tool results are pending")]
+    #[error("tool_pending_tool_results")]
     PendingToolResults,
-    #[error("No tool results are expected")]
+    #[error("tool_unexpected_tool_results")]
     UnexpectedToolResults,
-    #[error("Tool round limit exceeded")]
+    #[error("tool_round_limit_exceeded")]
     RoundLimitExceeded,
-    #[error("Tool-call turn contains no calls")]
+    #[error("tool_empty_tool_calls")]
     EmptyToolCalls,
-    #[error("Tool call ID is empty")]
+    #[error("tool_empty_call_id")]
     EmptyCallId,
-    #[error("Duplicate tool call ID: {0}")]
-    DuplicateCallId(String),
-    #[error("Unknown tool: {0}")]
-    UnknownTool(String),
-    #[error("Tool arguments must be a JSON object")]
+    #[error("tool_duplicate_call_id")]
+    DuplicateCallId,
+    #[error("tool_unknown")]
+    UnknownTool,
+    #[error("tool_invalid_arguments")]
     InvalidArguments,
-    #[error("Assistant tool-call message does not match the pending turn")]
+    #[error("tool_assistant_message_mismatch")]
     AssistantMessageMismatch,
-    #[error("Tool result count does not match the pending calls")]
+    #[error("tool_result_count_mismatch")]
     ResultCountMismatch,
-    #[error("Tool result call IDs are not in the pending order")]
+    #[error("tool_result_call_id_mismatch")]
     ResultCallIdMismatch,
+}
+
+impl std::fmt::Debug for ToolLoopError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
 }
 
 struct PendingRound {
@@ -198,14 +204,14 @@ impl ToolConversation {
                         return Err(ToolLoopError::EmptyCallId);
                     }
                     if self.seen_call_ids.contains(&call.id) || !next_ids.insert(call.id.clone()) {
-                        return Err(ToolLoopError::DuplicateCallId(call.id.clone()));
+                        return Err(ToolLoopError::DuplicateCallId);
                     }
                     if !self
                         .definitions
                         .iter()
                         .any(|definition| definition.name == call.name)
                     {
-                        return Err(ToolLoopError::UnknownTool(call.name.clone()));
+                        return Err(ToolLoopError::UnknownTool);
                     }
                     if !matches!(
                         serde_json::from_str::<Value>(&call.arguments),

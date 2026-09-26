@@ -4,6 +4,30 @@ use deepseek_cli::provider::{
 use deepseek_cli::tools::{ConversationStep, ToolConversation, ToolLoopError, ToolResultMessage};
 use serde_json::{Value, json};
 
+#[test]
+fn provider_controlled_ids_and_names_never_reach_error_formatting() {
+    let marker = "SECRET_MARKER".repeat(10_000);
+    let mut conversation = ToolConversation::new(base_messages(), definitions(), 8);
+    let mut unknown = call("safe-id");
+    unknown.name = marker.clone();
+    let error = conversation
+        .accept_assistant_turn(tool_turn(vec![unknown], None))
+        .unwrap_err();
+    for formatted in [error.to_string(), format!("{error:?}")] {
+        assert!(formatted.len() < 64);
+        assert!(!formatted.contains("SECRET_MARKER"));
+        assert_eq!(formatted, "tool_unknown");
+    }
+    let error = conversation
+        .accept_assistant_turn(tool_turn(vec![call(&marker), call(&marker)], None))
+        .unwrap_err();
+    for formatted in [error.to_string(), format!("{error:?}")] {
+        assert!(formatted.len() < 64);
+        assert!(!formatted.contains("SECRET_MARKER"));
+        assert_eq!(formatted, "tool_duplicate_call_id");
+    }
+}
+
 fn base_messages() -> Vec<ProviderMessage> {
     vec![
         ProviderMessage::system("Follow the user request."),
@@ -194,7 +218,7 @@ fn duplicate_ids_within_a_turn_are_rejected_without_state_change() {
                 Some(usage(4, 1))
             ))
             .unwrap_err(),
-        ToolLoopError::DuplicateCallId("same".into())
+        ToolLoopError::DuplicateCallId
     );
     assert_eq!(conversation.messages().len(), 2);
     assert_eq!(conversation.rounds(), 0);
@@ -220,7 +244,7 @@ fn duplicate_ids_across_rounds_are_rejected_without_state_change() {
                 Some(usage(4, 1))
             ))
             .unwrap_err(),
-        ToolLoopError::DuplicateCallId("same".into())
+        ToolLoopError::DuplicateCallId
     );
     assert_eq!(conversation.messages().len(), before);
     assert_eq!(conversation.rounds(), 1);
@@ -269,7 +293,7 @@ fn next_ordinary_turn_requires_completion_and_replaces_only_transcript_and_usage
         conversation
             .accept_assistant_turn(tool_turn(vec![call("same")], None))
             .unwrap_err(),
-        ToolLoopError::DuplicateCallId("same".into())
+        ToolLoopError::DuplicateCallId
     );
 }
 
@@ -313,7 +337,7 @@ fn malformed_arguments_and_unknown_tools_are_rejected_before_mutation() {
         conversation
             .accept_assistant_turn(tool_turn(vec![unknown], None))
             .unwrap_err(),
-        ToolLoopError::UnknownTool("absent".into())
+        ToolLoopError::UnknownTool
     );
     assert_eq!(conversation.messages().len(), 2);
     assert_eq!(conversation.rounds(), 0);
