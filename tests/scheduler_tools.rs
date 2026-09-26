@@ -7,6 +7,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono_tz::UTC;
 use deepseek_cli::domain::{DialogId, JobDesiredState, JobId, JobSyncState, RequestId};
 use deepseek_cli::provider::ModelToolCall;
 use deepseek_cli::scheduler::{CronSynchronizer, CrontabBackend, CrontabFuture, SchedulerError};
@@ -278,6 +279,107 @@ fn schemas_are_closed_and_session_fields_are_not_model_arguments() {
     ] {
         assert!(!executor.is_read_only(name).unwrap());
     }
+}
+
+#[tokio::test]
+async fn configured_defaults_bound_prompt_schema_and_confirmation_expiry() {
+    let fixture = Fixture::new(FakeBackend::success());
+    let broker = ImmediateBroker::accepting();
+    let issued_at = Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap();
+    let executor = SchedulerToolExecutor::new_with_clock_and_config(
+        fixture.store.clone(),
+        fixture.synchronizer.clone(),
+        broker.clone(),
+        fixture.source_dialog_id,
+        request(REQUEST_A),
+        Arc::new(FixedClock(issued_at)),
+        UTC,
+        1024,
+        std::time::Duration::from_secs(120),
+    );
+
+    for tool in ["cron__create", "cron__update"] {
+        let prompt_limit = executor
+            .definitions()
+            .iter()
+            .find(|definition| definition.name == tool)
+            .unwrap()
+            .parameters["properties"]["prompt"]["maxLength"]
+            .as_u64();
+        assert_eq!(prompt_limit, Some(1024));
+    }
+    let timezone_default = executor
+        .definitions()
+        .iter()
+        .find(|definition| definition.name == "cron__create")
+        .unwrap()
+        .parameters["properties"]["timezone"]["default"]
+        .as_str();
+    assert_eq!(timezone_default, Some("UTC"));
+
+    executor
+        .call(&call(
+            "cron__create",
+            json!({
+                "name":"UTC report",
+                "schedule":{"kind":"cron","expression":"0 9 * * *"},
+                "prompt":"report"
+            }),
+        ))
+        .await
+        .unwrap();
+    let request = broker.requests.lock().unwrap()[0].clone();
+    assert_eq!(request.preview.timezone, "UTC");
+    assert_eq!(request.expires_at, issued_at + Duration::minutes(2));
+    assert_eq!(
+        fixture.store.list_jobs().unwrap()[0].schedule.timezone(),
+        UTC
+    );
+
+    let before = fixture.store.list_jobs().unwrap().len();
+    let installs_before = fixture.backend.installed.lock().unwrap().len();
+    assert_eq!(
+        executor
+            .call(&call(
+                "cron__create",
+                json!({
+                    "name":"too large",
+                    "schedule":{"kind":"cron","expression":"0 9 * * *"},
+                    "timezone":"Europe/Moscow",
+                    "prompt":"x".repeat(1025)
+                }),
+            ))
+            .await
+            .unwrap_err(),
+        deepseek_cli::tools::ToolExecutionError::InvalidArguments
+    );
+    assert_eq!(fixture.store.list_jobs().unwrap().len(), before);
+    assert_eq!(
+        fixture.backend.installed.lock().unwrap().len(),
+        installs_before
+    );
+
+    let existing = fixture.store.list_jobs().unwrap()[0].clone();
+    assert_eq!(
+        executor
+            .call(&call(
+                "cron__update",
+                json!({
+                    "job_id":existing.id,
+                    "name":"oversized update",
+                    "schedule":{"kind":"cron","expression":"30 10 * * *"},
+                    "prompt":"x".repeat(1025)
+                }),
+            ))
+            .await
+            .unwrap_err(),
+        deepseek_cli::tools::ToolExecutionError::InvalidArguments
+    );
+    assert_eq!(fixture.store.get_job(existing.id).unwrap(), existing);
+    assert_eq!(
+        fixture.backend.installed.lock().unwrap().len(),
+        installs_before
+    );
 }
 
 #[tokio::test]

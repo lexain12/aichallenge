@@ -32,7 +32,7 @@ pub enum ProtocolErrorCode {
     InternalError,
 }
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ProtocolError {
     #[error("invalid_request")]
     InvalidRequest,
@@ -327,7 +327,10 @@ impl<R: AsyncRead + Unpin> NdjsonReader<R> {
         self.line.capacity()
     }
 
-    async fn read_line(&mut self) -> Result<Option<&[u8]>, ProtocolError> {
+    async fn read_line(
+        &mut self,
+        truncated: ProtocolError,
+    ) -> Result<Option<&[u8]>, ProtocolError> {
         self.line.clear();
         loop {
             let available = self
@@ -339,7 +342,7 @@ impl<R: AsyncRead + Unpin> NdjsonReader<R> {
                 return if self.line.is_empty() {
                     Ok(None)
                 } else {
-                    Err(ProtocolError::InvalidRequest)
+                    Err(truncated)
                 };
             }
             let count = available
@@ -363,7 +366,7 @@ impl<R: AsyncRead + Unpin> NdjsonReader<R> {
     }
 
     pub async fn read_request(&mut self) -> Result<Option<RequestEnvelope>, ProtocolError> {
-        let Some(line) = self.read_line().await? else {
+        let Some(line) = self.read_line(ProtocolError::InvalidRequest).await? else {
             return Ok(None);
         };
         let request: RequestEnvelope =
@@ -378,7 +381,7 @@ impl<R: AsyncRead + Unpin> NdjsonReader<R> {
     }
 
     pub async fn read_event(&mut self) -> Result<Option<ServerEnvelope>, ProtocolError> {
-        let Some(line) = self.read_line().await? else {
+        let Some(line) = self.read_line(ProtocolError::InvalidEvent).await? else {
             return Ok(None);
         };
         let event: ServerEnvelope =

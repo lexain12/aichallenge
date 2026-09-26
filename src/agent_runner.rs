@@ -63,6 +63,7 @@ pub enum CronRunError {
 pub struct CronAgentService {
     store: Store,
     runner: AgentRunner,
+    max_message_bytes: usize,
     system_prompt: String,
     timeout: Duration,
     reconciler: Option<Arc<dyn CronRunReconciler>>,
@@ -93,6 +94,7 @@ impl CronAgentService {
         Self {
             store,
             runner,
+            max_message_bytes,
             system_prompt: system_prompt.into(),
             timeout,
             reconciler,
@@ -124,22 +126,24 @@ impl CronAgentService {
         if remaining.is_zero() {
             return Err(CronRunError::TimedOut);
         }
+        if cancellation.is_cancelled() {
+            return Err(CronRunError::Interrupted);
+        }
         // Keep a meaningful part of even very short budgets for the durable
         // terminal write. Production timeouts cap this reservation at 100ms.
         let reserve = std::cmp::min(Duration::from_millis(100), remaining / 2);
         let execution_deadline = deadline.checked_sub(reserve).unwrap_or(deadline);
-        if cancellation.is_cancelled() {
-            return Err(CronRunError::Interrupted);
-        }
         let claim_cancellation = CancellationToken::new();
         let claim_store = self.store.clone();
         let claim_clock = self.clock.clone();
+        let max_message_bytes = self.max_message_bytes;
         let blocking_cancellation = claim_cancellation.clone();
         let claim_task = tokio::task::spawn_blocking(move || {
             claim_store.claim_run_with_deadline(
                 job_id,
                 execution_deadline,
                 &blocking_cancellation,
+                max_message_bytes,
                 || claim_clock.now(),
             )
         });
@@ -177,6 +181,7 @@ impl CronAgentService {
         let claim = match claim {
             RunClaim::Inactive => return Ok(CronRunOutcome::Inactive),
             RunClaim::Skipped(run) => return Ok(CronRunOutcome::Skipped(run.id)),
+            RunClaim::PromptTooLong => return Err(CronRunError::ContextTooLong),
             RunClaim::Claimed(claim) => claim,
         };
 
@@ -828,14 +833,17 @@ pub struct InteractiveService {
     store: Store,
     runner: AgentRunner,
     system_prompt: String,
+    max_message_bytes: usize,
 }
 
 impl InteractiveService {
     pub fn new(store: Store, runner: AgentRunner, system_prompt: impl Into<String>) -> Self {
+        let max_message_bytes = runner.max_message_bytes;
         Self {
             store,
             runner,
             system_prompt: system_prompt.into(),
+            max_message_bytes,
         }
     }
 
@@ -846,6 +854,9 @@ impl InteractiveService {
         cancellation: CancellationToken,
         event_sink: &mut AgentEventSink<'_>,
     ) -> Result<AgentOutcome, AgentError> {
+        if content.len() > self.max_message_bytes {
+            return Err(AgentError::ContentTooLong);
+        }
         let turn = self.store.begin_turn(dialog_id, content)?;
         let history = match self.store.completed_messages(dialog_id) {
             Ok(history) => history,

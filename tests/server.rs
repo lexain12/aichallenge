@@ -158,7 +158,9 @@ impl ToolExecutor for PendingWriteTools {
         Box::pin(std::future::pending())
     }
 }
-struct FakeCron;
+struct FakeCron {
+    installed: Arc<Mutex<Vec<String>>>,
+}
 impl CrontabBackend for FakeCron {
     fn preflight(&self) -> CrontabFuture<'_, ()> {
         Box::pin(async { Ok(()) })
@@ -169,7 +171,8 @@ impl CrontabBackend for FakeCron {
     fn validate<'a>(&'a self, _: &'a str) -> CrontabFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
-    fn install<'a>(&'a self, _: &'a str) -> CrontabFuture<'a, ()> {
+    fn install<'a>(&'a self, candidate: &'a str) -> CrontabFuture<'a, ()> {
+        self.installed.lock().unwrap().push(candidate.to_owned());
         Box::pin(async { Ok(()) })
     }
 }
@@ -177,6 +180,7 @@ struct Fixture {
     _dir: TempDir,
     store: Store,
     inspection: InspectionService,
+    installed_crontabs: Arc<Mutex<Vec<String>>>,
     server: StdioServer,
 }
 impl Fixture {
@@ -184,16 +188,27 @@ impl Fixture {
         Self::with_tools(provider, Arc::new(EmptyTools))
     }
     fn with_tools(provider: Arc<dyn Provider>, mcp: Arc<dyn ToolExecutor>) -> Self {
+        Self::with_config(provider, mcp, "", "")
+    }
+    fn with_config(
+        provider: Arc<dyn Provider>,
+        mcp: Arc<dyn ToolExecutor>,
+        scheduler: &str,
+        limits: &str,
+    ) -> Self {
         let dir = common::private_tempdir();
         let db = dir.path().join("agent.sqlite");
         let store = Store::open(&db).unwrap();
         let config = dir.path().join("server.toml");
-        std::fs::write(&config, format!("[provider]\napi_key = \"test\"\n[database]\npath = \"{}\"\n[scheduler]\nlock_path = \"{}\"\nbinary_path = \"/opt/light-agent/bin/light-agent\"\ncrontab_binary = \"/usr/bin/crontab\"\n", db.display(), dir.path().join("cron.lock").display())).unwrap();
+        std::fs::write(&config, format!("[provider]\napi_key = \"test\"\n[database]\npath = \"{}\"\n[scheduler]\nlock_path = \"{}\"\nbinary_path = \"/opt/light-agent/bin/light-agent\"\ncrontab_binary = \"/usr/bin/crontab\"\n{scheduler}\n[limits]\n{limits}\n", db.display(), dir.path().join("cron.lock").display())).unwrap();
         let settings = Arc::new(ServerSettings::load(&config, None).unwrap());
+        let installed_crontabs = Arc::new(Mutex::new(Vec::new()));
         let synchronizer = Arc::new(
             CronSynchronizer::new(
                 store.clone(),
-                Arc::new(FakeCron),
+                Arc::new(FakeCron {
+                    installed: installed_crontabs.clone(),
+                }),
                 dir.path().join("cron.lock"),
                 PathBuf::from("/opt/light-agent/bin/light-agent"),
             )
@@ -212,6 +227,7 @@ impl Fixture {
             _dir: dir,
             store,
             inspection,
+            installed_crontabs,
             server,
         }
     }
@@ -249,6 +265,62 @@ impl Session {
 }
 fn req() -> RequestId {
     RequestId::new()
+}
+
+async fn confirm_scheduled_turn(
+    session: &mut Session,
+    dialog_id: deepseek_cli::domain::DialogId,
+    expected_timezone: &str,
+) {
+    let origin = req();
+    session
+        .send(
+            origin,
+            ClientRequest::SendMessage {
+                dialog_id,
+                message: "schedule it".into(),
+            },
+        )
+        .await;
+    let confirmation_id = loop {
+        let event = session.event().await;
+        assert_eq!(event.request_id, origin);
+        if let ServerEvent::ConfirmationRequired {
+            confirmation_id,
+            preview,
+        } = event.event
+        {
+            assert_eq!(preview.timezone, expected_timezone);
+            assert!(
+                render_confirmation_preview(&preview)
+                    .contains(&format!("timezone: {expected_timezone:?}"))
+            );
+            break confirmation_id;
+        }
+    };
+    let response = req();
+    session
+        .send(
+            response,
+            ClientRequest::ConfirmAction {
+                confirmation_id,
+                originating_request_id: origin,
+            },
+        )
+        .await;
+    loop {
+        let event = session.event().await;
+        if event.request_id == response {
+            assert!(matches!(
+                event.event,
+                ServerEvent::ConfirmationResolved { accepted: true, .. }
+            ));
+        } else if event.request_id == origin
+            && matches!(event.event, ServerEvent::TurnCompleted { .. })
+        {
+            break;
+        }
+    }
 }
 
 #[tokio::test]
@@ -340,6 +412,46 @@ async fn send_streams_events_and_commits_answer() {
             .collect::<Vec<_>>(),
         ["question", "answer"]
     );
+}
+
+#[tokio::test]
+async fn configured_message_limit_rejects_send_before_persistence() {
+    let provider = FakeProvider::new([Reply::Final("must not run".into())]);
+    let fixture = Fixture::with_config(
+        provider.clone(),
+        Arc::new(EmptyTools),
+        "",
+        "message_bytes = 1024",
+    );
+    let dialog = fixture.store.create_dialog("chat").unwrap().id;
+    let store = fixture.store.clone();
+    let database_path = fixture._dir.path().join("agent.sqlite");
+    let mut session = Session::start(fixture.server).await;
+    session.event().await;
+    let request_id = req();
+    session
+        .send(
+            request_id,
+            ClientRequest::SendMessage {
+                dialog_id: dialog,
+                message: "x".repeat(1025),
+            },
+        )
+        .await;
+
+    assert!(matches!(
+        session.event().await.event,
+        ServerEvent::ProtocolError {
+            code: deepseek_cli::protocol::ProtocolErrorCode::ContentTooLong
+        }
+    ));
+    assert!(store.completed_messages(dialog).unwrap().is_empty());
+    let connection = rusqlite::Connection::open(database_path).unwrap();
+    let turns: i64 = connection
+        .query_row("SELECT count(*) FROM turns", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(turns, 0);
+    assert_eq!(provider.replies.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -548,6 +660,57 @@ async fn confirmation_routes_only_to_originating_request() {
         replay_event.event,
         ServerEvent::ProtocolError { .. }
     ));
+}
+
+#[tokio::test]
+async fn configured_scheduler_timezone_defaults_and_explicit_override_agree_end_to_end() {
+    let provider = FakeProvider::new([
+        Reply::ToolCall(ModelToolCall {
+            id: "default-utc".into(),
+            name: "cron__create".into(),
+            arguments: json!({
+                "name":"UTC report",
+                "schedule":{"kind":"cron","expression":"0 9 * * *"},
+                "prompt":"utc task"
+            })
+            .to_string(),
+        }),
+        Reply::Final("scheduled UTC".into()),
+        Reply::ToolCall(ModelToolCall {
+            id: "explicit-moscow".into(),
+            name: "cron__create".into(),
+            arguments: json!({
+                "name":"Moscow report",
+                "schedule":{"kind":"cron","expression":"30 9 * * *"},
+                "timezone":"Europe/Moscow",
+                "prompt":"moscow task"
+            })
+            .to_string(),
+        }),
+        Reply::Final("scheduled Moscow".into()),
+    ]);
+    let fixture = Fixture::with_config(
+        provider,
+        Arc::new(EmptyTools),
+        "timezone = \"UTC\"\nconfirmation_timeout_minutes = 2",
+        "message_bytes = 1024",
+    );
+    let dialog = fixture.store.create_dialog("chat").unwrap().id;
+    let store = fixture.store.clone();
+    let installed = fixture.installed_crontabs.clone();
+    let mut session = Session::start(fixture.server).await;
+    session.event().await;
+
+    confirm_scheduled_turn(&mut session, dialog, "UTC").await;
+    confirm_scheduled_turn(&mut session, dialog, "Europe/Moscow").await;
+
+    let jobs = store.list_jobs().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].schedule.timezone().to_string(), "UTC");
+    assert_eq!(jobs[1].schedule.timezone().to_string(), "Europe/Moscow");
+    let rendered = installed.lock().unwrap().last().unwrap().clone();
+    assert!(rendered.contains("CRON_TZ=UTC"));
+    assert!(rendered.contains("CRON_TZ=Europe/Moscow"));
 }
 
 #[tokio::test]

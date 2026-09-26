@@ -52,6 +52,7 @@ pub enum RunClaim {
     Claimed(CronRunClaim),
     Skipped(CronRun),
     Inactive,
+    PromptTooLong,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -329,6 +330,7 @@ impl Store {
             job_id,
             Instant::now() + Duration::from_secs(5),
             &CancellationToken::new(),
+            usize::MAX,
             || current_time,
         )
     }
@@ -338,9 +340,10 @@ impl Store {
         job_id: JobId,
         deadline: Instant,
         cancellation: &CancellationToken,
+        max_prompt_bytes: usize,
         now: impl FnOnce() -> DateTime<Utc>,
     ) -> Result<RunClaim, StoreError> {
-        self.claim_run_inner(job_id, deadline, cancellation, now)
+        self.claim_run_inner(job_id, deadline, cancellation, max_prompt_bytes, now)
     }
 
     fn claim_run_inner(
@@ -348,6 +351,7 @@ impl Store {
         job_id: JobId,
         deadline: Instant,
         cancellation: &CancellationToken,
+        max_prompt_bytes: usize,
         now: impl FnOnce() -> DateTime<Utc>,
     ) -> Result<RunClaim, StoreError> {
         self.with_immediate_transaction(deadline, cancellation, |tx| {
@@ -367,6 +371,9 @@ impl Store {
                 || job.sync_state != JobSyncState::Applied
             {
                 return Ok(RunClaim::Inactive);
+            }
+            if job.prompt.len() > max_prompt_bytes {
+                return Ok(RunClaim::PromptTooLong);
             }
             if let ScheduleSpec::OnceAt { at, .. } = job.schedule {
                 let current_minute = minute_start(current_time);

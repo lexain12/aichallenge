@@ -83,6 +83,22 @@ fn tool_run_stores_route_status_and_read_only_but_no_arguments() {
 }
 
 #[test]
+fn terminal_audit_status_is_visible_after_reopening_the_database() {
+    let (dir, store, db, owner) = setup();
+    let id = store.start_tool_run(start(owner, false)).unwrap();
+    store
+        .finish_tool_run(id, ToolRunFinish::failed(SafeErrorCode::ToolError))
+        .unwrap();
+    drop(db);
+    drop(store);
+
+    let reopened = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    let audit = &reopened.list_tool_runs().unwrap()[0];
+    assert_eq!(audit.status, ToolRunStatus::Failed);
+    assert_eq!(audit.safe_error_code, Some(SafeErrorCode::ToolError));
+}
+
+#[test]
 fn write_recovery_becomes_uncertain() {
     let dir = common::private_tempdir();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();

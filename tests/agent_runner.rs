@@ -516,6 +516,34 @@ async fn oversized_provider_answer_is_not_persisted() {
 }
 
 #[tokio::test]
+async fn oversized_interactive_input_is_rejected_before_turn_persistence() {
+    let f = fixture();
+    let provider = FakeProvider::new([final_text("must not run")]);
+    let runner = AgentRunner::new(
+        provider.clone(),
+        FakeTools::empty(),
+        f.store.clone(),
+        8,
+        REQUEST_LIMIT,
+        1024,
+    );
+
+    let error = service(&f.store, runner)
+        .send_message(
+            f.dialog_id,
+            &"x".repeat(1025),
+            CancellationToken::new(),
+            &mut sink(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, AgentError::ContentTooLong);
+    assert!(turn_rows(&f.path).is_empty());
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test]
 async fn provider_context_error_recommends_new_dialog_without_deleting_history() {
     let f = fixture();
     let old = f.store.begin_turn(f.dialog_id, "old user").unwrap();

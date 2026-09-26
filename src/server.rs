@@ -47,7 +47,6 @@ const MAX_ACTIVE_TURNS: usize = 8;
 const MAX_BACKGROUND_REQUESTS: usize = 8;
 const FRAGMENT_BYTES: usize = 64 * 1024;
 const USED_CONFIRMATIONS: usize = 1024;
-const CONFIRMATION_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const TERMINAL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone)]
@@ -133,7 +132,7 @@ impl SessionConfirmationBroker {
     fn pair_with_clock(
         clock: Arc<dyn ConfirmationClock>,
     ) -> (Arc<Self>, mpsc::Receiver<ConfirmationPrompt>) {
-        Self::pair_with_clock_and_timeout(clock, CONFIRMATION_TTL)
+        Self::pair_with_clock_and_timeout(clock, std::time::Duration::from_secs(5 * 60))
     }
 
     fn pair_with_clock_and_timeout(
@@ -312,13 +311,16 @@ impl ConfirmationBroker for SessionConfirmationBroker {
 pub struct StdioServer {
     dependencies: ServerDependencies,
     confirmation_timeout: std::time::Duration,
+    maximum_confirmation_timeout: std::time::Duration,
 }
 
 impl StdioServer {
     pub fn new(dependencies: ServerDependencies) -> Self {
+        let confirmation_timeout = dependencies.settings.scheduler().confirmation_timeout();
         Self {
             dependencies,
-            confirmation_timeout: CONFIRMATION_TTL,
+            confirmation_timeout,
+            maximum_confirmation_timeout: confirmation_timeout,
         }
     }
 
@@ -328,7 +330,7 @@ impl StdioServer {
         mut self,
         timeout: std::time::Duration,
     ) -> Result<Self, ServerError> {
-        if timeout.is_zero() || timeout > CONFIRMATION_TTL {
+        if timeout.is_zero() || timeout > self.maximum_confirmation_timeout {
             return Err(ServerError::Protocol);
         }
         self.confirmation_timeout = timeout;
@@ -511,6 +513,10 @@ impl StdioServer {
                 }
             }
             SendMessage { dialog_id, message } => {
+                if message.len() > self.dependencies.settings.max_message_bytes() {
+                    queue_error(output, request_id, ProtocolErrorCode::ContentTooLong)?;
+                    return Ok(());
+                }
                 let at_capacity = active.len() >= MAX_ACTIVE_TURNS;
                 match active.entry(dialog_id) {
                     std::collections::hash_map::Entry::Occupied(_) => {
@@ -663,12 +669,18 @@ impl StdioServer {
         events: mpsc::Sender<InternalEvent>,
         broker: Arc<SessionConfirmationBroker>,
     ) -> Result<JoinHandle<()>, ServerError> {
-        let scheduler: Arc<dyn ToolExecutor> = Arc::new(SchedulerToolExecutor::new(
+        let scheduler: Arc<dyn ToolExecutor> = Arc::new(SchedulerToolExecutor::new_configured(
             self.dependencies.store.clone(),
             self.dependencies.synchronizer.clone(),
             broker,
             dialog_id,
             request_id,
+            self.dependencies.settings.scheduler().timezone(),
+            self.dependencies.settings.max_message_bytes(),
+            self.dependencies
+                .settings
+                .scheduler()
+                .confirmation_timeout(),
         ));
         let tools = CompositeToolExecutor::new(vec![self.dependencies.mcp.clone(), scheduler])
             .map_err(|_| ServerError::ToolCatalog)?;
@@ -683,6 +695,7 @@ impl StdioServer {
         let execution = TurnExecution {
             store: self.dependencies.store.clone(),
             runner,
+            max_message_bytes: self.dependencies.settings.max_message_bytes(),
             system_prompt: self
                 .dependencies
                 .settings
@@ -905,6 +918,7 @@ struct TurnExecution {
     store: Store,
     runner: AgentRunner,
     system_prompt: String,
+    max_message_bytes: usize,
 }
 
 struct PreparedTurn {
@@ -921,6 +935,9 @@ impl TurnExecution {
         sink: &mut crate::agent_runner::AgentEventSink<'_>,
         acknowledgements: EventAcknowledgements,
     ) -> Result<PreparedTurn, AgentError> {
+        if content.len() > self.max_message_bytes {
+            return Err(AgentError::ContentTooLong);
+        }
         let turn = self.store.begin_turn(dialog_id, content)?;
         let history = match self.store.completed_messages(dialog_id) {
             Ok(history) => history,

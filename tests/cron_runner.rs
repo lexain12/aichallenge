@@ -417,6 +417,49 @@ async fn cron_catalog_has_mcp_but_no_cron_tools() {
 }
 
 #[tokio::test]
+async fn legacy_oversized_prompt_is_rejected_before_claim_or_provider() {
+    let fixture = fixture();
+    let job = fixture
+        .store
+        .create_job(JobCreate {
+            source_dialog_id: fixture.dialog_id,
+            name: "legacy oversized".into(),
+            schedule: ScheduleSpec::parse_cron("30 1 * * *", Moscow).unwrap(),
+            prompt: "x".repeat(1025),
+        })
+        .unwrap();
+    fixture.store.mark_job_sync_applied(job.id).unwrap();
+    let provider = FakeProvider::new([final_text("must not run")]);
+    let now = Utc.with_ymd_and_hms(2026, 9, 26, 6, 30, 0).unwrap();
+    let service = CronAgentService::new(
+        fixture.store.clone(),
+        provider.clone(),
+        FakeTools::mcp(),
+        "CRON SYSTEM",
+        8,
+        REQUEST_LIMIT,
+        1024,
+        Duration::from_secs(2),
+        Some(Arc::new(FailedReconciler)),
+    )
+    .with_clock(Arc::new(FixedClock(now)));
+
+    assert_eq!(
+        service
+            .run_job(job.id, CancellationToken::new())
+            .await
+            .unwrap_err(),
+        CronRunError::ContextTooLong
+    );
+    assert!(fixture.store.list_runs(job.id).unwrap().is_empty());
+    assert!(provider.requests().is_empty());
+    assert_eq!(
+        fixture.store.get_job(job.id).unwrap().desired_state,
+        JobDesiredState::Active
+    );
+}
+
+#[tokio::test]
 async fn result_is_stored_as_run_not_message_and_tool_owner_is_cron_run() {
     let fixture = fixture();
     let job = recurring(&fixture, Moscow);

@@ -187,8 +187,8 @@ pub(crate) fn serialized_len(value: &impl Serialize) -> Result<usize, ProviderEr
     Ok(counter.0)
 }
 
-/// Safe error for protocol callers. The HTTP body is kept only for explicit
-/// operator diagnostics; even Debug does not show it.
+/// Safe error for protocol callers. Production values retain only bounded
+/// machine metadata; provider tests may inspect a redacted HTTP diagnostic.
 ///
 /// Protocol callers cannot access the HTTP body:
 ///
@@ -201,6 +201,7 @@ pub(crate) fn serialized_len(value: &impl Serialize) -> Result<usize, ProviderEr
 pub struct ProviderError {
     code: &'static str,
     status: Option<u16>,
+    #[cfg(test)]
     diagnostic: Option<String>,
     usage: Option<TokenUsage>,
 }
@@ -217,6 +218,7 @@ impl ProviderError {
         Self {
             code,
             status: None,
+            #[cfg(test)]
             diagnostic: None,
             usage: None,
         }
@@ -227,9 +229,12 @@ impl ProviderError {
     }
 
     pub(crate) fn http_with_code(code: &'static str, status: u16, diagnostic: String) -> Self {
+        #[cfg(not(test))]
+        let _ = diagnostic;
         Self {
             code,
             status: Some(status),
+            #[cfg(test)]
             diagnostic: Some(diagnostic),
             usage: None,
         }
@@ -255,7 +260,7 @@ impl ProviderError {
         }
     }
 
-    #[allow(dead_code)] // Reserved for operator logging inside the VM crate.
+    #[cfg(test)]
     pub(crate) fn raw_diagnostic(&self) -> String {
         match (&self.status, &self.diagnostic) {
             (Some(status), Some(body)) => format!("DeepSeek API returned HTTP {status}: {body}"),

@@ -1094,7 +1094,16 @@ async fn duplicate_confirmation_id_after_fifo_pop_is_not_redisplayed_or_replayed
         ))
         .await
         .unwrap();
-    tokio::task::yield_now().await;
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::TextDelta {
+                text: "duplicate-processing-barrier".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_text(&output_view, "duplicate-processing-barrier").await;
     assert_eq!(
         output_view
             .text()

@@ -185,6 +185,9 @@ pub struct SchedulerToolExecutor {
     source_dialog_id: DialogId,
     request_id: RequestId,
     clock: Arc<dyn ConfirmationClock>,
+    default_timezone: Tz,
+    max_prompt_bytes: usize,
+    confirmation_timeout: std::time::Duration,
     definitions: Vec<ModelToolDefinition>,
 }
 
@@ -196,13 +199,40 @@ impl SchedulerToolExecutor {
         source_dialog_id: DialogId,
         request_id: RequestId,
     ) -> Self {
-        Self::new_with_clock(
+        Self::new_with_clock_and_config(
             store,
             synchronizer,
             broker,
             source_dialog_id,
             request_id,
             Arc::new(SystemClock),
+            Moscow,
+            MAX_PROMPT_BYTES,
+            std::time::Duration::from_secs((CONFIRMATION_MINUTES * 60) as u64),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_configured(
+        store: Store,
+        synchronizer: Arc<CronSynchronizer>,
+        broker: Arc<dyn ConfirmationBroker>,
+        source_dialog_id: DialogId,
+        request_id: RequestId,
+        default_timezone: Tz,
+        max_prompt_bytes: usize,
+        confirmation_timeout: std::time::Duration,
+    ) -> Self {
+        Self::new_with_clock_and_config(
+            store,
+            synchronizer,
+            broker,
+            source_dialog_id,
+            request_id,
+            Arc::new(SystemClock),
+            default_timezone,
+            max_prompt_bytes,
+            confirmation_timeout,
         )
     }
 
@@ -214,6 +244,31 @@ impl SchedulerToolExecutor {
         request_id: RequestId,
         clock: Arc<dyn ConfirmationClock>,
     ) -> Self {
+        Self::new_with_clock_and_config(
+            store,
+            synchronizer,
+            broker,
+            source_dialog_id,
+            request_id,
+            clock,
+            Moscow,
+            MAX_PROMPT_BYTES,
+            std::time::Duration::from_secs((CONFIRMATION_MINUTES * 60) as u64),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_clock_and_config(
+        store: Store,
+        synchronizer: Arc<CronSynchronizer>,
+        broker: Arc<dyn ConfirmationBroker>,
+        source_dialog_id: DialogId,
+        request_id: RequestId,
+        clock: Arc<dyn ConfirmationClock>,
+        default_timezone: Tz,
+        max_prompt_bytes: usize,
+        confirmation_timeout: std::time::Duration,
+    ) -> Self {
         Self {
             store,
             synchronizer,
@@ -221,15 +276,20 @@ impl SchedulerToolExecutor {
             source_dialog_id,
             request_id,
             clock,
-            definitions: definitions(),
+            default_timezone,
+            max_prompt_bytes,
+            confirmation_timeout,
+            definitions: definitions(max_prompt_bytes, default_timezone),
         }
     }
 
     fn parse_create(&self, arguments: &str) -> Result<CanonicalAction, ToolExecutionError> {
         let arguments: CreateArguments = parse_arguments(arguments)?;
         let name = normalize_name(arguments.name)?;
-        validate_prompt(&arguments.prompt)?;
-        let schedule = arguments.schedule.normalize(arguments.timezone)?;
+        validate_prompt(&arguments.prompt, self.max_prompt_bytes)?;
+        let schedule = arguments
+            .schedule
+            .normalize(arguments.timezone, self.default_timezone)?;
         Ok(CanonicalAction::Create {
             source_dialog_id: self.source_dialog_id,
             name,
@@ -245,8 +305,10 @@ impl SchedulerToolExecutor {
             return Err(ToolExecutionError::InvalidArguments);
         }
         let name = normalize_name(arguments.name)?;
-        validate_prompt(&arguments.prompt)?;
-        let schedule = arguments.schedule.normalize(arguments.timezone)?;
+        validate_prompt(&arguments.prompt, self.max_prompt_bytes)?;
+        let schedule = arguments
+            .schedule
+            .normalize(arguments.timezone, self.default_timezone)?;
         Ok(CanonicalAction::Update {
             source_dialog_id: self.source_dialog_id,
             expected,
@@ -288,7 +350,8 @@ impl SchedulerToolExecutor {
     ) -> Result<ToolExecutionResult, ToolExecutionError> {
         let preview = action.preview();
         let issued_at = self.clock.now();
-        let expires_at = issued_at + Duration::minutes(CONFIRMATION_MINUTES);
+        let expires_at =
+            issued_at + Duration::from_std(self.confirmation_timeout).unwrap_or(Duration::MAX);
         let request = ConfirmationRequest {
             id: ConfirmationId::new(),
             request_id: self.request_id,
@@ -484,7 +547,11 @@ enum InputSchedule {
 }
 
 impl InputSchedule {
-    fn normalize(self, timezone: Option<String>) -> Result<ScheduleSpec, ToolExecutionError> {
+    fn normalize(
+        self,
+        timezone: Option<String>,
+        default_timezone: Tz,
+    ) -> Result<ScheduleSpec, ToolExecutionError> {
         let timezone = match timezone {
             Some(timezone)
                 if !timezone.is_empty()
@@ -497,7 +564,7 @@ impl InputSchedule {
                     .map_err(|_| ToolExecutionError::InvalidArguments)?
             }
             Some(_) => return Err(ToolExecutionError::InvalidArguments),
-            None => Moscow,
+            None => default_timezone,
         };
         match self {
             Self::Cron { expression } => ScheduleSpec::parse_cron(&expression, timezone),
@@ -522,8 +589,8 @@ fn normalize_name(name: String) -> Result<String, ToolExecutionError> {
     Ok(name)
 }
 
-fn validate_prompt(prompt: &str) -> Result<(), ToolExecutionError> {
-    if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES || prompt.contains('\0') {
+fn validate_prompt(prompt: &str, max_prompt_bytes: usize) -> Result<(), ToolExecutionError> {
+    if prompt.is_empty() || prompt.len() > max_prompt_bytes || prompt.contains('\0') {
         return Err(ToolExecutionError::InvalidArguments);
     }
     Ok(())
@@ -608,7 +675,7 @@ fn native_name(name: &str) -> Option<&'static str> {
     }
 }
 
-fn definitions() -> Vec<ModelToolDefinition> {
+fn definitions(max_prompt_bytes: usize, default_timezone: Tz) -> Vec<ModelToolDefinition> {
     let schedule = json!({
         "oneOf": [
             {
@@ -635,8 +702,8 @@ fn definitions() -> Vec<ModelToolDefinition> {
         json!({
             "name":{"type":"string","maxLength":MAX_NAME_BYTES},
             "schedule":schedule,
-            "timezone":{"type":"string","maxLength":64,"default":"Europe/Moscow"},
-            "prompt":{"type":"string","maxLength":MAX_PROMPT_BYTES}
+            "timezone":{"type":"string","maxLength":64,"default":default_timezone.to_string()},
+            "prompt":{"type":"string","maxLength":max_prompt_bytes}
         }),
         json!(["name", "schedule", "prompt"]),
     );

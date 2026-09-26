@@ -399,6 +399,25 @@ async fn export_chunks_are_at_most_64_kib() {
     assert_eq!(parsed, exact);
 }
 
+#[tokio::test]
+async fn truncated_eof_is_typed_for_the_expected_wire_direction() {
+    let partial = br#"{"protocol_version":1"#;
+    assert_eq!(
+        NdjsonReader::new(partial.as_slice())
+            .read_request()
+            .await
+            .unwrap_err(),
+        ProtocolError::InvalidRequest
+    );
+    assert_eq!(
+        NdjsonReader::new(partial.as_slice())
+            .read_event()
+            .await
+            .unwrap_err(),
+        ProtocolError::InvalidEvent
+    );
+}
+
 #[test]
 fn error_responses_contain_only_a_bounded_machine_code() {
     let envelope = ServerEnvelope {

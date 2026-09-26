@@ -3,7 +3,7 @@
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
 };
@@ -32,7 +32,7 @@ const HARD_MAX_COLUMNS: usize = 256;
 const HARD_MAX_CELL_BYTES: usize = 1_048_576;
 const HARD_MAX_OUTPUT_BYTES: usize = 67_108_864;
 const HARD_MAX_QUERY_TIME: Duration = Duration::from_secs(30);
-const CANCELLATION_POLL: Duration = Duration::from_millis(10);
+const SQLITE_BUSY_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,6 +110,7 @@ pub struct InspectionSnapshot {
 #[derive(Clone, Debug, Default)]
 pub struct InspectionCancellation {
     cancelled: Arc<AtomicBool>,
+    workers: Arc<Mutex<Vec<SyncSender<SnapshotCommand>>>>,
 }
 
 impl InspectionCancellation {
@@ -119,16 +120,28 @@ impl InspectionCancellation {
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        if let Ok(workers) = self.workers.lock() {
+            for worker in workers.iter() {
+                let _ = worker.try_send(SnapshotCommand::Cancel);
+            }
+        }
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn register(&self, worker: SyncSender<SnapshotCommand>) {
+        if let Ok(mut workers) = self.workers.lock() {
+            workers.push(worker);
+        }
     }
 }
 
 enum SnapshotCommand {
     Next(SyncSender<Result<InspectionResult, InspectionError>>),
     Close(SyncSender<Result<(), InspectionError>>),
+    Cancel,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,6 +290,7 @@ impl InspectionService {
         let active_snapshots = self.active_snapshots.clone();
         let deadline = Instant::now() + self.snapshot_timeout;
         let worker_cancellation = cancellation.clone();
+        cancellation.register(commands.clone());
         active_snapshots.fetch_add(1, Ordering::AcqRel);
         let worker = match thread::Builder::new()
             .name("light-agent-inspection".into())
@@ -310,7 +324,7 @@ impl InspectionService {
                 let _ = worker.join();
                 return Err(InspectionError::SnapshotExpired);
             }
-            match ready_rx.recv_timeout(startup_remaining.min(CANCELLATION_POLL)) {
+            match ready_rx.recv_timeout(startup_remaining) {
                 Ok(Ok(())) => break,
                 Ok(Err(error)) => {
                     let _ = worker.join();
@@ -371,7 +385,16 @@ impl InspectionSnapshot {
         if self.complete {
             return Ok(None);
         }
-        let remaining = self.remaining()?;
+        let remaining = match self.remaining() {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                self.cancellation.cancel();
+                self.complete = true;
+                self.commands.take();
+                self.join_worker()?;
+                return Err(error);
+            }
+        };
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.commands
             .as_ref()
@@ -385,7 +408,7 @@ impl InspectionSnapshot {
                 self.join_worker()?;
                 return Err(InspectionError::SnapshotExpired);
             }
-            match reply_rx.recv_timeout(remaining.min(CANCELLATION_POLL)) {
+            match reply_rx.recv_timeout(remaining) {
                 Ok(Ok(result)) => break result,
                 Ok(Err(error)) => {
                     self.complete = true;
@@ -530,7 +553,7 @@ fn run_snapshot_worker(worker: SnapshotWorker) {
             let _ = db.execute_batch("ROLLBACK");
             return;
         }
-        match commands.recv_timeout(remaining.min(CANCELLATION_POLL)) {
+        match commands.recv_timeout(remaining) {
             Ok(SnapshotCommand::Next(reply)) => {
                 let result = read_snapshot_page(
                     &db,
@@ -555,6 +578,10 @@ fn run_snapshot_worker(worker: SnapshotWorker) {
             Ok(SnapshotCommand::Close(reply)) => {
                 let result = map_db(db.execute_batch("ROLLBACK"));
                 let _ = reply.send(result);
+                return;
+            }
+            Ok(SnapshotCommand::Cancel) => {
+                let _ = db.execute_batch("ROLLBACK");
                 return;
             }
             Err(RecvTimeoutError::Timeout) => continue,
@@ -639,7 +666,7 @@ fn read_schema_version_until_deadline(
         map_snapshot_db(
             deadline,
             cancellation,
-            db.busy_timeout(remaining.min(CANCELLATION_POLL)),
+            db.busy_timeout(remaining.min(SQLITE_BUSY_POLL)),
         )?;
         let result = db.query_row("SELECT version FROM schema_version LIMIT 1", [], |_| Ok(()));
         match result {

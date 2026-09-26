@@ -40,6 +40,20 @@ fn server_settings_default_to_exact_limits_and_moscow() {
 }
 
 #[test]
+fn server_settings_load_explicit_scheduler_runtime_defaults() {
+    let file = config(
+        "[provider]\napi_key = 'key'\n[scheduler]\ntimezone = 'UTC'\nconfirmation_timeout_minutes = 7\n",
+    );
+    let settings = ServerSettings::load(file.path(), None).unwrap();
+    assert_eq!(settings.scheduler().timezone().to_string(), "UTC");
+    assert_eq!(settings.scheduler().confirmation_timeout_minutes(), 7);
+    assert_eq!(
+        settings.scheduler().confirmation_timeout(),
+        std::time::Duration::from_secs(7 * 60)
+    );
+}
+
+#[test]
 fn omitted_scheduler_lock_is_derived_beside_the_configured_database() {
     let file = config(
         "[provider]\napi_key = 'key'\n[database]\npath = '/srv/light-agent/state.sqlite3'\n",
@@ -175,4 +189,19 @@ fn server_settings_reject_empty_url_userinfo() {
         "[provider]\napi_key = 'key'\nbase_url = 'https://example.com/path/@name'\n[[mcp.servers]]\nname = 'x'\nurl = 'https://example.com/mcp?contact=@name'\n",
     );
     assert!(ServerSettings::load(path_and_query.path(), None).is_ok());
+}
+
+#[test]
+fn uppercase_http_schemes_preserve_userinfo_validation() {
+    let safe = config(
+        "[provider]\napi_key = 'key'\nbase_url = 'HTTPS://example.com/api'\n[[mcp.servers]]\nname = 'x'\nurl = 'HTTP://localhost:8080/mcp'\n",
+    );
+    assert!(ServerSettings::load(safe.path(), None).is_ok());
+
+    for url in ["HTTPS://user@example.com/api", "HTTP://@localhost:8080/mcp"] {
+        let file = config(&format!(
+            "[provider]\napi_key = 'key'\nbase_url = '{url}'\n"
+        ));
+        assert!(ServerSettings::load(file.path(), None).is_err());
+    }
 }
