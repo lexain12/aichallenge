@@ -1,8 +1,11 @@
+mod common;
+
 use std::{
     collections::VecDeque,
     future::pending,
     io,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use deepseek_cli::{
@@ -226,7 +229,7 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let path = directory.path().join("agent.sqlite3");
     let store = Store::open(&path).unwrap();
     let dialog_id = store.create_dialog("dialog").unwrap().id;
@@ -699,6 +702,52 @@ async fn tool_calls_run_sequentially_and_emit_events() {
             .iter()
             .all(|run| run.status == ToolRunStatus::Completed)
     );
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_a_locked_tool_audit_without_a_late_insert() {
+    let f = fixture();
+    let turn = f.store.begin_turn(f.dialog_id, "question").unwrap();
+    let provider = FakeProvider::new([
+        tool_turn(vec![call("locked-call", "read")]),
+        final_text("unused"),
+    ]);
+    let tools = FakeTools::with_definitions(
+        vec![definition("read", true)],
+        ToolBehavior::Immediate(success("unused")),
+        None,
+    );
+    let runner = runner(&f.store, provider, tools);
+    let mut blocker = Connection::open(&f.path).unwrap();
+    let transaction = blocker
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let cancel_from_thread = cancellation.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(40));
+        cancel_from_thread.cancel();
+    });
+    let started = Instant::now();
+
+    let error = runner
+        .run(
+            AgentInput {
+                owner: ToolOwner::InteractiveTurn(turn.turn_id),
+                system_prompt: "SYSTEM".into(),
+                history: Vec::new(),
+                prompt: "question".into(),
+            },
+            cancellation,
+            &mut sink(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error, AgentError::Interrupted);
+    assert!(started.elapsed() < Duration::from_millis(500));
+    drop(transaction);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(f.store.list_tool_runs().unwrap().is_empty());
 }
 
 async fn cancelled_tool(read_only: bool) -> (Fixture, Arc<FakeTools>, AgentError) {

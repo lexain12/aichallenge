@@ -1,5 +1,8 @@
+mod common;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
 use chrono_tz::{Europe::Moscow, US::Eastern};
@@ -9,6 +12,7 @@ use deepseek_cli::scheduler::{
     SyncReport, SystemCrontabBackend,
 };
 use deepseek_cli::store::{JobCreate, Store};
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn cron_parser_accepts_numeric_lists_ranges_and_steps() {
@@ -75,7 +79,7 @@ fn deserialize_rejects_schedule_values_that_bypass_parsers() {
 
 #[test]
 fn renderer_contains_only_timezone_fixed_binary_and_canonical_job_id() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
     let dialog = store.create_dialog("source").unwrap().id;
     let cron = store
@@ -114,7 +118,7 @@ fn renderer_contains_only_timezone_fixed_binary_and_canonical_job_id() {
 
 #[test]
 fn renderer_defensively_rejects_direct_invalid_schedule_and_normalizes_valid_cron() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
     let dialog = store.create_dialog("source").unwrap().id;
     let mut job = store
@@ -229,7 +233,7 @@ impl CrontabBackend for FakeBackend {
 }
 
 fn sync_fixture() -> (tempfile::TempDir, Store, deepseek_cli::store::CronJob) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
     let dialog = store.create_dialog("source").unwrap().id;
     let job = store
@@ -241,6 +245,82 @@ fn sync_fixture() -> (tempfile::TempDir, Store, deepseek_cli::store::CronJob) {
         })
         .unwrap();
     (dir, store, job)
+}
+
+#[test]
+fn synchronizer_rejects_lock_outside_the_store_trusted_directory() {
+    let (store_dir, store, _) = sync_fixture();
+    let lock_dir = common::private_tempdir();
+    let result = CronSynchronizer::new(
+        store,
+        Arc::new(FakeBackend::success("")),
+        lock_dir.path().join("cron.lock"),
+        PathBuf::from("/opt/light-agent/bin/light-agent"),
+    );
+    assert!(matches!(result, Err(SchedulerError::InvalidPath)));
+    drop(store_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn synchronizer_rejects_replaced_trusted_directory_before_opening_lock() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = common::private_tempdir();
+    let db_dir = root.path().join("database");
+    std::fs::create_dir(&db_dir).unwrap();
+    std::fs::set_permissions(&db_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = Store::open(db_dir.join("agent.sqlite")).unwrap();
+    let backend = Arc::new(FakeBackend::success(""));
+    let sync = CronSynchronizer::new(
+        store,
+        backend.clone(),
+        db_dir.join("cron.lock"),
+        PathBuf::from("/opt/light-agent/bin/light-agent"),
+    )
+    .unwrap();
+
+    let original_dir = root.path().join("original-database");
+    std::fs::rename(&db_dir, &original_dir).unwrap();
+    std::fs::create_dir(&db_dir).unwrap();
+    std::fs::set_permissions(&db_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::rename(
+        original_dir.join("agent.sqlite"),
+        db_dir.join("agent.sqlite"),
+    )
+    .unwrap();
+
+    assert_eq!(sync.sync().await.unwrap_err(), SchedulerError::Store);
+    assert!(backend.calls.lock().unwrap().is_empty());
+    assert!(!db_dir.join("cron.lock").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn synchronizer_pins_canonical_lock_parent_instead_of_path_alias() {
+    use std::os::unix::fs::symlink;
+
+    let (store_dir, store, _) = sync_fixture();
+    let aliases = common::private_tempdir();
+    let other = common::private_tempdir();
+    let alias = aliases.path().join("database-alias");
+    symlink(store_dir.path(), &alias).unwrap();
+    let sync = CronSynchronizer::new(
+        store,
+        Arc::new(FakeBackend::success("")),
+        alias.join("cron.lock"),
+        PathBuf::from("/opt/light-agent/bin/light-agent"),
+    )
+    .unwrap();
+    std::fs::remove_file(&alias).unwrap();
+    symlink(other.path(), &alias).unwrap();
+
+    assert_eq!(
+        sync.sync().await.unwrap(),
+        SyncReport::Installed { jobs: 1 }
+    );
+    assert!(store_dir.path().join("cron.lock").exists());
+    assert!(!other.path().join("cron.lock").exists());
 }
 
 #[tokio::test]
@@ -267,6 +347,18 @@ async fn successful_sync_marks_rendered_jobs_applied_after_validation_and_instal
     assert_eq!(calls[1], "list");
     assert!(calls[2].starts_with("validate:"));
     assert_eq!(calls[3], "install");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(dir.path().join("cron.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
 }
 
 #[tokio::test]
@@ -342,6 +434,38 @@ async fn malformed_existing_block_never_calls_install() {
     );
 }
 
+#[tokio::test]
+async fn sqlite_lock_during_reconciliation_obeys_deadline_and_never_installs_late() {
+    let (dir, store, _) = sync_fixture();
+    let backend = Arc::new(FakeBackend::success(""));
+    let sync = CronSynchronizer::new(
+        store,
+        backend.clone(),
+        dir.path().join("cron.lock"),
+        PathBuf::from("/opt/light-agent/bin/light-agent"),
+    )
+    .unwrap();
+    let mut blocker = rusqlite::Connection::open(dir.path().join("agent.sqlite")).unwrap();
+    let transaction = blocker
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let started = Instant::now();
+
+    let result = sync
+        .sync_at_until(
+            Utc::now(),
+            started + Duration::from_millis(60),
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.unwrap_err(), SchedulerError::Busy);
+    assert!(started.elapsed() < Duration::from_millis(500));
+    drop(transaction);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(&*backend.calls.lock().unwrap(), &["preflight"]);
+    assert!(backend.installed.lock().unwrap().is_none());
+}
+
 #[cfg(unix)]
 fn fake_crontab(dir: &std::path::Path, version: &str) -> (PathBuf, PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
@@ -365,7 +489,7 @@ fn fake_crontab(dir: &std::path::Path, version: &str) -> (PathBuf, PathBuf, Path
 #[cfg(unix)]
 #[tokio::test]
 async fn system_preflight_requires_cronie_and_t_validation_without_a_shell() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let (not_cronie, _, _) = fake_crontab(dir.path(), "Vixie Cron 4.1");
     let backend = SystemCrontabBackend::new(not_cronie).unwrap();
     assert_eq!(
@@ -373,7 +497,7 @@ async fn system_preflight_requires_cronie_and_t_validation_without_a_shell() {
         SchedulerError::UnsupportedCron
     );
 
-    let other = tempfile::tempdir().unwrap();
+    let other = common::private_tempdir();
     let (cronie, log, installed) = fake_crontab(other.path(), "cronie 1.7.2");
     let backend = SystemCrontabBackend::new(cronie).unwrap();
     backend.preflight().await.unwrap();
@@ -448,7 +572,7 @@ async fn assert_process_exits(pid: u32) {
 #[cfg(unix)]
 #[tokio::test]
 async fn dropping_preflight_and_list_kills_and_reaps_hanging_crontab_children() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let (executable, version_pid_path, list_pid_path) = hanging_crontab(dir.path());
 
     let backend = SystemCrontabBackend::new(executable.clone()).unwrap();

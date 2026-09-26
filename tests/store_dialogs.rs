@@ -1,10 +1,12 @@
+mod common;
+
 use deepseek_cli::domain::DialogId;
 use deepseek_cli::store::{MessageRole, SafeErrorCode, Store, StoreError};
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 fn setup() -> (TempDir, Store, Connection) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let path = dir.path().join("agent.sqlite");
     let store = Store::open(&path).unwrap();
     let db = Connection::open(path).unwrap();
@@ -13,7 +15,7 @@ fn setup() -> (TempDir, Store, Connection) {
 }
 
 #[test]
-fn migration_creates_exact_v3_schema() {
+fn migration_creates_exact_v4_schema() {
     let (dir, store, db) = setup();
     let tables: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
         .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
@@ -35,7 +37,7 @@ fn migration_creates_exact_v3_schema() {
         db.query_row("SELECT version FROM schema_version", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     assert_eq!(
         db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
@@ -364,12 +366,17 @@ fn missing_dialogs_and_invalid_turn_transitions_are_rejected() {
 
 #[test]
 fn incompatible_schemas_and_memory_databases_are_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let path = dir.path().join("legacy.sqlite");
     Connection::open(&path)
         .unwrap()
         .execute_batch("CREATE TABLE dialogs(id INTEGER PRIMARY KEY, legacy TEXT);")
         .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     assert!(matches!(
         Store::open(&path),
         Err(StoreError::UnsupportedSchema)
@@ -379,7 +386,7 @@ fn incompatible_schemas_and_memory_databases_are_rejected() {
         Err(StoreError::InvalidPath)
     ));
     let (_new_dir, _store, db) = setup();
-    db.execute("UPDATE schema_version SET version=4", [])
+    db.execute("UPDATE schema_version SET version=5", [])
         .unwrap();
     // A future version must not be silently downgraded.
     assert!(matches!(
@@ -391,7 +398,7 @@ fn incompatible_schemas_and_memory_databases_are_rejected() {
 #[cfg(unix)]
 #[test]
 fn store_rejects_a_symlink_database_path_before_runtime_coordination() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let database = dir.path().join("agent.sqlite3");
     Store::open(&database).unwrap();
     let alias = dir.path().join("alias.sqlite3");
@@ -403,7 +410,7 @@ fn store_rejects_a_symlink_database_path_before_runtime_coordination() {
 #[cfg(unix)]
 #[test]
 fn store_rejects_a_hardlink_database_alias() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let database = dir.path().join("agent.sqlite3");
     Store::open(&database).unwrap();
     let alias = dir.path().join("alias.sqlite3");
@@ -415,7 +422,7 @@ fn store_rejects_a_hardlink_database_alias() {
 #[cfg(unix)]
 #[test]
 fn opened_store_rejects_database_path_replacement() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let database = dir.path().join("agent.sqlite3");
     let displaced = dir.path().join("displaced.sqlite3");
     let store = Store::open(&database).unwrap();
@@ -430,7 +437,7 @@ fn opened_store_rejects_database_path_replacement() {
 fn store_rejects_a_group_or_world_writable_database() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let database = dir.path().join("agent.sqlite3");
     Store::open(&database).unwrap();
     let mut permissions = std::fs::metadata(&database).unwrap().permissions();
@@ -441,4 +448,54 @@ fn store_rejects_a_group_or_world_writable_database() {
         Store::open(database),
         Err(StoreError::InvalidPath)
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn store_rejects_database_without_exact_owner_only_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = common::private_tempdir();
+    let database = dir.path().join("agent.sqlite3");
+    Store::open(&database).unwrap();
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    assert_eq!(Store::open(database).unwrap_err(), StoreError::InvalidPath);
+}
+
+#[cfg(unix)]
+#[test]
+fn store_rejects_database_in_a_non_private_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = common::private_tempdir();
+    let directory = root.path().join("agent-data");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        Store::open(directory.join("agent.sqlite3")).unwrap_err(),
+        StoreError::InvalidPath
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn opened_store_rejects_trusted_directory_replacement_even_if_database_inode_returns() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = common::private_tempdir();
+    let directory = root.path().join("agent-data");
+    let displaced = root.path().join("agent-data-old");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.join("agent.sqlite3");
+    let store = Store::open(&database).unwrap();
+
+    std::fs::rename(&directory, &displaced).unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::rename(displaced.join("agent.sqlite3"), &database).unwrap();
+
+    assert_eq!(store.list_dialogs().unwrap_err(), StoreError::InvalidPath);
 }

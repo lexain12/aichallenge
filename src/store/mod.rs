@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::runtime::RuntimeOwnerCapability;
+
 /// Closed local codes: remote error strings cannot become persisted metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,7 +106,15 @@ impl From<rusqlite::Error> for StoreError {
 pub struct Store {
     path: PathBuf,
     identity: DatabaseIdentity,
-    runtime_owner_id: Option<String>,
+    trusted_directory: std::sync::Arc<TrustedDirectory>,
+    runtime_owner: Option<std::sync::Arc<RuntimeOwnerCapability>>,
+}
+
+#[derive(Debug)]
+struct TrustedDirectory {
+    path: PathBuf,
+    file: std::fs::File,
+    identity: DatabaseIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,11 +141,13 @@ impl Store {
         cancellation: &CancellationToken,
     ) -> Result<Self, StoreError> {
         check_deadline(deadline, cancellation)?;
-        let (path, identity) = prepare_database_path(path.as_ref(), deadline, cancellation)?;
+        let (path, identity, trusted_directory) =
+            prepare_database_path(path.as_ref(), deadline, cancellation)?;
         let store = Self {
             path,
             identity,
-            runtime_owner_id: None,
+            trusted_directory: std::sync::Arc::new(trusted_directory),
+            runtime_owner: None,
         };
         store.with_immediate_transaction(deadline, cancellation, |tx| {
             let version_table: bool = tx.query_row(
@@ -151,9 +163,14 @@ impl Store {
                     [1] => {
                         tx.execute_batch(SCHEMA_V2)?;
                         tx.execute_batch(SCHEMA_V3)?;
+                        tx.execute_batch(SCHEMA_V4)?;
                     }
-                    [2] => tx.execute_batch(SCHEMA_V3)?,
-                    [3] => {}
+                    [2] => {
+                        tx.execute_batch(SCHEMA_V3)?;
+                        tx.execute_batch(SCHEMA_V4)?;
+                    }
+                    [3] => tx.execute_batch(SCHEMA_V4)?,
+                    [4] => {}
                     _ => return Err(StoreError::UnsupportedSchema),
                 }
             } else {
@@ -168,6 +185,7 @@ impl Store {
                 tx.execute_batch(SCHEMA_V1)?;
                 tx.execute_batch(SCHEMA_V2)?;
                 tx.execute_batch(SCHEMA_V3)?;
+                tx.execute_batch(SCHEMA_V4)?;
             }
             Ok(())
         })?;
@@ -182,16 +200,16 @@ impl Store {
         &self,
         busy_timeout: Duration,
     ) -> Result<Connection, StoreError> {
-        validate_database_identity(&self.path, self.identity)?;
+        self.validate_storage_boundary()?;
         let connection =
             Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         // Recheck before any writable pragma. Opening without CREATE prevents
         // a rename race from manufacturing a replacement database here.
-        validate_database_identity(&self.path, self.identity)?;
+        self.validate_storage_boundary()?;
         connection.busy_timeout(busy_timeout.max(Duration::from_millis(1)))?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        validate_database_identity(&self.path, self.identity)?;
+        self.validate_storage_boundary()?;
         Ok(connection)
     }
 
@@ -244,20 +262,13 @@ impl Store {
         }
     }
 
-    pub fn with_runtime_owner(&self, owner_id: &str) -> Result<Self, StoreError> {
-        self.with_runtime_owner_until(
-            owner_id,
-            Instant::now() + Duration::from_secs(5),
-            &CancellationToken::new(),
-        )
-    }
-
-    pub fn with_runtime_owner_until(
+    pub(crate) fn with_runtime_capability_until(
         &self,
-        owner_id: &str,
+        capability: std::sync::Arc<RuntimeOwnerCapability>,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Self, StoreError> {
+        let owner_id = capability.owner_id();
         uuid::Uuid::parse_str(owner_id).map_err(|_| StoreError::InvalidOwner)?;
         let exists: bool = self.with_immediate_transaction(deadline, cancellation, |tx| {
             Ok(tx.query_row(
@@ -270,7 +281,7 @@ impl Store {
             return Err(StoreError::InvalidOwner);
         }
         let mut store = self.clone();
-        store.runtime_owner_id = Some(owner_id.to_owned());
+        store.runtime_owner = Some(capability);
         Ok(store)
     }
 
@@ -278,15 +289,36 @@ impl Store {
         &self.path
     }
 
+    pub(crate) fn database_directory_path(&self) -> &Path {
+        &self.trusted_directory.path
+    }
+
+    pub(crate) fn database_identity(&self) -> DatabaseIdentity {
+        self.identity
+    }
+
+    pub(crate) fn validate_storage_boundary(&self) -> Result<(), StoreError> {
+        // rusqlite does not expose an fd-bound VFS here. The exact-mode 0700
+        // parent is therefore the security boundary: another Unix user cannot
+        // rename entries between these checks, while a same-uid adversary is
+        // deliberately out of scope because it can already inspect this
+        // process and its provider credentials. Retaining the directory fd
+        // still detects path replacement for the lifetime of every Store.
+        validate_trusted_directory_identity(&self.trusted_directory)?;
+        validate_database_identity(&self.path, self.identity)
+    }
+
     pub(crate) fn runtime_owner_id(&self) -> Option<&str> {
-        self.runtime_owner_id.as_deref()
+        self.runtime_owner
+            .as_deref()
+            .map(RuntimeOwnerCapability::owner_id)
     }
 
     pub(crate) fn require_runtime_owner_for_creation(
         &self,
         db: &Connection,
     ) -> Result<(), StoreError> {
-        if self.runtime_owner_id.is_some() {
+        if self.runtime_owner.is_some() {
             return Ok(());
         }
         let initialized: bool = db.query_row(
@@ -313,6 +345,24 @@ impl Store {
             (None, None) => self.require_runtime_owner_for_creation(db),
         }
     }
+
+    pub(crate) fn reject_pending_tools(
+        &self,
+        db: &Connection,
+        owner_kind: &str,
+        owner_id: i64,
+    ) -> Result<(), StoreError> {
+        let pending: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_runs WHERE owner_kind=? AND owner_id=? AND status='pending')",
+            rusqlite::params![owner_kind, owner_id],
+            |row| row.get(0),
+        )?;
+        if pending {
+            Err(StoreError::Busy)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn check_deadline(deadline: Instant, cancellation: &CancellationToken) -> Result<(), StoreError> {
@@ -327,7 +377,7 @@ fn prepare_database_path(
     path: &Path,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<(PathBuf, DatabaseIdentity), StoreError> {
+) -> Result<(PathBuf, DatabaseIdentity, TrustedDirectory), StoreError> {
     check_deadline(deadline, cancellation)?;
     if path.as_os_str().is_empty() || path == Path::new(":memory:") {
         return Err(StoreError::InvalidPath);
@@ -342,7 +392,7 @@ fn prepare_database_path(
     let file_name = absolute.file_name().ok_or(StoreError::InvalidPath)?;
     let parent = absolute.parent().ok_or(StoreError::InvalidPath)?;
     let parent = fs::canonicalize(parent).map_err(|_| StoreError::InvalidPath)?;
-    validate_trusted_directory(&parent)?;
+    let trusted_directory = open_trusted_directory(&parent)?;
     let canonical_candidate = parent.join(file_name);
 
     match fs::symlink_metadata(&canonical_candidate) {
@@ -366,7 +416,7 @@ fn prepare_database_path(
     }
     let metadata = fs::symlink_metadata(&path).map_err(|_| StoreError::InvalidPath)?;
     validate_database_metadata(&metadata)?;
-    Ok((path, metadata_identity(&metadata)))
+    Ok((path, metadata_identity(&metadata), trusted_directory))
 }
 
 fn validate_database_identity(path: &Path, expected: DatabaseIdentity) -> Result<(), StoreError> {
@@ -379,24 +429,59 @@ fn validate_database_identity(path: &Path, expected: DatabaseIdentity) -> Result
 }
 
 #[cfg(unix)]
-fn validate_trusted_directory(path: &Path) -> Result<(), StoreError> {
-    let metadata = fs::metadata(path).map_err(|_| StoreError::InvalidPath)?;
+fn open_trusted_directory(path: &Path) -> Result<TrustedDirectory, StoreError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(path).map_err(|_| StoreError::InvalidPath)?;
+    let metadata = file.metadata().map_err(|_| StoreError::InvalidPath)?;
     if !metadata.is_dir()
         || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o7777 != 0o700
     {
+        return Err(StoreError::InvalidPath);
+    }
+    let path_metadata = fs::symlink_metadata(path).map_err(|_| StoreError::InvalidPath)?;
+    if metadata_identity(&path_metadata) != metadata_identity(&metadata) {
+        return Err(StoreError::InvalidPath);
+    }
+    Ok(TrustedDirectory {
+        path: path.to_owned(),
+        identity: metadata_identity(&metadata),
+        file,
+    })
+}
+
+#[cfg(not(unix))]
+fn open_trusted_directory(_path: &Path) -> Result<TrustedDirectory, StoreError> {
+    Err(StoreError::InvalidPath)
+}
+
+#[cfg(unix)]
+fn validate_trusted_directory_identity(directory: &TrustedDirectory) -> Result<(), StoreError> {
+    let fd_metadata = directory
+        .file
+        .metadata()
+        .map_err(|_| StoreError::InvalidPath)?;
+    if !fd_metadata.is_dir()
+        || fd_metadata.uid() != unsafe { libc::geteuid() }
+        || fd_metadata.mode() & 0o7777 != 0o700
+        || metadata_identity(&fd_metadata) != directory.identity
+    {
+        return Err(StoreError::InvalidPath);
+    }
+    let path_metadata =
+        fs::symlink_metadata(&directory.path).map_err(|_| StoreError::InvalidPath)?;
+    if metadata_identity(&path_metadata) != directory.identity {
         return Err(StoreError::InvalidPath);
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn validate_trusted_directory(path: &Path) -> Result<(), StoreError> {
-    fs::metadata(path)
-        .map(|metadata| metadata.is_dir())
-        .map_err(|_| StoreError::InvalidPath)?
-        .then_some(())
-        .ok_or(StoreError::InvalidPath)
+fn validate_trusted_directory_identity(_directory: &TrustedDirectory) -> Result<(), StoreError> {
+    Err(StoreError::InvalidPath)
 }
 
 #[cfg(unix)]
@@ -404,7 +489,7 @@ fn validate_database_metadata(metadata: &fs::Metadata) -> Result<(), StoreError>
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.nlink() != 1
-        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o7777 != 0o600
     {
         return Err(StoreError::InvalidPath);
     }
@@ -574,4 +659,14 @@ ALTER TABLE cron_runs ADD COLUMN runtime_owner_id TEXT REFERENCES runtime_owners
 CREATE INDEX pending_turns_by_runtime_owner ON turns(runtime_owner_id) WHERE status='pending';
 CREATE INDEX pending_runs_by_runtime_owner ON cron_runs(runtime_owner_id) WHERE status='pending';
 UPDATE schema_version SET version=3;
+";
+
+const SCHEMA_V4: &str = "
+ALTER TABLE tool_runs ADD COLUMN runtime_owner_id TEXT REFERENCES runtime_owners(owner_id);
+UPDATE tool_runs SET runtime_owner_id=CASE owner_kind
+    WHEN 'interactive_turn' THEN (SELECT runtime_owner_id FROM turns WHERE id=tool_runs.owner_id)
+    WHEN 'cron_run' THEN (SELECT runtime_owner_id FROM cron_runs WHERE id=tool_runs.owner_id)
+END WHERE status='pending';
+CREATE INDEX pending_tools_by_runtime_owner ON tool_runs(runtime_owner_id) WHERE status='pending';
+UPDATE schema_version SET version=4;
 ";

@@ -196,14 +196,14 @@ async fn acquire_process_lease_until(
 
 async fn attach_runtime_owner_until(
     store: Store,
-    owner_id: String,
+    lease: ProcessLease,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<Store, AppError> {
     let operation_cancellation = CancellationToken::new();
     let worker_cancellation = operation_cancellation.clone();
     let worker = tokio::task::spawn_blocking(move || {
-        store.with_runtime_owner_until(&owner_id, deadline, &worker_cancellation)
+        lease.owned_store_until(&store, deadline, &worker_cancellation)
     });
     tokio::pin!(worker);
     tokio::select! {
@@ -281,9 +281,7 @@ async fn runtime_catalog_until(
 async fn serve_stdio(settings: Arc<ServerSettings>) -> Result<(), AppError> {
     let store = open_store(&settings)?;
     let lease = acquire_process_lease(&store).await?;
-    let store = store
-        .with_runtime_owner(lease.owner_id())
-        .map_err(|_| AppError::Store)?;
+    let store = lease.owned_store(&store).map_err(|_| AppError::Store)?;
     let (provider, mcp) = runtime_catalog(&settings).await?;
     let synchronizer = synchronizer(&settings, store.clone())?;
     let server = StdioServer::new(ServerDependencies {
@@ -340,9 +338,7 @@ async fn run_job(
 ) -> Result<(), AppError> {
     let store = open_store_until(&settings, deadline, &cancellation).await?;
     let lease = acquire_process_lease_until(&store, deadline, &cancellation).await?;
-    let store =
-        attach_runtime_owner_until(store, lease.owner_id().to_owned(), deadline, &cancellation)
-            .await?;
+    let store = attach_runtime_owner_until(store, lease.clone(), deadline, &cancellation).await?;
     let (provider, mcp) = runtime_catalog_until(&settings, deadline, &cancellation).await?;
     let synchronizer = synchronizer(&settings, store.clone())?;
     let reconciler: Arc<dyn CronRunReconciler> = synchronizer;
@@ -368,19 +364,16 @@ async fn run_job(
 async fn cron_sync(settings: Arc<ServerSettings>) -> Result<(), AppError> {
     let store = open_store(&settings)?;
     let lease = acquire_process_lease(&store).await?;
-    let store = store
-        .with_runtime_owner(lease.owner_id())
-        .map_err(|_| AppError::Store)?;
+    let store = lease.owned_store(&store).map_err(|_| AppError::Store)?;
     let synchronizer = synchronizer(&settings, store)?;
     let (cancellation, signal) = signal_cancellation();
-    let report = tokio::select! {
-        result = synchronizer.sync() => result.map_err(|_| AppError::Scheduler)?,
-        _ = cancellation.cancelled() => {
-            signal.abort();
-            let _ = signal.await;
-            return Err(AppError::Scheduler);
-        }
-    };
+    let deadline = Instant::now() + settings.scheduler().run_timeout();
+    // Pass the process cancellation into the synchronizer itself. It cancels
+    // and joins every blocking SQLite worker before this command returns.
+    let report = synchronizer
+        .sync_at_until(chrono::Utc::now(), deadline, cancellation)
+        .await
+        .map_err(|_| AppError::Scheduler)?;
     signal.abort();
     let _ = signal.await;
     match report {

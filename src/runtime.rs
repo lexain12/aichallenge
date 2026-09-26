@@ -3,6 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
@@ -30,11 +31,27 @@ pub enum RuntimeLeaseError {
     Recovery,
 }
 
+/// Unforgeable proof that this process still owns a runtime lock. The lock
+/// file lives in the capability, so every Store clone carrying the capability
+/// keeps the ownership fence alive even after ProcessLease itself is dropped.
+#[derive(Debug)]
+pub(crate) struct RuntimeOwnerCapability {
+    owner_id: String,
+    database_identity: DatabaseIdentity,
+    _owner_file: File,
+}
+
+impl RuntimeOwnerCapability {
+    pub(crate) fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+}
+
 /// Every mutating runtime holds one exclusive owner lock. The coordinator
 /// lock is held only while scanning dead owners and registering this owner.
+#[derive(Clone)]
 pub struct ProcessLease {
-    owner_id: String,
-    _owner_file: File,
+    capability: Arc<RuntimeOwnerCapability>,
     report: StartupRecoveryReport,
 }
 
@@ -53,6 +70,9 @@ impl ProcessLease {
         cancellation: &CancellationToken,
     ) -> Result<Self, RuntimeLeaseError> {
         ensure_active(deadline, cancellation)?;
+        store
+            .validate_storage_boundary()
+            .map_err(|_| RuntimeLeaseError::Lease)?;
         let coordinator_path = coordinator_path(store)?;
         ensure_active(deadline, cancellation)?;
         let coordinator = open_or_create_lock(&coordinator_path)?;
@@ -127,14 +147,39 @@ impl ProcessLease {
             .map_err(|_| RuntimeLeaseError::Recovery)?;
         drop(coordinator);
         Ok(Self {
-            owner_id,
-            _owner_file: owner_file,
+            capability: Arc::new(RuntimeOwnerCapability {
+                owner_id,
+                database_identity: store.database_identity(),
+                _owner_file: owner_file,
+            }),
             report,
         })
     }
 
     pub fn owner_id(&self) -> &str {
-        &self.owner_id
+        self.capability.owner_id()
+    }
+
+    pub fn owned_store(&self, store: &Store) -> Result<Store, RuntimeLeaseError> {
+        self.owned_store_until(
+            store,
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+    }
+
+    pub fn owned_store_until(
+        &self,
+        store: &Store,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Store, RuntimeLeaseError> {
+        if self.capability.database_identity != store.database_identity() {
+            return Err(RuntimeLeaseError::Lease);
+        }
+        store
+            .with_runtime_capability_until(self.capability.clone(), deadline, cancellation)
+            .map_err(|_| RuntimeLeaseError::Lease)
     }
 
     pub fn recovery_report(&self) -> StartupRecoveryReport {
@@ -278,7 +323,7 @@ fn validate_lock_metadata(metadata: &std::fs::Metadata) -> Result<(), RuntimeLea
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.nlink() != 1
-        || metadata.mode() & 0o077 != 0
+        || metadata.mode() & 0o7777 != 0o600
     {
         return Err(RuntimeLeaseError::Lease);
     }

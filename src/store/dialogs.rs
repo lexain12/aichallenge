@@ -261,6 +261,7 @@ impl Store {
             };
         }
         self.require_runtime_owner(&tx, runtime_owner_id.as_deref())?;
+        self.reject_pending_tools(&tx, "interactive_turn", id.get())?;
         let timestamp = now();
         execute_one(
             &tx,
@@ -325,6 +326,7 @@ impl Store {
             };
         }
         self.require_runtime_owner(&tx, runtime_owner_id.as_deref())?;
+        self.reject_pending_tools(&tx, "interactive_turn", id.get())?;
         let timestamp = now();
         execute_one(
             &tx,

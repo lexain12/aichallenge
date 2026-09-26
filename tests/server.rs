@@ -1,3 +1,5 @@
+mod common;
+
 use base64::Engine as _;
 use chrono_tz::Europe::Moscow;
 use deepseek_cli::{
@@ -182,7 +184,7 @@ impl Fixture {
         Self::with_tools(provider, Arc::new(EmptyTools))
     }
     fn with_tools(provider: Arc<dyn Provider>, mcp: Arc<dyn ToolExecutor>) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::private_tempdir();
         let db = dir.path().join("agent.sqlite");
         let store = Store::open(&db).unwrap();
         let config = dir.path().join("server.toml");

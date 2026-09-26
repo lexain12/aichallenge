@@ -1487,6 +1487,17 @@ mod tests {
     use chrono_tz::Europe::Moscow;
     use std::{path::PathBuf, sync::Mutex};
 
+    fn private_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        directory
+    }
+
     #[derive(Clone)]
     struct MutableClock(Arc<Mutex<DateTime<Utc>>>);
     impl MutableClock {
@@ -1530,7 +1541,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirmation_is_request_session_hash_expiry_bound_and_single_use() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
         let dialog = store.create_dialog("dialog").unwrap().id;
         let synchronizer = Arc::new(
@@ -1595,7 +1606,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirmation_action_hash_tampering_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
         let dialog = store.create_dialog("dialog").unwrap().id;
         let synchronizer = Arc::new(
@@ -1637,7 +1648,7 @@ mod tests {
 
     #[tokio::test]
     async fn unanswered_confirmation_expires_without_a_real_five_minute_wait() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
         let dialog = store.create_dialog("dialog").unwrap().id;
         let synchronizer = Arc::new(
@@ -1683,7 +1694,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirmation_and_expiry_race_has_one_single_use_winner() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
         let dialog = store.create_dialog("dialog").unwrap().id;
         let synchronizer = Arc::new(

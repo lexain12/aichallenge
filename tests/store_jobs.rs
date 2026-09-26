@@ -1,13 +1,16 @@
+mod common;
+
 use chrono::{TimeZone, Utc};
 use chrono_tz::Europe::Moscow;
 use deepseek_cli::domain::{CronRunStatus, JobDesiredState, JobSyncState, ToolOwner};
 use deepseek_cli::scheduler::ScheduleSpec;
 use deepseek_cli::store::{
-    CronRunFinish, JobCreate, RunClaim, SafeErrorCode, Store, StoreError, ToolRunStart,
+    CronRunFinish, JobCreate, RunClaim, SafeErrorCode, Store, StoreError, ToolRunFinish,
+    ToolRunStart,
 };
 
 fn setup() -> (tempfile::TempDir, Store, deepseek_cli::domain::DialogId) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
     let dialog = store.create_dialog("scheduler").unwrap().id;
     (dir, store, dialog)
@@ -15,14 +18,16 @@ fn setup() -> (tempfile::TempDir, Store, deepseek_cli::domain::DialogId) {
 
 #[test]
 fn v1_database_migrates_jobs_and_runs_without_losing_dialogs() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let path = dir.path().join("agent.sqlite");
     let store = Store::open(&path).unwrap();
     let dialog = store.create_dialog("before migration").unwrap().id;
     drop(store);
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch(
-        "DROP INDEX pending_turns_by_runtime_owner;
+        "DROP INDEX pending_tools_by_runtime_owner;
+         ALTER TABLE tool_runs DROP COLUMN runtime_owner_id;
+         DROP INDEX pending_turns_by_runtime_owner;
          ALTER TABLE turns DROP COLUMN runtime_owner_id;
          DROP TABLE runtime_owners;
          DROP TABLE runtime_coordination;
@@ -41,7 +46,7 @@ fn v1_database_migrates_jobs_and_runs_without_losing_dialogs() {
             .query_row("SELECT version FROM schema_version", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     migrated.create_job(recurring(dialog)).unwrap();
 }
@@ -309,6 +314,36 @@ fn finishing_run_is_idempotent_only_for_identical_outcome() {
         ),
         Err(StoreError::Conflict)
     ));
+}
+
+#[test]
+fn cron_run_cannot_finish_while_its_tool_audit_is_pending() {
+    let (_dir, store, dialog) = setup();
+    let job = store.create_job(recurring(dialog)).unwrap();
+    store.mark_job_sync_applied(job.id).unwrap();
+    let RunClaim::Claimed(claim) = store.claim_run(job.id, Utc::now()).unwrap() else {
+        panic!("expected claim")
+    };
+    let audit = store
+        .start_tool_run(ToolRunStart {
+            owner: ToolOwner::CronRun(claim.run.id),
+            call_id: "pending".into(),
+            server_name: "fixture".into(),
+            tool_name: "read".into(),
+            read_only: true,
+        })
+        .unwrap();
+
+    assert_eq!(
+        store.finish_run(claim.run.id, CronRunFinish::completed("too early")),
+        Err(StoreError::Busy)
+    );
+    store
+        .finish_tool_run(audit, ToolRunFinish::completed())
+        .unwrap();
+    store
+        .finish_run(claim.run.id, CronRunFinish::completed("done"))
+        .unwrap();
 }
 
 #[test]

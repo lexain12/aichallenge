@@ -30,8 +30,24 @@ fn server_settings_default_to_exact_limits_and_moscow() {
     assert_eq!(settings.scheduler().confirmation_timeout_minutes(), 5);
     assert_eq!(settings.scheduler().timezone().to_string(), "Europe/Moscow");
     assert_eq!(
+        settings.scheduler().lock_path(),
+        std::path::Path::new("/var/lib/light-agent/light-agent.sqlite3.cron.lock")
+    );
+    assert_eq!(
         settings.scheduler().crontab_binary(),
         std::path::Path::new("/usr/bin/crontab")
+    );
+}
+
+#[test]
+fn omitted_scheduler_lock_is_derived_beside_the_configured_database() {
+    let file = config(
+        "[provider]\napi_key = 'key'\n[database]\npath = '/srv/light-agent/state.sqlite3'\n",
+    );
+    let settings = ServerSettings::load(file.path(), None).unwrap();
+    assert_eq!(
+        settings.scheduler().lock_path(),
+        std::path::Path::new("/srv/light-agent/state.sqlite3.cron.lock")
     );
 }
 

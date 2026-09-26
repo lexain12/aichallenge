@@ -1,10 +1,12 @@
+mod common;
+
 use deepseek_cli::domain::{RunId, ToolOwner, ToolRunStatus, TurnId};
 use deepseek_cli::runtime::ProcessLease;
 use deepseek_cli::store::{SafeErrorCode, Store, StoreError, ToolRunFinish, ToolRunStart};
 use rusqlite::Connection;
 
 fn setup() -> (tempfile::TempDir, Store, Connection, ToolOwner) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let path = dir.path().join("agent.sqlite");
     let store = Store::open(&path).unwrap();
     let d = store.create_dialog("audit").unwrap();
@@ -71,7 +73,8 @@ fn tool_run_stores_route_status_and_read_only_but_no_arguments() {
             "status",
             "safe_error_code",
             "started_at",
-            "finished_at"
+            "finished_at",
+            "runtime_owner_id"
         ]
     );
     for forbidden in ["argument", "hash", "result", "url", "raw_error"] {
@@ -81,15 +84,16 @@ fn tool_run_stores_route_status_and_read_only_but_no_arguments() {
 
 #[test]
 fn write_recovery_becomes_uncertain() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
     let lease = ProcessLease::acquire(&store).unwrap();
-    let owned = store.with_runtime_owner(lease.owner_id()).unwrap();
+    let owned = lease.owned_store(&store).unwrap();
     let dialog = store.create_dialog("audit").unwrap();
     let turn = owned.begin_turn(dialog.id, "question").unwrap();
     owned
         .start_tool_run(start(ToolOwner::InteractiveTurn(turn.turn_id), false))
         .unwrap();
+    drop(owned);
     drop(lease);
     let recovered = ProcessLease::acquire(&store).unwrap();
     assert_eq!(recovered.recovery_report().tool_runs, 1);
@@ -109,15 +113,16 @@ fn write_recovery_becomes_uncertain() {
 
 #[test]
 fn read_only_recovery_becomes_failed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
     let lease = ProcessLease::acquire(&store).unwrap();
-    let owned = store.with_runtime_owner(lease.owner_id()).unwrap();
+    let owned = lease.owned_store(&store).unwrap();
     let dialog = store.create_dialog("audit").unwrap();
     let turn = owned.begin_turn(dialog.id, "question").unwrap();
     let id = owned
         .start_tool_run(start(ToolOwner::InteractiveTurn(turn.turn_id), true))
         .unwrap();
+    drop(owned);
     drop(lease);
     let recovered = ProcessLease::acquire(&store).unwrap();
     assert_eq!(recovered.recovery_report().tool_runs, 1);
@@ -132,7 +137,64 @@ fn read_only_recovery_becomes_failed() {
 }
 
 fn recovered_store(store: &Store, lease: &ProcessLease) -> Store {
-    store.with_runtime_owner(lease.owner_id()).unwrap()
+    lease.owned_store(store).unwrap()
+}
+
+#[test]
+fn parent_cannot_be_terminal_while_owned_tool_audit_is_pending() {
+    let directory = common::private_tempdir();
+    let store = Store::open(directory.path().join("agent.sqlite")).unwrap();
+    let lease = ProcessLease::acquire(&store).unwrap();
+    let owned = lease.owned_store(&store).unwrap();
+    let dialog = store.create_dialog("audit fence").unwrap();
+    let turn = owned.begin_turn(dialog.id, "question").unwrap();
+    let audit = owned
+        .start_tool_run(start(ToolOwner::InteractiveTurn(turn.turn_id), true))
+        .unwrap();
+
+    assert_eq!(
+        owned.complete_turn(turn.turn_id, "answer"),
+        Err(StoreError::Busy)
+    );
+    assert_eq!(
+        owned.fail_turn(turn.turn_id, SafeErrorCode::InternalError),
+        Err(StoreError::Busy)
+    );
+    owned
+        .finish_tool_run(audit, ToolRunFinish::completed())
+        .unwrap();
+    owned.complete_turn(turn.turn_id, "answer").unwrap();
+}
+
+#[test]
+fn v3_migration_backfills_pending_tool_runtime_owner_from_parent() {
+    let directory = common::private_tempdir();
+    let path = directory.path().join("agent.sqlite");
+    let store = Store::open(&path).unwrap();
+    let lease = ProcessLease::acquire(&store).unwrap();
+    let owned = lease.owned_store(&store).unwrap();
+    let dialog = store.create_dialog("migration").unwrap();
+    let turn = owned.begin_turn(dialog.id, "question").unwrap();
+    owned
+        .start_tool_run(start(ToolOwner::InteractiveTurn(turn.turn_id), true))
+        .unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "DROP INDEX pending_tools_by_runtime_owner;
+         ALTER TABLE tool_runs DROP COLUMN runtime_owner_id;
+         UPDATE schema_version SET version=3;",
+    )
+    .unwrap();
+    drop(db);
+
+    Store::open(&path).unwrap();
+    let backfilled: String = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT runtime_owner_id FROM tool_runs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(backfilled, lease.owner_id());
 }
 
 #[test]

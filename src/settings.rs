@@ -366,6 +366,11 @@ impl ServerSettings {
             raw.scheduler.confirmation_timeout_minutes.unwrap_or(5),
             "scheduler.confirmation_timeout_minutes",
         )?;
+        let database_path = raw
+            .database
+            .path
+            .unwrap_or_else(|| PathBuf::from("/var/lib/light-agent/light-agent.sqlite3"));
+        let default_lock_path = scheduler_lock_path_for_database(&database_path)?;
         let scheduler = SchedulerSettings {
             timezone,
             confirmation_timeout: Duration::from_secs(confirmation_minutes.checked_mul(60).ok_or(
@@ -375,10 +380,7 @@ impl ServerSettings {
                 raw.scheduler.run_timeout_seconds.unwrap_or(600),
                 "scheduler.run_timeout_seconds",
             )?),
-            lock_path: raw
-                .scheduler
-                .lock_path
-                .unwrap_or_else(|| PathBuf::from("/run/lock/light-agent-cron.lock")),
+            lock_path: raw.scheduler.lock_path.unwrap_or(default_lock_path),
             binary_path: raw
                 .scheduler
                 .binary_path
@@ -412,10 +414,7 @@ impl ServerSettings {
             provider,
             mcp,
             scheduler,
-            database_path: raw
-                .database
-                .path
-                .unwrap_or_else(|| PathBuf::from("/var/lib/light-agent/light-agent.sqlite3")),
+            database_path,
             interactive_system_prompt: nonblank(
                 raw.prompts
                     .interactive_system
@@ -457,6 +456,20 @@ impl ServerSettings {
     pub fn max_message_bytes(&self) -> usize {
         self.max_message_bytes
     }
+}
+
+fn scheduler_lock_path_for_database(database: &Path) -> Result<PathBuf, SettingsError> {
+    let database = if database.is_absolute() {
+        database.to_owned()
+    } else {
+        std::env::current_dir()?.join(database)
+    };
+    let mut lock_name = database
+        .file_name()
+        .ok_or(SettingsError::Invalid("database.path"))?
+        .to_os_string();
+    lock_name.push(".cron.lock");
+    Ok(database.with_file_name(lock_name))
 }
 
 #[derive(Clone, Debug)]

@@ -189,33 +189,34 @@ impl CronAgentService {
             && let Some(reconciler) = &self.reconciler
         {
             let reconcile_time = self.clock.now();
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {
-                    self.finish_run_bounded(
-                        run_id,
-                        CronRunFinish::interrupted(SafeErrorCode::Interrupted),
-                        finalization_deadline(deadline),
-                        &CancellationToken::new(),
-                    ).await?;
-                    return Err(CronRunError::Interrupted);
-                }
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(execution_deadline)) => {
-                    self.finish_run_bounded(
-                        run_id,
-                        CronRunFinish::timed_out(),
-                        deadline,
-                        &CancellationToken::new(),
-                    ).await?;
-                    return Err(CronRunError::TimedOut);
-                }
-                _ = reconciler.reconcile(reconcile_time) => {}
+            let _ = reconciler
+                .reconcile(reconcile_time, execution_deadline, cancellation.clone())
+                .await;
+            if cancellation.is_cancelled() {
+                self.finish_run_bounded(
+                    run_id,
+                    CronRunFinish::interrupted(SafeErrorCode::Interrupted),
+                    finalization_deadline(deadline),
+                    &CancellationToken::new(),
+                )
+                .await?;
+                return Err(CronRunError::Interrupted);
+            }
+            if Instant::now() >= execution_deadline {
+                self.finish_run_bounded(
+                    run_id,
+                    CronRunFinish::timed_out(),
+                    deadline,
+                    &CancellationToken::new(),
+                )
+                .await?;
+                return Err(CronRunError::TimedOut);
             }
         }
 
         let run_cancellation = CancellationToken::new();
         let mut sink = |_event| Ok(());
-        let execution = self.runner.run(
+        let execution = self.runner.run_until(
             AgentInput {
                 owner: ToolOwner::CronRun(run_id),
                 system_prompt: self.system_prompt.clone(),
@@ -224,6 +225,8 @@ impl CronAgentService {
             },
             run_cancellation.clone(),
             &mut sink,
+            execution_deadline,
+            deadline,
         );
         tokio::pin!(execution);
         let deadline_sleep =
@@ -494,6 +497,36 @@ impl AgentRunner {
         cancellation: CancellationToken,
         event_sink: &mut AgentEventSink<'_>,
     ) -> Result<AgentOutcome, AgentError> {
+        self.run_inner(input, cancellation, event_sink, None, None)
+            .await
+    }
+
+    async fn run_until(
+        &self,
+        input: AgentInput,
+        cancellation: CancellationToken,
+        event_sink: &mut AgentEventSink<'_>,
+        execution_deadline: Instant,
+        finalization_deadline: Instant,
+    ) -> Result<AgentOutcome, AgentError> {
+        self.run_inner(
+            input,
+            cancellation,
+            event_sink,
+            Some(execution_deadline),
+            Some(finalization_deadline),
+        )
+        .await
+    }
+
+    async fn run_inner(
+        &self,
+        input: AgentInput,
+        cancellation: CancellationToken,
+        event_sink: &mut AgentEventSink<'_>,
+        execution_deadline: Option<Instant>,
+        finalization_deadline: Option<Instant>,
+    ) -> Result<AgentOutcome, AgentError> {
         if input.prompt.len() > self.max_message_bytes {
             return Err(AgentError::ContentTooLong);
         }
@@ -565,7 +598,14 @@ impl AgentRunner {
                     ..
                 } => {
                     let results = self
-                        .execute_tools(input.owner, calls, &cancellation, event_sink)
+                        .execute_tools(
+                            input.owner,
+                            calls,
+                            &cancellation,
+                            event_sink,
+                            execution_deadline,
+                            finalization_deadline,
+                        )
                         .await?;
                     conversation
                         .accept_tool_results(assistant_message, results)
@@ -593,6 +633,8 @@ impl AgentRunner {
         calls: Vec<ModelToolCall>,
         cancellation: &CancellationToken,
         event_sink: &mut AgentEventSink<'_>,
+        execution_deadline: Option<Instant>,
+        finalization_deadline: Option<Instant>,
     ) -> Result<Vec<ToolResultMessage>, AgentError> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
@@ -604,22 +646,32 @@ impl AgentRunner {
                 .tools
                 .is_read_only(&call.name)
                 .ok_or(AgentError::Tool)?;
-            let audit_id = self.store.start_tool_run(ToolRunStart {
-                owner,
-                call_id: call.id.clone(),
-                server_name: route.server_name.to_owned(),
-                tool_name: route.tool_name.to_owned(),
-                read_only,
-            })?;
+            let audit_id = self
+                .start_tool_audit(
+                    ToolRunStart {
+                        owner,
+                        call_id: call.id.clone(),
+                        server_name: route.server_name.to_owned(),
+                        tool_name: route.tool_name.to_owned(),
+                        read_only,
+                    },
+                    cancellation,
+                    execution_deadline,
+                    finalization_deadline,
+                )
+                .await?;
             if event_sink(AgentEvent::ToolStarted {
                 name: call.name.clone(),
             })
             .is_err()
             {
-                self.store.finish_tool_run(
+                self.finish_tool_audit(
                     audit_id,
                     ToolRunFinish::failed(SafeErrorCode::InternalError),
-                )?;
+                    &CancellationToken::new(),
+                    finalization_deadline,
+                )
+                .await?;
                 return Err(AgentError::Output);
             }
 
@@ -631,13 +683,43 @@ impl AgentRunner {
                     } else {
                         ToolRunFinish::uncertain(SafeErrorCode::Interrupted)
                     };
-                    self.store.finish_tool_run(audit_id, finish)?;
+                    self.finish_tool_audit(
+                        audit_id,
+                        finish,
+                        &CancellationToken::new(),
+                        bounded_audit_cleanup_deadline(finalization_deadline),
+                    ).await?;
                     return Err(AgentError::Interrupted);
                 }
                 result = self.tools.call(&call) => result,
             };
             let (result, finish, event_code) = classify_tool_result(execution, read_only, &call.id);
-            self.store.finish_tool_run(audit_id, finish)?;
+            let finish_result = self
+                .finish_tool_audit(
+                    audit_id,
+                    finish.clone(),
+                    cancellation,
+                    finalization_deadline,
+                )
+                .await;
+            if matches!(finish_result, Err(AgentError::Interrupted)) && cancellation.is_cancelled()
+            {
+                // A signal may arrive after the tool returns while SQLite is
+                // persisting its audit. Stop and join that worker, then make
+                // one short shielded terminal attempt before owner recovery.
+                self.finish_tool_audit(
+                    audit_id,
+                    finish,
+                    &CancellationToken::new(),
+                    bounded_audit_cleanup_deadline(finalization_deadline),
+                )
+                .await?;
+                return Err(AgentError::Interrupted);
+            }
+            finish_result?;
+            if cancellation.is_cancelled() {
+                return Err(AgentError::Interrupted);
+            }
             if event_sink(AgentEvent::ToolFinished {
                 name: call.name,
                 code: event_code,
@@ -650,6 +732,96 @@ impl AgentRunner {
         }
         Ok(results)
     }
+
+    async fn start_tool_audit(
+        &self,
+        start: ToolRunStart,
+        cancellation: &CancellationToken,
+        execution_deadline: Option<Instant>,
+        finalization_deadline: Option<Instant>,
+    ) -> Result<i64, AgentError> {
+        let deadline =
+            execution_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
+        let store = self.store.clone();
+        let worker_cancellation = CancellationToken::new();
+        let blocking_cancellation = worker_cancellation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            store.start_tool_run_with_deadline(start, deadline, &blocking_cancellation)
+        });
+        tokio::pin!(worker);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                worker_cancellation.cancel();
+                if let Ok(Ok(id)) = worker.await {
+                    let finish = ToolRunFinish::failed(SafeErrorCode::Interrupted);
+                    self.finish_tool_audit(
+                        id,
+                        finish,
+                        &CancellationToken::new(),
+                        bounded_audit_cleanup_deadline(finalization_deadline),
+                    ).await?;
+                }
+                Err(AgentError::Interrupted)
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                worker_cancellation.cancel();
+                if let Ok(Ok(id)) = worker.await {
+                    // Dispatch has not happened yet, so even a write is known
+                    // not to have been delivered and is safe to mark failed.
+                    let finish = ToolRunFinish::failed(SafeErrorCode::TimedOut);
+                    self.finish_tool_audit(
+                        id,
+                        finish,
+                        &CancellationToken::new(),
+                        finalization_deadline,
+                    ).await?;
+                }
+                Err(AgentError::Store(StoreError::Busy))
+            }
+            result = &mut worker => result.map_err(|_| AgentError::Store(StoreError::Database))?.map_err(AgentError::Store),
+        }
+    }
+
+    async fn finish_tool_audit(
+        &self,
+        id: i64,
+        finish: ToolRunFinish,
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> Result<(), AgentError> {
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
+        let store = self.store.clone();
+        let worker_cancellation = CancellationToken::new();
+        let blocking_cancellation = worker_cancellation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            store.finish_tool_run_with_deadline(id, finish, deadline, &blocking_cancellation)
+        });
+        tokio::pin!(worker);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                worker_cancellation.cancel();
+                match worker.await {
+                    Ok(Ok(())) => Ok(()),
+                    _ => Err(AgentError::Interrupted),
+                }
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                worker_cancellation.cancel();
+                match worker.await {
+                    Ok(Ok(())) => Ok(()),
+                    _ => Err(AgentError::Store(StoreError::Busy)),
+                }
+            }
+            result = &mut worker => result.map_err(|_| AgentError::Store(StoreError::Database))?.map_err(AgentError::Store),
+        }
+    }
+}
+
+fn bounded_audit_cleanup_deadline(deadline: Option<Instant>) -> Option<Instant> {
+    let bounded = Instant::now() + Duration::from_millis(100);
+    Some(deadline.map_or(bounded, |deadline| deadline.min(bounded)))
 }
 
 pub struct InteractiveService {

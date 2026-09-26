@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -10,7 +12,8 @@ use deepseek_cli::protocol::{ClientRequest, PROTOCOL_VERSION, RequestEnvelope};
 use deepseek_cli::runtime::ProcessLease;
 use deepseek_cli::scheduler::ScheduleSpec;
 use deepseek_cli::store::{
-    CronRunFinish, JobCreate, RunClaim, Store, StoreError, ToolRunFinish, ToolRunStart,
+    CronRunFinish, JobCreate, RunClaim, SafeErrorCode, Store, StoreError, ToolRunFinish,
+    ToolRunStart,
 };
 
 fn server_binary() -> &'static str {
@@ -91,9 +94,110 @@ fn configuration_failure_is_nonzero_bounded_and_safe() {
     assert!(!stderr.contains("SECRET.toml"));
 }
 
+#[cfg(unix)]
+#[test]
+fn sigterm_cancels_and_joins_cron_sync_sqlite_worker() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let directory = common::private_tempdir();
+    let database = directory.path().join("agent.sqlite3");
+    let store = Store::open(&database).unwrap();
+    let dialog = store.create_dialog("cron sync signal").unwrap().id;
+    let job = store
+        .create_job(JobCreate {
+            source_dialog_id: dialog,
+            name: "pending sync".into(),
+            schedule: ScheduleSpec::parse_cron("* * * * *", Moscow).unwrap(),
+            prompt: "never install".into(),
+        })
+        .unwrap();
+    let marker = directory.path().join("validation-ready");
+    let release = directory.path().join("validation-release");
+    let crontab = directory.path().join("fake-crontab");
+    fs::write(
+        &crontab,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  -V) printf 'cronie 1.7.2\\n' ;;\n  -T) cat >/dev/null; touch '{}'; while [ ! -f '{}' ]; do sleep 0.01; done ;;\n  *) exit 9 ;;\nesac\n",
+            marker.display(),
+            release.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&crontab, fs::Permissions::from_mode(0o700)).unwrap();
+    let config = directory.path().join("server.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[provider]
+api_key = "test-key"
+
+[database]
+path = "{}"
+
+[scheduler]
+lock_path = "{}"
+binary_path = "/opt/light-agent/bin/light-agent"
+crontab_binary = "{}"
+run_timeout_seconds = 5
+"#,
+            database.display(),
+            directory.path().join("cron.lock").display(),
+            crontab.display(),
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(server_binary())
+        .args(["--config", config.to_str().unwrap(), "cron-sync"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "cron-sync exited before crontab validation"
+        );
+        assert!(
+            Instant::now() < ready_deadline,
+            "cron preflight did not start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let blocker = rusqlite::Connection::open(&database).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    fs::write(&release, "go").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let exit_deadline = Instant::now() + Duration::from_secs(2);
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < exit_deadline,
+            "cron-sync abandoned a locked SQLite worker"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(blocker);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        store.get_job(job.id).unwrap().sync_state,
+        deepseek_cli::domain::JobSyncState::Pending
+    );
+}
+
 #[test]
 fn serve_stdio_stdout_contains_protocol_lines_only() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let config_path = directory.path().join("server.toml");
     let database = directory.path().join("agent.sqlite3");
     let lock = directory.path().join("cron.lock");
@@ -221,7 +325,7 @@ fn second_live_server_never_recovers_the_first_process_work() {
         accepted_tx.send(()).unwrap();
         let _ = release_rx.recv_timeout(Duration::from_secs(5));
     });
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let (config, store) = write_server_config_with_provider(&directory, &provider_url);
     let (mut first, _first_stdout) = start_server(&config);
     let dialog = store.create_dialog("live").unwrap();
@@ -256,7 +360,7 @@ fn second_live_server_never_recovers_the_first_process_work() {
 
 #[test]
 fn initialized_owner_registry_rejects_new_unowned_work() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let database = directory.path().join("agent.sqlite3");
     let store = Store::open(&database).unwrap();
     let first = ProcessLease::acquire(&store).unwrap();
@@ -274,12 +378,12 @@ fn initialized_owner_registry_rejects_new_unowned_work() {
 
 #[test]
 fn one_live_runtime_owner_cannot_mutate_another_owners_active_work() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let store = Store::open(directory.path().join("agent.sqlite3")).unwrap();
     let owner_a = ProcessLease::acquire(&store).unwrap();
-    let store_a = store.with_runtime_owner(owner_a.owner_id()).unwrap();
+    let store_a = owner_a.owned_store(&store).unwrap();
     let owner_b = ProcessLease::acquire(&store).unwrap();
-    let store_b = store.with_runtime_owner(owner_b.owner_id()).unwrap();
+    let store_b = owner_b.owned_store(&store).unwrap();
 
     let dialog = store.create_dialog("owner fence").unwrap();
     let turn = store_a.begin_turn(dialog.id, "question").unwrap();
@@ -336,10 +440,69 @@ fn one_live_runtime_owner_cannot_mutate_another_owners_active_work() {
         .unwrap();
 }
 
+#[test]
+fn owned_store_clone_keeps_the_runtime_lock_alive_after_lease_drop() {
+    let directory = common::private_tempdir();
+    let store = Store::open(directory.path().join("agent.sqlite3")).unwrap();
+    let lease = ProcessLease::acquire(&store).unwrap();
+    let owned = lease.owned_store(&store).unwrap();
+    let survivor = owned.clone();
+    let dialog = store.create_dialog("capability lifetime").unwrap();
+    let turn = owned.begin_turn(dialog.id, "question").unwrap();
+
+    drop(owned);
+    drop(lease);
+    let concurrent = ProcessLease::acquire(&store).unwrap();
+    assert_eq!(concurrent.recovery_report().turns, 0);
+    assert_eq!(turn_status(&directory, turn.turn_id), "pending");
+
+    survivor
+        .interrupt_turn(turn.turn_id, SafeErrorCode::Interrupted)
+        .unwrap();
+    drop(survivor);
+}
+
+#[test]
+fn runtime_capability_cannot_be_rebound_to_a_different_database() {
+    let first_directory = common::private_tempdir();
+    let second_directory = common::private_tempdir();
+    let first_path = first_directory.path().join("agent.sqlite3");
+    let second_path = second_directory.path().join("agent.sqlite3");
+    let first = Store::open(&first_path).unwrap();
+    let second = Store::open(&second_path).unwrap();
+    let lease = ProcessLease::acquire(&first).unwrap();
+
+    let owner: (String, String, i64, i64, String) = rusqlite::Connection::open(&first_path)
+        .unwrap()
+        .query_row(
+            "SELECT owner_id,lock_name,lock_device,lock_inode,created_at FROM runtime_owners",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    rusqlite::Connection::open(&second_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO runtime_owners(owner_id,lock_name,lock_device,lock_inode,created_at) VALUES(?,?,?,?,?)",
+            rusqlite::params![owner.0, owner.1, owner.2, owner.3, owner.4],
+        )
+        .unwrap();
+
+    assert!(lease.owned_store(&second).is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn runtime_coordination_rejects_a_symlink_lock() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let database = directory.path().join("agent.sqlite3");
     let store = Store::open(&database).unwrap();
     let target = directory.path().join("attacker-controlled");
@@ -352,7 +515,7 @@ fn runtime_coordination_rejects_a_symlink_lock() {
 
 #[test]
 fn expired_startup_budget_creates_no_database_or_runtime_sidecars() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let database = directory.path().join("expired.sqlite3");
     let cancellation = tokio_util::sync::CancellationToken::new();
     assert!(matches!(
@@ -378,7 +541,7 @@ fn expired_startup_budget_creates_no_database_or_runtime_sidecars() {
 #[cfg(unix)]
 #[test]
 fn simultaneous_startups_register_distinct_owners_and_reap_only_the_crashed_one() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let (config, _store) = write_server_config(&directory);
     let spawn = || {
         Command::new(server_binary())
@@ -441,7 +604,7 @@ fn simultaneous_startups_register_distinct_owners_and_reap_only_the_crashed_one(
 
 #[test]
 fn exclusive_startup_recovers_cron_run_and_tools_after_simulated_sigkill() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let (config, store) = write_server_config(&directory);
     let dialog = store.create_dialog("cron").unwrap().id;
     let job = store
@@ -478,7 +641,7 @@ fn exclusive_startup_recovers_cron_run_and_tools_after_simulated_sigkill() {
     assert_eq!(tools[0].status, ToolRunStatus::Failed);
     assert_eq!(tools[1].status, ToolRunStatus::Uncertain);
     let next_owner = ProcessLease::acquire(&store).unwrap();
-    let owned_store = store.with_runtime_owner(next_owner.owner_id()).unwrap();
+    let owned_store = next_owner.owned_store(&store).unwrap();
     assert!(matches!(
         owned_store
             .claim_run(job.id, Utc::now() + chrono::Duration::minutes(1))
@@ -504,7 +667,7 @@ fn live_cron_process_is_not_recovered_by_concurrent_server_startups() {
         let _ = release_rx.recv_timeout(Duration::from_secs(5));
     });
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let (config, store) = write_server_config_with_provider(&directory, &provider_url);
     let dialog = store.create_dialog("cron-live").unwrap().id;
     let job = store
@@ -600,7 +763,7 @@ fn run_job_deadline_includes_mcp_discovery() {
         let _ = release_rx.recv_timeout(Duration::from_secs(5));
     });
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let config = directory.path().join("server.toml");
     let database = directory.path().join("agent.sqlite3");
     let lock = directory.path().join("cron.lock");
@@ -703,7 +866,7 @@ fn sigterm_interrupts_run_job_while_provider_is_blocked() {
         accepted_tx.send(()).unwrap();
         let _ = release_rx.recv_timeout(Duration::from_secs(3));
     });
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let (config, store) = write_server_config_with_provider(&directory, &provider_url);
     let dialog = store.create_dialog("signal cron").unwrap().id;
     let job = store
@@ -772,7 +935,7 @@ fn sigterm_interrupts_run_job_while_finalization_is_locked() {
         stream.write_all(response.as_bytes()).unwrap();
         stream.flush().unwrap();
     });
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let (config, store) = write_server_config_with_provider(&directory, &provider_url);
     let dialog = store.create_dialog("finalize signal").unwrap().id;
     let job = store
@@ -847,7 +1010,7 @@ fn sigint_and_sigterm_cancel_active_turn_and_wait_for_durable_finish() {
             accepted_tx.send(()).unwrap();
             let _ = release_rx.recv_timeout(Duration::from_secs(3));
         });
-        let directory = tempfile::tempdir().unwrap();
+        let directory = common::private_tempdir();
         let (config, store) = write_server_config_with_provider(&directory, &provider_url);
         let dialog = store.create_dialog("signal").unwrap();
         let (mut child, _stdout) = start_server(&config);

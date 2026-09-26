@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, LocalResult, NaiveDateTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
@@ -15,6 +16,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use crate::store::{CronJob, Store, StoreError};
 
@@ -390,7 +395,12 @@ impl CronClock for SystemCronClock {
 pub type CronReconcileFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>>;
 
 pub trait CronRunReconciler: Send + Sync {
-    fn reconcile<'a>(&'a self, now: DateTime<Utc>) -> CronReconcileFuture<'a>;
+    fn reconcile<'a>(
+        &'a self,
+        now: DateTime<Utc>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> CronReconcileFuture<'a>;
 }
 
 pub trait CrontabBackend: Send + Sync {
@@ -546,6 +556,20 @@ impl CronSynchronizer {
         binary_path: PathBuf,
     ) -> Result<Self, SchedulerError> {
         validate_lock_path(&lock_path)?;
+        store.validate_storage_boundary()?;
+        let lock_name = lock_path
+            .file_name()
+            .ok_or(SchedulerError::InvalidPath)?
+            .to_owned();
+        let lock_parent = lock_path.parent().ok_or(SchedulerError::InvalidPath)?;
+        let lock_parent =
+            std::fs::canonicalize(lock_parent).map_err(|_| SchedulerError::InvalidPath)?;
+        if lock_parent != store.database_directory_path() {
+            return Err(SchedulerError::InvalidPath);
+        }
+        // Never retain a caller-provided alias. Every later open resolves from
+        // the canonical directory that the Store has already pinned.
+        let lock_path = lock_parent.join(lock_name);
         Ok(Self {
             store,
             backend,
@@ -559,25 +583,74 @@ impl CronSynchronizer {
     }
 
     pub fn sync_at(&self, current_time: DateTime<Utc>) -> CrontabFuture<'_, SyncReport> {
+        self.sync_at_until(
+            current_time,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+    }
+
+    pub fn sync_at_until(
+        &self,
+        current_time: DateTime<Utc>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> CrontabFuture<'_, SyncReport> {
         Box::pin(async move {
+            if cancellation.is_cancelled() || Instant::now() >= deadline {
+                return Err(SchedulerError::Busy);
+            }
+            // The scheduler lock must remain in the Store's retained trusted
+            // directory. This validation rejects directory replacement before
+            // accepting whichever inode currently occupies the lock path.
+            self.store.validate_storage_boundary()?;
             let lock = open_lock(&self.lock_path)?;
             lock.try_lock_exclusive()
                 .map_err(|error| match error.kind() {
                     io::ErrorKind::WouldBlock => SchedulerError::Busy,
                     _ => SchedulerError::Backend,
                 })?;
-            self.backend.preflight().await?;
-            self.store.mark_missed_once_jobs(current_time)?;
-            let snapshot = self.store.jobs_for_sync()?;
+            deadline_future(deadline, &cancellation, self.backend.preflight()).await??;
+            let store = self.store.clone();
+            run_store(deadline, &cancellation, move |token| {
+                store.mark_missed_once_jobs_with_deadline(current_time, deadline, &token)
+            })
+            .await?;
+            let store = self.store.clone();
+            let snapshot = run_store(deadline, &cancellation, move |token| {
+                store.jobs_for_sync_with_deadline(deadline, &token)
+            })
+            .await?;
             let active: Vec<_> = snapshot
                 .iter()
                 .filter(|job| job.desired_state == crate::domain::JobDesiredState::Active)
                 .cloned()
                 .collect();
-            let existing = match self.backend.list().await {
-                Ok(existing) => existing,
+            let existing = match deadline_future(deadline, &cancellation, self.backend.list()).await
+            {
+                Ok(Ok(existing)) => existing,
                 Err(_) => {
-                    self.store.mark_sync_snapshot_failed(&snapshot)?;
+                    mark_snapshot(
+                        self.store.clone(),
+                        snapshot.clone(),
+                        false,
+                        deadline,
+                        &cancellation,
+                    )
+                    .await?;
+                    return Ok(SyncReport::SavedNotInstalled {
+                        jobs: snapshot.len(),
+                    });
+                }
+                Ok(Err(_)) => {
+                    mark_snapshot(
+                        self.store.clone(),
+                        snapshot.clone(),
+                        false,
+                        deadline,
+                        &cancellation,
+                    )
+                    .await?;
                     return Ok(SyncReport::SavedNotInstalled {
                         jobs: snapshot.len(),
                     });
@@ -586,42 +659,166 @@ impl CronSynchronizer {
             let candidate = match self.renderer.merge(&existing, &active) {
                 Ok(candidate) => candidate,
                 Err(error) => {
-                    self.store.mark_sync_snapshot_failed(&snapshot)?;
+                    mark_snapshot(
+                        self.store.clone(),
+                        snapshot.clone(),
+                        false,
+                        deadline,
+                        &cancellation,
+                    )
+                    .await?;
                     return Err(error);
                 }
             };
-            if self.backend.validate(&candidate).await.is_err() {
-                self.store.mark_sync_snapshot_failed(&snapshot)?;
+            if !matches!(
+                deadline_future(deadline, &cancellation, self.backend.validate(&candidate)).await,
+                Ok(Ok(()))
+            ) {
+                mark_snapshot(
+                    self.store.clone(),
+                    snapshot.clone(),
+                    false,
+                    deadline,
+                    &cancellation,
+                )
+                .await?;
                 return Ok(SyncReport::SavedNotInstalled {
                     jobs: snapshot.len(),
                 });
             }
-            if self.backend.install(&candidate).await.is_err() {
-                self.store.mark_sync_snapshot_failed(&snapshot)?;
+            if !matches!(
+                deadline_future(deadline, &cancellation, self.backend.install(&candidate)).await,
+                Ok(Ok(()))
+            ) {
+                mark_snapshot(
+                    self.store.clone(),
+                    snapshot.clone(),
+                    false,
+                    deadline,
+                    &cancellation,
+                )
+                .await?;
                 return Ok(SyncReport::SavedNotInstalled {
                     jobs: snapshot.len(),
                 });
             }
-            self.store.mark_sync_snapshot_applied(&snapshot)?;
+            mark_snapshot(self.store.clone(), snapshot, true, deadline, &cancellation).await?;
             Ok(SyncReport::Installed { jobs: active.len() })
         })
     }
 }
 
 impl CronRunReconciler for CronSynchronizer {
-    fn reconcile<'a>(&'a self, now: DateTime<Utc>) -> CronReconcileFuture<'a> {
-        Box::pin(async move { self.sync_at(now).await.map(|_| ()).map_err(|_| ()) })
+    fn reconcile<'a>(
+        &'a self,
+        now: DateTime<Utc>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> CronReconcileFuture<'a> {
+        Box::pin(async move {
+            self.sync_at_until(now, deadline, cancellation)
+                .await
+                .map(|_| ())
+                .map_err(|_| ())
+        })
+    }
+}
+
+async fn run_store<T: Send + 'static>(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    operation: impl FnOnce(CancellationToken) -> Result<T, StoreError> + Send + 'static,
+) -> Result<T, SchedulerError> {
+    let worker_cancellation = CancellationToken::new();
+    let blocking_cancellation = worker_cancellation.clone();
+    let worker = tokio::task::spawn_blocking(move || operation(blocking_cancellation));
+    tokio::pin!(worker);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            worker_cancellation.cancel();
+            let _ = worker.await;
+            Err(SchedulerError::Busy)
+        }
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            worker_cancellation.cancel();
+            let _ = worker.await;
+            Err(SchedulerError::Busy)
+        }
+        result = &mut worker => result.map_err(|_| SchedulerError::Store)?.map_err(SchedulerError::from),
+    }
+}
+
+async fn mark_snapshot(
+    store: Store,
+    snapshot: Vec<CronJob>,
+    applied: bool,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), SchedulerError> {
+    run_store(deadline, cancellation, move |token| {
+        if applied {
+            store.mark_sync_snapshot_applied_with_deadline(&snapshot, deadline, &token)
+        } else {
+            store.mark_sync_snapshot_failed_with_deadline(&snapshot, deadline, &token)
+        }
+    })
+    .await
+}
+
+async fn deadline_future<T>(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    future: impl Future<Output = T>,
+) -> Result<T, SchedulerError> {
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(SchedulerError::Busy),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => Err(SchedulerError::Busy),
+        result = &mut future => Ok(result),
     }
 }
 
 fn open_lock(path: &Path) -> Result<File, SchedulerError> {
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|_| SchedulerError::Backend)
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        return Err(SchedulerError::Backend);
+    }
+    #[cfg(unix)]
+    {
+        let parent = path.parent().ok_or(SchedulerError::Backend)?;
+        let parent_metadata =
+            std::fs::symlink_metadata(parent).map_err(|_| SchedulerError::Backend)?;
+        if !parent_metadata.is_dir()
+            || parent_metadata.uid() != unsafe { libc::geteuid() }
+            || parent_metadata.mode() & 0o7777 != 0o700
+        {
+            return Err(SchedulerError::Backend);
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|_| SchedulerError::Backend)?;
+        let metadata = file.metadata().map_err(|_| SchedulerError::Backend)?;
+        let path_metadata = std::fs::symlink_metadata(path).map_err(|_| SchedulerError::Backend)?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.dev() != path_metadata.dev()
+            || metadata.ino() != path_metadata.ino()
+        {
+            return Err(SchedulerError::Backend);
+        }
+        Ok(file)
+    }
 }
 
 fn validate_lock_path(path: &Path) -> Result<(), SchedulerError> {

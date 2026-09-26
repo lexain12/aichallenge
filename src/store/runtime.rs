@@ -129,14 +129,8 @@ impl Store {
             let tool_runs = tx.execute(
                 "UPDATE tool_runs
                  SET status=CASE WHEN read_only=1 THEN 'failed' ELSE 'uncertain' END,
-                     safe_error_code='process_interrupted',finished_at=?1
-                 WHERE status='pending' AND (
-                    (owner_kind='interactive_turn' AND owner_id IN
-                        (SELECT id FROM turns WHERE runtime_owner_id=?2))
-                    OR
-                    (owner_kind='cron_run' AND owner_id IN
-                        (SELECT id FROM cron_runs WHERE runtime_owner_id=?2))
-                 )",
+                     safe_error_code='process_interrupted',finished_at=?1,runtime_owner_id=NULL
+                 WHERE status='pending' AND runtime_owner_id=?2",
                 params![timestamp, owner_id],
             )?;
             tx.execute(
@@ -181,14 +175,8 @@ fn recover_unowned_runtime_work(tx: &Transaction<'_>) -> Result<OwnerRecovery, S
     let tool_runs = tx.execute(
         "UPDATE tool_runs
          SET status=CASE WHEN read_only=1 THEN 'failed' ELSE 'uncertain' END,
-             safe_error_code='process_interrupted',finished_at=?1
-         WHERE status='pending' AND (
-            (owner_kind='interactive_turn' AND owner_id IN
-                (SELECT id FROM turns WHERE runtime_owner_id IS NULL AND status='pending'))
-            OR
-            (owner_kind='cron_run' AND owner_id IN
-                (SELECT id FROM cron_runs WHERE runtime_owner_id IS NULL AND status='pending'))
-         )",
+             safe_error_code='process_interrupted',finished_at=?1,runtime_owner_id=NULL
+         WHERE status='pending' AND runtime_owner_id IS NULL",
         [&timestamp],
     )?;
     tx.execute(

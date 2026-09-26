@@ -1,3 +1,5 @@
+mod common;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -180,7 +182,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(backend: FakeBackend) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::private_tempdir();
         let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
         let source_dialog_id = store.create_dialog("source").unwrap().id;
         let backend = Arc::new(backend);

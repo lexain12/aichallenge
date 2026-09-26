@@ -1,3 +1,5 @@
+mod common;
+
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -47,7 +49,7 @@ impl Write for ShortWriteRecorder {
 
 #[test]
 fn dump_export_and_history_cover_all_logical_state_in_stable_order() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
     let first = store.create_dialog("first").unwrap();
     let second = store.create_dialog("second").unwrap();
@@ -171,7 +173,7 @@ fn dump_export_and_history_cover_all_logical_state_in_stable_order() {
 
 #[test]
 fn export_is_streamed_and_has_no_secret_or_raw_payload_fields() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
     let dialog = store.create_dialog("safe").unwrap();
     let turn = store.begin_turn(dialog.id, "ordinary message").unwrap();
@@ -216,7 +218,7 @@ fn export_is_streamed_and_has_no_secret_or_raw_payload_fields() {
 
 #[test]
 fn inspection_pages_are_bounded_and_cursor_order_is_deterministic() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
     for index in 0..7 {
         store.create_dialog(&format!("dialog-{index}")).unwrap();
@@ -238,7 +240,7 @@ fn inspection_pages_are_bounded_and_cursor_order_is_deterministic() {
 
 #[test]
 fn inspection_snapshot_is_consistent_across_pages_during_concurrent_mutation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
     let original = (0..5)
         .map(|index| store.create_dialog(&format!("original-{index}")).unwrap())
@@ -290,7 +292,7 @@ fn inspection_snapshot_is_consistent_across_pages_during_concurrent_mutation() {
 
 #[test]
 fn stalled_snapshot_worker_releases_wal_at_the_hard_deadline() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let path = dir.path().join("agent.sqlite");
     let store = Store::open(&path).unwrap();
     for index in 0..5 {
@@ -330,7 +332,7 @@ fn stalled_snapshot_worker_releases_wal_at_the_hard_deadline() {
 
 #[test]
 fn deadline_interrupted_page_is_reported_as_snapshot_expired() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let path = dir.path().join("agent.sqlite");
     let store = Store::open(&path).unwrap();
     let setup = rusqlite::Connection::open(&path).unwrap();
@@ -370,7 +372,7 @@ fn deadline_interrupted_page_is_reported_as_snapshot_expired() {
 
 #[test]
 fn cancellation_interrupts_a_running_sqlite_page_and_joins_the_worker() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let path = dir.path().join("agent.sqlite");
     let store = Store::open(&path).unwrap();
     let setup = rusqlite::Connection::open(&path).unwrap();
@@ -417,7 +419,7 @@ fn cancellation_interrupts_a_running_sqlite_page_and_joins_the_worker() {
 
 #[test]
 fn locked_database_startup_expires_and_releases_the_worker_before_unlock() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let path = dir.path().join("agent.sqlite");
     let store = Store::open(&path).unwrap();
     let lock = rusqlite::Connection::open(&path).unwrap();

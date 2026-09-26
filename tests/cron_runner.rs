@@ -1,13 +1,17 @@
+mod common;
+
 use std::collections::VecDeque;
 use std::future::pending;
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::{America::New_York, Europe::Moscow};
 use deepseek_cli::agent_runner::{CronAgentService, CronRunError, CronRunOutcome};
-use deepseek_cli::domain::{CronRunStatus, JobDesiredState, JobSyncState, ToolOwner};
+use deepseek_cli::domain::{
+    CronRunStatus, JobDesiredState, JobSyncState, ToolOwner, ToolRunStatus,
+};
 use deepseek_cli::provider::{
     AssistantTurn, ModelToolCall, ModelToolDefinition, Provider, ProviderError, ProviderFuture,
     ProviderMessage, TokenUsage,
@@ -171,6 +175,93 @@ impl ToolExecutor for FakeTools {
     }
 }
 
+struct PendingTools {
+    definitions: Vec<ModelToolDefinition>,
+    entered: Arc<Notify>,
+}
+
+impl PendingTools {
+    fn new(entered: Arc<Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            definitions: FakeTools::mcp().definitions.clone(),
+            entered,
+        })
+    }
+}
+
+impl ToolExecutor for PendingTools {
+    fn definitions(&self) -> &[ModelToolDefinition] {
+        &self.definitions
+    }
+
+    fn route(&self, name: &str) -> Option<ToolRoute<'_>> {
+        (name == "telegram__send").then_some(ToolRoute {
+            server_name: "telegram",
+            tool_name: "send",
+        })
+    }
+
+    fn is_read_only(&self, name: &str) -> Option<bool> {
+        (name == "telegram__send").then_some(false)
+    }
+
+    fn call<'a>(&'a self, _call: &'a ModelToolCall) -> ToolFuture<'a> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            pending().await
+        })
+    }
+}
+
+struct GatedTools {
+    definitions: Vec<ModelToolDefinition>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    returned: Arc<Notify>,
+}
+
+impl GatedTools {
+    fn new(entered: Arc<Notify>, release: Arc<Notify>, returned: Arc<Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            definitions: FakeTools::mcp().definitions.clone(),
+            entered,
+            release,
+            returned,
+        })
+    }
+}
+
+impl ToolExecutor for GatedTools {
+    fn definitions(&self) -> &[ModelToolDefinition] {
+        &self.definitions
+    }
+
+    fn route(&self, name: &str) -> Option<ToolRoute<'_>> {
+        (name == "telegram__send").then_some(ToolRoute {
+            server_name: "telegram",
+            tool_name: "send",
+        })
+    }
+
+    fn is_read_only(&self, name: &str) -> Option<bool> {
+        (name == "telegram__send").then_some(false)
+    }
+
+    fn call<'a>(&'a self, _call: &'a ModelToolCall) -> ToolFuture<'a> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.returned.notify_one();
+            Ok(ToolExecutionResult {
+                content: "sent".into(),
+                is_error: false,
+                error_code: None,
+                delivery_uncertain: false,
+            })
+        })
+    }
+}
+
 #[derive(Clone)]
 struct FixedClock(DateTime<Utc>);
 
@@ -192,7 +283,12 @@ impl CronClock for AdjustableClock {
 struct FailedReconciler;
 
 impl CronRunReconciler for FailedReconciler {
-    fn reconcile<'a>(&'a self, _now: DateTime<Utc>) -> CronReconcileFuture<'a> {
+    fn reconcile<'a>(
+        &'a self,
+        _now: DateTime<Utc>,
+        _deadline: Instant,
+        _cancellation: CancellationToken,
+    ) -> CronReconcileFuture<'a> {
         Box::pin(async { Err(()) })
     }
 }
@@ -200,8 +296,19 @@ impl CronRunReconciler for FailedReconciler {
 struct PendingReconciler;
 
 impl CronRunReconciler for PendingReconciler {
-    fn reconcile<'a>(&'a self, _now: DateTime<Utc>) -> CronReconcileFuture<'a> {
-        Box::pin(pending())
+    fn reconcile<'a>(
+        &'a self,
+        _now: DateTime<Utc>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> CronReconcileFuture<'a> {
+        Box::pin(async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => Err(()),
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => Err(()),
+                _ = pending::<()>() => Ok(()),
+            }
+        })
     }
 }
 
@@ -212,7 +319,7 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let store = Store::open(directory.path().join("agent.sqlite3")).unwrap();
     let dialog_id = store.create_dialog("source").unwrap().id;
     Fixture {
@@ -363,6 +470,184 @@ async fn run_timeout_is_durable() {
     assert_eq!(runs[0].status, CronRunStatus::TimedOut);
 }
 
+#[tokio::test]
+async fn timeout_during_active_write_tool_terminalizes_audit_before_run() {
+    let fixture = fixture();
+    let job = recurring(&fixture, Moscow);
+    let provider = FakeProvider::new([Reply::Turn(AssistantTurn::ToolCalls {
+        content: None,
+        calls: vec![ModelToolCall {
+            id: "call_timeout".into(),
+            name: "telegram__send".into(),
+            arguments: "{}".into(),
+        }],
+        usage: None,
+    })]);
+    let entered = Arc::new(Notify::new());
+    let now = Utc.with_ymd_and_hms(2026, 9, 26, 6, 30, 0).unwrap();
+    let service = CronAgentService::new(
+        fixture.store.clone(),
+        provider,
+        PendingTools::new(entered.clone()),
+        "CRON SYSTEM",
+        8,
+        REQUEST_LIMIT,
+        MESSAGE_LIMIT,
+        Duration::from_millis(300),
+        Some(Arc::new(FailedReconciler)),
+    )
+    .with_clock(Arc::new(FixedClock(now)));
+    let task = tokio::spawn(async move { service.run_job(job.id, CancellationToken::new()).await });
+    entered.notified().await;
+
+    assert_eq!(task.await.unwrap().unwrap_err(), CronRunError::TimedOut);
+    assert_eq!(
+        fixture.store.list_runs(job.id).unwrap()[0].status,
+        CronRunStatus::TimedOut
+    );
+    let tools = fixture.store.list_tool_runs().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].status, ToolRunStatus::Uncertain);
+    assert!(tools[0].finished_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_during_locked_active_tool_audit_is_bounded_and_recoverable() {
+    let fixture = fixture();
+    let job = recurring(&fixture, Moscow);
+    let provider = FakeProvider::new([Reply::Turn(AssistantTurn::ToolCalls {
+        content: None,
+        calls: vec![ModelToolCall {
+            id: "call_cancel".into(),
+            name: "telegram__send".into(),
+            arguments: "{}".into(),
+        }],
+        usage: None,
+    })]);
+    let entered = Arc::new(Notify::new());
+    let now = Utc.with_ymd_and_hms(2026, 9, 26, 6, 30, 0).unwrap();
+    let service = CronAgentService::new(
+        fixture.store.clone(),
+        provider,
+        PendingTools::new(entered.clone()),
+        "CRON SYSTEM",
+        8,
+        REQUEST_LIMIT,
+        MESSAGE_LIMIT,
+        Duration::from_secs(5),
+        Some(Arc::new(FailedReconciler)),
+    )
+    .with_clock(Arc::new(FixedClock(now)));
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let mut task = tokio::spawn(async move { service.run_job(job.id, task_cancellation).await });
+    entered.notified().await;
+    let blocker =
+        rusqlite::Connection::open(fixture._directory.path().join("agent.sqlite3")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let cancelled_at = Instant::now();
+    cancellation.cancel();
+    let result = tokio::time::timeout(Duration::from_millis(500), &mut task)
+        .await
+        .expect("active tool audit ignored cancellation")
+        .unwrap();
+    assert_eq!(result.unwrap_err(), CronRunError::Store);
+    assert!(cancelled_at.elapsed() < Duration::from_millis(500));
+    assert_eq!(
+        fixture.store.list_runs(job.id).unwrap()[0].status,
+        CronRunStatus::Pending
+    );
+    assert_eq!(
+        fixture.store.list_tool_runs().unwrap()[0].status,
+        ToolRunStatus::Pending
+    );
+
+    drop(blocker);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        fixture.store.list_tool_runs().unwrap()[0].status,
+        ToolRunStatus::Pending,
+        "cancelled worker mutated after returning"
+    );
+    let recovery = ProcessLease::acquire(&fixture.store).unwrap();
+    assert_eq!(recovery.recovery_report().tool_runs, 1);
+    assert_eq!(recovery.recovery_report().cron_runs, 1);
+    assert_eq!(
+        fixture.store.list_tool_runs().unwrap()[0].status,
+        ToolRunStatus::Uncertain
+    );
+    assert_eq!(
+        fixture.store.list_runs(job.id).unwrap()[0].status,
+        CronRunStatus::Interrupted
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_interrupts_locked_audit_after_tool_has_returned() {
+    let fixture = fixture();
+    let job = recurring(&fixture, Moscow);
+    let provider = FakeProvider::new([Reply::Turn(AssistantTurn::ToolCalls {
+        content: None,
+        calls: vec![ModelToolCall {
+            id: "call_returned".into(),
+            name: "telegram__send".into(),
+            arguments: "{}".into(),
+        }],
+        usage: None,
+    })]);
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let returned = Arc::new(Notify::new());
+    let now = Utc.with_ymd_and_hms(2026, 9, 26, 6, 30, 0).unwrap();
+    let service = CronAgentService::new(
+        fixture.store.clone(),
+        provider,
+        GatedTools::new(entered.clone(), release.clone(), returned.clone()),
+        "CRON SYSTEM",
+        8,
+        REQUEST_LIMIT,
+        MESSAGE_LIMIT,
+        Duration::from_secs(5),
+        Some(Arc::new(FailedReconciler)),
+    )
+    .with_clock(Arc::new(FixedClock(now)));
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let mut task = tokio::spawn(async move { service.run_job(job.id, task_cancellation).await });
+    entered.notified().await;
+    let blocker =
+        rusqlite::Connection::open(fixture._directory.path().join("agent.sqlite3")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    release.notify_one();
+    returned.notified().await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let cancelled_at = Instant::now();
+    cancellation.cancel();
+    let result = tokio::time::timeout(Duration::from_millis(500), &mut task)
+        .await
+        .expect("audit finish ignored cancellation after the tool returned")
+        .unwrap();
+    assert_eq!(result.unwrap_err(), CronRunError::Store);
+    assert!(cancelled_at.elapsed() < Duration::from_millis(500));
+    assert_eq!(
+        fixture.store.list_tool_runs().unwrap()[0].status,
+        ToolRunStatus::Pending
+    );
+
+    drop(blocker);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        fixture.store.list_tool_runs().unwrap()[0].status,
+        ToolRunStatus::Pending,
+        "cancelled audit worker performed a late write"
+    );
+    let recovery = ProcessLease::acquire(&fixture.store).unwrap();
+    assert_eq!(recovery.recovery_report().tool_runs, 1);
+    assert_eq!(recovery.recovery_report().cron_runs, 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn locked_database_cannot_push_claim_past_the_whole_run_deadline() {
     let fixture = fixture();
@@ -427,7 +712,7 @@ async fn blocked_finalization_is_bounded_and_next_exclusive_startup_recovers() {
     let release = Arc::new(Notify::new());
     let provider = FakeProvider::gated(final_text("done"), entered.clone(), release.clone());
     let now = Utc.with_ymd_and_hms(2026, 9, 26, 6, 30, 0).unwrap();
-    let owned_store = fixture.store.with_runtime_owner(lease.owner_id()).unwrap();
+    let owned_store = lease.owned_store(&fixture.store).unwrap();
     let runner = CronAgentService::new(
         owned_store,
         provider,
@@ -472,7 +757,7 @@ async fn cancellation_interrupts_locked_finalization_without_late_mutation() {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let provider = FakeProvider::gated(final_text("done"), entered.clone(), release.clone());
-    let owned_store = fixture.store.with_runtime_owner(lease.owner_id()).unwrap();
+    let owned_store = lease.owned_store(&fixture.store).unwrap();
     let now = Utc.with_ymd_and_hms(2026, 9, 26, 6, 30, 0).unwrap();
     let runner = CronAgentService::new(
         owned_store,
@@ -622,7 +907,7 @@ async fn reconciliation_timeout_kills_the_crontab_preflight_process() {
         .unwrap();
     fixture.store.mark_job_sync_applied(job.id).unwrap();
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = common::private_tempdir();
     let executable = directory.path().join("fake-crontab");
     let escaped_marker = directory.path().join("preflight-completed");
     std::fs::write(
@@ -641,7 +926,7 @@ async fn reconciliation_timeout_kills_the_crontab_preflight_process() {
         CronSynchronizer::new(
             fixture.store.clone(),
             backend,
-            directory.path().join("cron.lock"),
+            fixture._directory.path().join("cron.lock"),
             "/opt/light-agent/bin/light-agent".into(),
         )
         .unwrap(),

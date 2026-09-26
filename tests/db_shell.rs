@@ -1,3 +1,5 @@
+mod common;
+
 use std::io::{BufReader, Cursor};
 use std::time::Duration;
 
@@ -5,7 +7,7 @@ use deepseek_cli::inspection::{DbShellLimits, InspectionError, ReadonlyDbShell};
 use deepseek_cli::store::Store;
 
 fn setup() -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::private_tempdir();
     let path = dir.path().join("agent.sqlite");
     let store = Store::open(&path).unwrap();
     store.create_dialog("one").unwrap();

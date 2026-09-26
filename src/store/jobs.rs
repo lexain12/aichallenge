@@ -472,6 +472,7 @@ impl Store {
                 };
             }
             self.require_runtime_owner(tx, runtime_owner_id.as_deref())?;
+            self.reject_pending_tools(tx, "cron_run", id.get())?;
             execute_one(
                 tx,
                 "UPDATE cron_runs SET status=?,result=?,safe_error_code=?,finished_at=?,runtime_owner_id=NULL WHERE id=?",
@@ -481,8 +482,20 @@ impl Store {
     }
 
     pub fn mark_missed_once_jobs(&self, current_time: DateTime<Utc>) -> Result<usize, StoreError> {
-        let mut db = self.connection()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.mark_missed_once_jobs_with_deadline(
+            current_time,
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+    }
+
+    pub(crate) fn mark_missed_once_jobs_with_deadline(
+        &self,
+        current_time: DateTime<Utc>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<usize, StoreError> {
+        self.with_immediate_transaction(deadline, cancellation, |tx| {
         let candidates = {
             let mut statement = tx.prepare("SELECT id,schedule_value FROM cron_jobs WHERE schedule_kind='once_at' AND desired_state='active'")?;
             statement
@@ -498,13 +511,13 @@ impl Store {
                 .with_timezone(&Utc);
             if at < minute_start(current_time) {
                 let job_id = JobId::from_str(&id).map_err(|_| StoreError::Database)?;
-                insert_terminal_run(&tx, job_id, at, CronRunStatus::Missed)?;
-                disable_once(&tx, job_id)?;
+                insert_terminal_run(tx, job_id, at, CronRunStatus::Missed)?;
+                disable_once(tx, job_id)?;
                 changed += 1;
             }
         }
-        tx.commit()?;
         Ok(changed)
+        })
     }
 
     pub fn mark_job_sync_applied(&self, id: JobId) -> Result<(), StoreError> {
@@ -532,28 +545,55 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn jobs_for_sync(&self) -> Result<Vec<CronJob>, StoreError> {
-        self.list_jobs()
+    pub(crate) fn jobs_for_sync_with_deadline(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<CronJob>, StoreError> {
+        self.with_immediate_transaction(deadline, cancellation, |tx| {
+            let mut statement = tx.prepare("SELECT id,source_dialog_id,name,schedule_kind,schedule_value,timezone,prompt,desired_state,sync_state,safe_sync_error_code,created_at,updated_at FROM cron_jobs ORDER BY created_at,id")?;
+            Ok(statement
+                .query_map([], decode_job)?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
     }
 
-    pub(crate) fn mark_sync_snapshot_applied(
+    pub(crate) fn mark_sync_snapshot_applied_with_deadline(
         &self,
         snapshot: &[CronJob],
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<(), StoreError> {
-        self.mark_sync_snapshot(snapshot, JobSyncState::Applied)
+        self.mark_sync_snapshot_with_deadline(
+            snapshot,
+            JobSyncState::Applied,
+            deadline,
+            cancellation,
+        )
     }
 
-    pub(crate) fn mark_sync_snapshot_failed(&self, snapshot: &[CronJob]) -> Result<(), StoreError> {
-        self.mark_sync_snapshot(snapshot, JobSyncState::Failed)
+    pub(crate) fn mark_sync_snapshot_failed_with_deadline(
+        &self,
+        snapshot: &[CronJob],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), StoreError> {
+        self.mark_sync_snapshot_with_deadline(
+            snapshot,
+            JobSyncState::Failed,
+            deadline,
+            cancellation,
+        )
     }
 
-    fn mark_sync_snapshot(
+    fn mark_sync_snapshot_with_deadline(
         &self,
         snapshot: &[CronJob],
         state: JobSyncState,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<(), StoreError> {
-        let mut db = self.connection()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.with_immediate_transaction(deadline, cancellation, |tx| {
         for job in snapshot {
             if state == JobSyncState::Failed && job.sync_state == JobSyncState::Applied {
                 continue;
@@ -581,8 +621,8 @@ impl Store {
                 }
             }
         }
-        tx.commit()?;
         Ok(())
+        })
     }
 }
 
