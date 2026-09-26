@@ -27,6 +27,8 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::Waker,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -822,6 +824,128 @@ async fn dialog_list_pages_multiple_maximum_titles_below_wire_limit() {
 }
 
 #[tokio::test]
+async fn malformed_request_error_is_drained_before_session_shutdown() {
+    let fixture = Fixture::new(FakeProvider::new([]));
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let released = Arc::new(AtomicBool::new(false));
+    let blocked = Arc::new(AtomicBool::new(false));
+    let waker = Arc::new(Mutex::new(None));
+    let writer = ReleasableGateWriter::new(
+        1,
+        capture.clone(),
+        blocked.clone(),
+        released.clone(),
+        waker.clone(),
+    );
+    let (mut client, remote) = duplex(MAX_LINE_BYTES);
+    let (remote_read, _remote_write) = split(remote);
+    let server = fixture.server;
+    let task = tokio::spawn(async move { server.serve(remote_read, writer).await });
+    use tokio::io::AsyncWriteExt as _;
+    client.write_all(b"not-json\n").await.unwrap();
+    client.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !blocked.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !task.is_finished(),
+        "server returned before the terminal protocol error was written"
+    );
+
+    released.store(true, Ordering::Release);
+    if let Some(waker) = waker.lock().unwrap().take() {
+        waker.wake();
+    }
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let events = capture.lock().unwrap().clone();
+    let frames = events
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<deepseek_cli::protocol::ServerEnvelope>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        frames.last().unwrap().event,
+        ServerEvent::ProtocolError { .. }
+    ));
+}
+
+#[tokio::test]
+async fn eof_interrupts_running_sqlite_for_inspection_and_export() {
+    for request in [
+        ClientRequest::Inspect {
+            kind: InspectKind::Dialogs,
+        },
+        ClientRequest::Export,
+    ] {
+        let fixture = Fixture::new(FakeProvider::new([]));
+        let path = fixture._dir.path().join("agent.sqlite");
+        let setup = rusqlite::Connection::open(path).unwrap();
+        setup
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DROP TABLE dialogs;
+                 CREATE TABLE inspection_slow_source(n INTEGER PRIMARY KEY);
+                 WITH digits(d) AS (
+                   VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+                 )
+                 INSERT INTO inspection_slow_source(n)
+                 SELECT hundreds.d * 100 + tens.d * 10 + ones.d
+                 FROM digits hundreds, digits tens, digits ones;
+                 CREATE VIEW dialogs AS
+                 SELECT a.n * 1000000 + b.n * 1000 + c.n AS id,
+                        'slow' AS title,
+                        '2026-09-26T00:00:00Z' AS created_at,
+                        '2026-09-26T00:00:00Z' AS updated_at
+                 FROM inspection_slow_source a
+                 CROSS JOIN inspection_slow_source b
+                 CROSS JOIN inspection_slow_source c;",
+            )
+            .unwrap();
+        drop(setup);
+        let inspection = fixture.inspection.clone();
+        let (client, remote) = duplex(MAX_LINE_BYTES);
+        let (_client_read, client_write) = split(client);
+        let (remote_read, remote_write) = split(remote);
+        let server = fixture.server;
+        let task = tokio::spawn(async move { server.serve(remote_read, remote_write).await });
+        let mut requests = NdjsonWriter::new(client_write);
+        requests
+            .write_request(&RequestEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: req(),
+                request,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inspection.active_snapshots() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let started = Instant::now();
+        requests.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .expect("EOF must interrupt the running SQLite query")
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(inspection.active_snapshots(), 0);
+    }
+}
+
+#[tokio::test]
 async fn blocked_stdout_still_processes_confirmation_and_eof() {
     let call = ModelToolCall {
         id: "schedule".into(),
@@ -1071,6 +1195,65 @@ struct GateWriter {
     complete_lines: usize,
     capture: Arc<Mutex<Vec<u8>>>,
     blocked: Arc<AtomicBool>,
+}
+
+struct ReleasableGateWriter {
+    line_limit: usize,
+    complete_lines: usize,
+    capture: Arc<Mutex<Vec<u8>>>,
+    blocked: Arc<AtomicBool>,
+    released: Arc<AtomicBool>,
+    waker: Arc<Mutex<Option<Waker>>>,
+}
+
+impl ReleasableGateWriter {
+    fn new(
+        line_limit: usize,
+        capture: Arc<Mutex<Vec<u8>>>,
+        blocked: Arc<AtomicBool>,
+        released: Arc<AtomicBool>,
+        waker: Arc<Mutex<Option<Waker>>>,
+    ) -> Self {
+        Self {
+            line_limit,
+            complete_lines: 0,
+            capture,
+            blocked,
+            released,
+            waker,
+        }
+    }
+}
+
+impl AsyncWrite for ReleasableGateWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        if self.complete_lines >= self.line_limit && !self.released.load(Ordering::Acquire) {
+            self.blocked.store(true, Ordering::Release);
+            *self.waker.lock().unwrap() = Some(cx.waker().clone());
+            return std::task::Poll::Pending;
+        }
+        self.capture.lock().unwrap().extend_from_slice(bytes);
+        self.complete_lines += bytes.iter().filter(|byte| **byte == b'\n').count();
+        std::task::Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 impl GateWriter {

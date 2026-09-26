@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 use chrono::{TimeZone, Utc};
 use chrono_tz::Europe::Moscow;
 use deepseek_cli::domain::{JobDesiredState, ToolOwner};
-use deepseek_cli::inspection::{InspectQuery, InspectionError, InspectionService};
+use deepseek_cli::inspection::{
+    InspectQuery, InspectionCancellation, InspectionError, InspectionService,
+};
 use deepseek_cli::scheduler::ScheduleSpec;
 use deepseek_cli::store::{
     CronRunFinish, JobCreate, RunClaim, SafeErrorCode, Store, ToolRunFinish, ToolRunStart,
@@ -364,6 +366,53 @@ fn deadline_interrupted_page_is_reported_as_snapshot_expired() {
         InspectionError::SnapshotExpired
     );
     assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[test]
+fn cancellation_interrupts_a_running_sqlite_page_and_joins_the_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.sqlite");
+    let store = Store::open(&path).unwrap();
+    let setup = rusqlite::Connection::open(&path).unwrap();
+    setup
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE dialogs;
+             CREATE TABLE inspection_slow_source(n INTEGER PRIMARY KEY);
+             WITH digits(d) AS (
+               VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+             )
+             INSERT INTO inspection_slow_source(n)
+             SELECT hundreds.d * 100 + tens.d * 10 + ones.d
+             FROM digits hundreds, digits tens, digits ones;
+             CREATE VIEW dialogs AS
+             SELECT a.n * 1000000 + b.n * 1000 + c.n AS id,
+                    'slow' AS title,
+                    '2026-09-26T00:00:00Z' AS created_at,
+                    '2026-09-26T00:00:00Z' AS updated_at
+             FROM inspection_slow_source a
+             CROSS JOIN inspection_slow_source b
+             CROSS JOIN inspection_slow_source c;",
+        )
+        .unwrap();
+    drop(setup);
+
+    let service = InspectionService::new(store);
+    let cancellation = InspectionCancellation::new();
+    let mut snapshot = service
+        .snapshot_with_cancellation(InspectQuery::Dialogs, cancellation.clone())
+        .unwrap();
+    let query = std::thread::spawn(move || snapshot.next_page());
+    std::thread::sleep(Duration::from_millis(25));
+    let started = Instant::now();
+    cancellation.cancel();
+
+    assert_eq!(
+        query.join().unwrap().unwrap_err(),
+        InspectionError::SnapshotExpired
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(service.active_snapshots(), 0);
 }
 
 #[test]

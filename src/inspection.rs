@@ -32,6 +32,7 @@ const HARD_MAX_COLUMNS: usize = 256;
 const HARD_MAX_CELL_BYTES: usize = 1_048_576;
 const HARD_MAX_OUTPUT_BYTES: usize = 67_108_864;
 const HARD_MAX_QUERY_TIME: Duration = Duration::from_secs(30);
+const CANCELLATION_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +102,28 @@ pub struct InspectionSnapshot {
     worker: Option<JoinHandle<()>>,
     complete: bool,
     deadline: Instant,
+    cancellation: InspectionCancellation,
+}
+
+/// Cloneable cooperative cancellation shared by the snapshot caller and its
+/// dedicated SQLite worker.
+#[derive(Clone, Debug, Default)]
+pub struct InspectionCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl InspectionCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 enum SnapshotCommand {
@@ -228,25 +251,35 @@ impl InspectionService {
     }
 
     pub fn snapshot(&self, query: InspectQuery) -> Result<InspectionSnapshot, InspectionError> {
+        self.snapshot_with_cancellation(query, InspectionCancellation::new())
+    }
+
+    pub fn snapshot_with_cancellation(
+        &self,
+        query: InspectQuery,
+        cancellation: InspectionCancellation,
+    ) -> Result<InspectionSnapshot, InspectionError> {
         let (commands, command_rx) = mpsc::sync_channel(1);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let store = self.store.clone();
         let page_size = self.page_size;
         let active_snapshots = self.active_snapshots.clone();
         let deadline = Instant::now() + self.snapshot_timeout;
+        let worker_cancellation = cancellation.clone();
         active_snapshots.fetch_add(1, Ordering::AcqRel);
         let worker = match thread::Builder::new()
             .name("light-agent-inspection".into())
             .spawn(move || {
-                run_snapshot_worker(
+                run_snapshot_worker(SnapshotWorker {
                     store,
                     query,
                     page_size,
                     deadline,
                     command_rx,
-                    ready_tx,
+                    ready: ready_tx,
                     active_snapshots,
-                )
+                    cancellation: worker_cancellation,
+                })
             }) {
             Ok(worker) => worker,
             Err(_) => {
@@ -254,22 +287,29 @@ impl InspectionService {
                 return Err(InspectionError::Store);
             }
         };
-        let startup_remaining = deadline.saturating_duration_since(Instant::now());
-        if startup_remaining.is_zero() {
-            drop(commands);
-            drop(worker);
-            return Err(InspectionError::SnapshotExpired);
-        }
-        match ready_rx.recv_timeout(startup_remaining) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                let _ = worker.join();
-                return Err(error);
-            }
-            Err(_) => {
+        loop {
+            if cancellation.is_cancelled() {
                 drop(commands);
-                drop(worker);
+                let _ = worker.join();
                 return Err(InspectionError::SnapshotExpired);
+            }
+            let startup_remaining = deadline.saturating_duration_since(Instant::now());
+            if startup_remaining.is_zero() {
+                drop(commands);
+                let _ = worker.join();
+                return Err(InspectionError::SnapshotExpired);
+            }
+            match ready_rx.recv_timeout(startup_remaining.min(CANCELLATION_POLL)) {
+                Ok(Ok(())) => break,
+                Ok(Err(error)) => {
+                    let _ = worker.join();
+                    return Err(error);
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    let _ = worker.join();
+                    return Err(InspectionError::SnapshotExpired);
+                }
             }
         }
         Ok(InspectionSnapshot {
@@ -277,6 +317,7 @@ impl InspectionService {
             worker: Some(worker),
             complete: false,
             deadline,
+            cancellation,
         })
     }
 
@@ -311,6 +352,10 @@ impl InspectionService {
 }
 
 impl InspectionSnapshot {
+    pub fn cancellation(&self) -> InspectionCancellation {
+        self.cancellation.clone()
+    }
+
     pub fn next_page(&mut self) -> Result<Option<InspectionResult>, InspectionError> {
         if self.complete {
             return Ok(None);
@@ -322,12 +367,36 @@ impl InspectionSnapshot {
             .ok_or(InspectionError::SnapshotExpired)?
             .try_send(SnapshotCommand::Next(reply_tx))
             .map_err(|_| InspectionError::SnapshotExpired)?;
-        let result = match reply_rx.recv_timeout(remaining) {
-            Ok(result) => result?,
-            Err(_) => {
+        let result = loop {
+            if self.cancellation.is_cancelled() {
                 self.complete = true;
                 self.commands.take();
+                self.join_worker()?;
                 return Err(InspectionError::SnapshotExpired);
+            }
+            match reply_rx.recv_timeout(remaining.min(CANCELLATION_POLL)) {
+                Ok(Ok(result)) => break result,
+                Ok(Err(error)) => {
+                    self.complete = true;
+                    self.commands.take();
+                    self.join_worker()?;
+                    return Err(error);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.remaining().is_err() {
+                        self.cancellation.cancel();
+                        self.complete = true;
+                        self.commands.take();
+                        self.join_worker()?;
+                        return Err(InspectionError::SnapshotExpired);
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.complete = true;
+                    self.commands.take();
+                    self.join_worker()?;
+                    return Err(InspectionError::SnapshotExpired);
+                }
             }
         };
         self.complete = result.complete;
@@ -378,6 +447,9 @@ impl InspectionSnapshot {
 
 impl Drop for InspectionSnapshot {
     fn drop(&mut self) {
+        if !self.complete || self.worker.is_some() {
+            self.cancellation.cancel();
+        }
         if let Some(commands) = self.commands.take() {
             let (reply_tx, _reply_rx) = mpsc::sync_channel(1);
             let _ = commands.try_send(SnapshotCommand::Close(reply_tx));
@@ -389,25 +461,42 @@ impl Drop for InspectionSnapshot {
     }
 }
 
-fn run_snapshot_worker(
+struct SnapshotWorker {
     store: Store,
     query: InspectQuery,
     page_size: usize,
     deadline: Instant,
-    commands: mpsc::Receiver<SnapshotCommand>,
+    command_rx: mpsc::Receiver<SnapshotCommand>,
     ready: SyncSender<Result<(), InspectionError>>,
     active_snapshots: Arc<AtomicUsize>,
-) {
+    cancellation: InspectionCancellation,
+}
+
+fn run_snapshot_worker(worker: SnapshotWorker) {
+    let SnapshotWorker {
+        store,
+        query,
+        page_size,
+        deadline,
+        command_rx: commands,
+        ready,
+        active_snapshots,
+        cancellation,
+    } = worker;
     let _active_guard = ActiveSnapshotGuard(active_snapshots);
-    let db = match open_snapshot_connection(&store, deadline) {
+    let db = match open_snapshot_connection(&store, deadline, &cancellation) {
         Ok(db) => db,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
     };
+    let progress_cancellation = cancellation.clone();
     if db
-        .progress_handler(1_000, Some(move || Instant::now() >= deadline))
+        .progress_handler(
+            1_000,
+            Some(move || progress_cancellation.is_cancelled() || Instant::now() >= deadline),
+        )
         .is_err()
     {
         let _ = db.execute_batch("ROLLBACK");
@@ -421,14 +510,25 @@ fn run_snapshot_worker(
 
     let mut offset = 0_u64;
     loop {
+        if cancellation.is_cancelled() {
+            let _ = db.execute_batch("ROLLBACK");
+            return;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             let _ = db.execute_batch("ROLLBACK");
             return;
         }
-        match commands.recv_timeout(remaining) {
+        match commands.recv_timeout(remaining.min(CANCELLATION_POLL)) {
             Ok(SnapshotCommand::Next(reply)) => {
-                let result = read_snapshot_page(&db, &query, page_size, &mut offset, deadline);
+                let result = read_snapshot_page(
+                    &db,
+                    &query,
+                    page_size,
+                    &mut offset,
+                    deadline,
+                    &cancellation,
+                );
                 let terminal = match &result {
                     Ok(page) => page.complete,
                     Err(_) => true,
@@ -446,7 +546,8 @@ fn run_snapshot_worker(
                 let _ = reply.send(result);
                 return;
             }
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
                 let _ = db.execute_batch("ROLLBACK");
                 return;
             }
@@ -465,29 +566,35 @@ impl Drop for ActiveSnapshotGuard {
 fn open_snapshot_connection(
     store: &Store,
     deadline: Instant,
+    cancellation: &InspectionCancellation,
 ) -> Result<Connection, InspectionError> {
-    deadline_remaining(deadline)?;
+    snapshot_remaining(deadline, cancellation)?;
     let db = map_snapshot_db(
         deadline,
+        cancellation,
         Connection::open_with_flags(
             store.database_path(),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ),
     )?;
 
-    configure_snapshot_connection(&db, deadline)?;
+    configure_snapshot_connection(&db, deadline, cancellation)?;
     // Validate a real read before BEGIN. If database startup is locked until
     // the deadline, the worker must exit without opening a late transaction.
-    read_schema_version_until_deadline(&db, deadline)?;
-    deadline_remaining(deadline)?;
-    map_snapshot_db(deadline, db.execute_batch("BEGIN DEFERRED TRANSACTION"))?;
-    if let Err(error) = deadline_remaining(deadline) {
+    read_schema_version_until_deadline(&db, deadline, cancellation)?;
+    snapshot_remaining(deadline, cancellation)?;
+    map_snapshot_db(
+        deadline,
+        cancellation,
+        db.execute_batch("BEGIN DEFERRED TRANSACTION"),
+    )?;
+    if let Err(error) = snapshot_remaining(deadline, cancellation) {
         let _ = db.execute_batch("ROLLBACK");
         return Err(error);
     }
     // BEGIN DEFERRED alone does not establish a read snapshot. This read does,
     // so mutations after snapshot() returns cannot enter later pages.
-    if let Err(error) = read_schema_version_until_deadline(&db, deadline) {
+    if let Err(error) = read_schema_version_until_deadline(&db, deadline, cancellation) {
         let _ = db.execute_batch("ROLLBACK");
         return Err(error);
     }
@@ -497,34 +604,44 @@ fn open_snapshot_connection(
 fn configure_snapshot_connection(
     db: &Connection,
     deadline: Instant,
+    cancellation: &InspectionCancellation,
 ) -> Result<(), InspectionError> {
-    let remaining = deadline_remaining(deadline)?;
-    map_snapshot_db(deadline, db.busy_timeout(remaining))?;
-    deadline_remaining(deadline)?;
-    map_snapshot_db(deadline, db.pragma_update(None, "query_only", true))?;
-    deadline_remaining(deadline)?;
+    let remaining = snapshot_remaining(deadline, cancellation)?;
+    map_snapshot_db(deadline, cancellation, db.busy_timeout(remaining))?;
+    snapshot_remaining(deadline, cancellation)?;
+    map_snapshot_db(
+        deadline,
+        cancellation,
+        db.pragma_update(None, "query_only", true),
+    )?;
+    snapshot_remaining(deadline, cancellation)?;
     Ok(())
 }
 
 fn read_schema_version_until_deadline(
     db: &Connection,
     deadline: Instant,
+    cancellation: &InspectionCancellation,
 ) -> Result<(), InspectionError> {
     loop {
-        let remaining = deadline_remaining(deadline)?;
-        map_snapshot_db(deadline, db.busy_timeout(remaining))?;
+        let remaining = snapshot_remaining(deadline, cancellation)?;
+        map_snapshot_db(
+            deadline,
+            cancellation,
+            db.busy_timeout(remaining.min(CANCELLATION_POLL)),
+        )?;
         let result = db.query_row("SELECT version FROM schema_version LIMIT 1", [], |_| Ok(()));
         match result {
-            Ok(()) => return deadline_remaining(deadline).map(|_| ()),
+            Ok(()) => return snapshot_remaining(deadline, cancellation).map(|_| ()),
             Err(error)
                 if matches!(
                     error.sqlite_error_code(),
                     Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
                 ) =>
             {
-                deadline_remaining(deadline)?;
+                snapshot_remaining(deadline, cancellation)?;
             }
-            Err(error) => return map_snapshot_db(deadline, Err(error)),
+            Err(error) => return map_snapshot_db(deadline, cancellation, Err(error)),
         }
     }
 }
@@ -538,26 +655,47 @@ fn deadline_remaining(deadline: Instant) -> Result<Duration, InspectionError> {
     }
 }
 
+fn snapshot_remaining(
+    deadline: Instant,
+    cancellation: &InspectionCancellation,
+) -> Result<Duration, InspectionError> {
+    if cancellation.is_cancelled() {
+        Err(InspectionError::SnapshotExpired)
+    } else {
+        deadline_remaining(deadline)
+    }
+}
+
 fn map_snapshot_db<T>(
     deadline: Instant,
+    cancellation: &InspectionCancellation,
     result: rusqlite::Result<T>,
 ) -> Result<T, InspectionError> {
     match result {
-        Ok(_value) if Instant::now() >= deadline => Err(InspectionError::SnapshotExpired),
+        Ok(_value) if cancellation.is_cancelled() || Instant::now() >= deadline => {
+            Err(InspectionError::SnapshotExpired)
+        }
         Ok(value) => Ok(value),
-        Err(_) if Instant::now() >= deadline => Err(InspectionError::SnapshotExpired),
+        Err(_) if cancellation.is_cancelled() || Instant::now() >= deadline => {
+            Err(InspectionError::SnapshotExpired)
+        }
         Err(_) => Err(InspectionError::Store),
     }
 }
 
 fn map_snapshot_query<T>(
     deadline: Instant,
+    cancellation: &InspectionCancellation,
     result: Result<T, InspectionError>,
 ) -> Result<T, InspectionError> {
     match result {
-        Ok(_value) if Instant::now() >= deadline => Err(InspectionError::SnapshotExpired),
+        Ok(_value) if cancellation.is_cancelled() || Instant::now() >= deadline => {
+            Err(InspectionError::SnapshotExpired)
+        }
         Ok(value) => Ok(value),
-        Err(_) if Instant::now() >= deadline => Err(InspectionError::SnapshotExpired),
+        Err(_) if cancellation.is_cancelled() || Instant::now() >= deadline => {
+            Err(InspectionError::SnapshotExpired)
+        }
         Err(error) => Err(error),
     }
 }
@@ -568,12 +706,14 @@ fn read_snapshot_page(
     page_size: usize,
     offset: &mut u64,
     deadline: Instant,
+    cancellation: &InspectionCancellation,
 ) -> Result<InspectionResult, InspectionError> {
-    let remaining = deadline_remaining(deadline)?;
-    map_snapshot_db(deadline, db.busy_timeout(remaining))?;
+    let remaining = snapshot_remaining(deadline, cancellation)?;
+    map_snapshot_db(deadline, cancellation, db.busy_timeout(remaining))?;
     let scope = CursorScope::from(query);
     let mut items = map_snapshot_query(
         deadline,
+        cancellation,
         (|| match query.clone() {
             InspectQuery::Dialogs => query_dialogs(db, *offset, page_size + 1),
             InspectQuery::History(dialog_id) => {

@@ -47,6 +47,43 @@ fn migration_creates_exact_v2_schema() {
 }
 
 #[test]
+fn dialog_pages_are_keyset_bounded_and_cover_each_dialog_once() {
+    let (_dir, store, _) = setup();
+    let created = (0..7)
+        .map(|index| store.create_dialog(&format!("dialog-{index}")).unwrap().id)
+        .collect::<Vec<_>>();
+
+    let first = store.list_dialogs_page(None, 3).unwrap();
+    let second = store
+        .list_dialogs_page(first.last().map(|dialog| dialog.id), 3)
+        .unwrap();
+    let third = store
+        .list_dialogs_page(second.last().map(|dialog| dialog.id), 3)
+        .unwrap();
+    let done = store
+        .list_dialogs_page(third.last().map(|dialog| dialog.id), 3)
+        .unwrap();
+
+    assert_eq!(first.len(), 3);
+    assert_eq!(second.len(), 3);
+    assert_eq!(third.len(), 1);
+    assert!(done.is_empty());
+    assert_eq!(
+        first
+            .into_iter()
+            .chain(second)
+            .chain(third)
+            .map(|dialog| dialog.id)
+            .collect::<Vec<_>>(),
+        created
+    );
+    assert_eq!(
+        store.list_dialogs_page(None, 0),
+        Err(StoreError::InvalidMetadata)
+    );
+}
+
+#[test]
 fn completed_history_excludes_failed_interrupted_and_pending_turns() {
     let (_dir, store, _) = setup();
     let d = store.create_dialog("test").unwrap().id;

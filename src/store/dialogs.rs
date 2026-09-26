@@ -13,6 +13,7 @@ pub struct Dialog {
 }
 
 pub type DialogSummary = Dialog;
+const MAX_DIALOG_PAGE_SIZE: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +69,51 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_dialogs_page(
+        &self,
+        after: Option<DialogId>,
+        limit: usize,
+    ) -> Result<Vec<DialogSummary>, StoreError> {
+        if limit == 0 || limit > MAX_DIALOG_PAGE_SIZE {
+            return Err(StoreError::InvalidMetadata);
+        }
+        let limit = i64::try_from(limit).map_err(|_| StoreError::InvalidMetadata)?;
+        let after = after.map(DialogId::get).unwrap_or(0);
+        let db = self.connection()?;
+        let mut statement = db.prepare(
+            "SELECT id,title,created_at,updated_at FROM dialogs
+             WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(params![after, limit], |row| {
+                Ok(Dialog {
+                    id: DialogId::new(row.get(0)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    title: row.get(1)?,
+                    created_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn get_dialog(&self, id: DialogId) -> Result<DialogSummary, StoreError> {
+        let db = self.connection()?;
+        db.query_row(
+            "SELECT id,title,created_at,updated_at FROM dialogs WHERE id=?1",
+            [id.get()],
+            |row| {
+                Ok(Dialog {
+                    id: DialogId::new(row.get(0)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    title: row.get(1)?,
+                    created_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::NotFound)
     }
 
     pub fn rename_dialog(&self, id: DialogId, title: &str) -> Result<(), StoreError> {

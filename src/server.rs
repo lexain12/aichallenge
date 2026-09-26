@@ -21,7 +21,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     agent_runner::{AgentError, AgentEvent, AgentInput, AgentRunner, ToolEventCode},
     domain::{ConfirmationId, DialogId, RequestId, ToolOwner},
-    inspection::{InspectQuery, InspectionError, InspectionService, LogicalExportV1},
+    inspection::{
+        InspectQuery, InspectionCancellation, InspectionError, InspectionService, LogicalExportV1,
+    },
     protocol::{
         EXPORT_CHUNK_BYTES, InspectKind, NdjsonReader, NdjsonWriter, PROTOCOL_VERSION,
         ProtocolError, ProtocolErrorCode, RequestEnvelope, ServerEnvelope, ServerEvent,
@@ -44,6 +46,9 @@ const MAX_ACTIVE_TURNS: usize = 8;
 const MAX_BACKGROUND_REQUESTS: usize = 8;
 const FRAGMENT_BYTES: usize = 64 * 1024;
 const USED_CONFIRMATIONS: usize = 1024;
+const CONFIRMATION_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const TERMINAL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const DIALOG_FETCH_LIMIT: usize = 2;
 
 #[derive(Clone)]
 pub struct ServerDependencies {
@@ -119,6 +124,7 @@ pub struct SessionConfirmationBroker {
     state: Mutex<ConfirmationState>,
     prompts: mpsc::Sender<ConfirmationPrompt>,
     clock: Arc<dyn ConfirmationClock>,
+    timeout: std::time::Duration,
 }
 
 struct UtcClock;
@@ -136,6 +142,13 @@ impl SessionConfirmationBroker {
     fn pair_with_clock(
         clock: Arc<dyn ConfirmationClock>,
     ) -> (Arc<Self>, mpsc::Receiver<ConfirmationPrompt>) {
+        Self::pair_with_clock_and_timeout(clock, CONFIRMATION_TTL)
+    }
+
+    fn pair_with_clock_and_timeout(
+        clock: Arc<dyn ConfirmationClock>,
+        timeout: std::time::Duration,
+    ) -> (Arc<Self>, mpsc::Receiver<ConfirmationPrompt>) {
         let (prompts, receiver) = mpsc::channel(EVENT_QUEUE);
         (
             Arc::new(Self {
@@ -146,6 +159,7 @@ impl SessionConfirmationBroker {
                 }),
                 prompts,
                 clock,
+                timeout,
             }),
             receiver,
         )
@@ -204,6 +218,19 @@ impl SessionConfirmationBroker {
             }
         }
     }
+
+    fn expire_pending(&self, confirmation_id: ConfirmationId) -> Result<bool, ConfirmationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConfirmationError::Unavailable)?;
+        let Some(pending) = state.pending.remove(&confirmation_id) else {
+            return Ok(false);
+        };
+        remember_used(&mut state, confirmation_id);
+        drop(pending);
+        Ok(true)
+    }
 }
 
 fn remember_used(state: &mut ConfirmationState, id: ConfirmationId) {
@@ -222,6 +249,11 @@ impl ConfirmationBroker for SessionConfirmationBroker {
             if self.clock.now() >= request.expires_at {
                 return Err(ConfirmationError::Expired);
             }
+            let until_request_expiry = (request.expires_at - self.clock.now())
+                .to_std()
+                .map_err(|_| ConfirmationError::Expired)?;
+            let timeout = self.timeout.min(until_request_expiry);
+            let deadline = tokio::time::Instant::now() + timeout;
             let (answer, response) = oneshot::channel();
             {
                 let mut state = self
@@ -241,19 +273,33 @@ impl ConfirmationBroker for SessionConfirmationBroker {
                     },
                 );
             }
-            if self
-                .prompts
-                .send(ConfirmationPrompt {
-                    request_id: request.request_id,
-                    request: request.clone(),
-                })
-                .await
-                .is_err()
-            {
-                self.clear();
-                return Err(ConfirmationError::Unavailable);
+            let prompt = ConfirmationPrompt {
+                request_id: request.request_id,
+                request: request.clone(),
+            };
+            tokio::select! {
+                result = self.prompts.send(prompt) => {
+                    if result.is_err() {
+                        self.clear();
+                        return Err(ConfirmationError::Unavailable);
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    if self.expire_pending(request.id)? {
+                        return Err(ConfirmationError::Expired);
+                    }
+                }
             }
-            let resolution = response.await.map_err(|_| ConfirmationError::Unavailable)?;
+            let mut response = Box::pin(response);
+            let resolution = match tokio::time::timeout_at(deadline, &mut response).await {
+                Ok(response) => response.map_err(|_| ConfirmationError::Unavailable)?,
+                Err(_) => {
+                    if self.expire_pending(request.id)? {
+                        return Err(ConfirmationError::Expired);
+                    }
+                    response.await.map_err(|_| ConfirmationError::Unavailable)?
+                }
+            };
             if resolution.request_id != request.request_id {
                 return Err(ConfirmationError::WrongRequest);
             }
@@ -314,8 +360,19 @@ impl StdioServer {
                         }
                     }
                     Some(InputEvent::ProtocolError(code)) => {
-                        let _ = queue_event(&output_tx, RequestId::new(), ServerEvent::ProtocolError { code }, None);
-                        break Ok(());
+                        let (ack, delivered) = oneshot::channel();
+                        if queue_event(
+                            &output_tx,
+                            RequestId::new(),
+                            ServerEvent::ProtocolError { code },
+                            Some(ack),
+                        ).is_err() {
+                            break Err(ServerError::Protocol);
+                        }
+                        match tokio::time::timeout(TERMINAL_DRAIN_TIMEOUT, delivered).await {
+                            Ok(Ok(Ok(()))) => break Ok(()),
+                            _ => break Err(ServerError::Protocol),
+                        }
                     }
                     Some(InputEvent::Eof) | None => break Ok(()),
                 },
@@ -395,26 +452,21 @@ impl StdioServer {
                     }
                 }
             }
-            OpenDialog { dialog_id } => {
-                match self
-                    .dependencies
-                    .store
-                    .list_dialogs()?
-                    .into_iter()
-                    .find(|d| d.id == dialog_id)
-                {
-                    Some(dialog) => queue_event(
-                        output,
-                        request_id,
-                        ServerEvent::DialogOpened {
-                            dialog_id,
-                            title: dialog.title,
-                        },
-                        None,
-                    )?,
-                    None => queue_error(output, request_id, ProtocolErrorCode::InvalidRequest)?,
+            OpenDialog { dialog_id } => match self.dependencies.store.get_dialog(dialog_id) {
+                Ok(dialog) => queue_event(
+                    output,
+                    request_id,
+                    ServerEvent::DialogOpened {
+                        dialog_id,
+                        title: dialog.title,
+                    },
+                    None,
+                )?,
+                Err(StoreError::NotFound) => {
+                    queue_error(output, request_id, ProtocolErrorCode::InvalidRequest)?
                 }
-            }
+                Err(_) => queue_error(output, request_id, ProtocolErrorCode::InternalError)?,
+            },
             RenameDialog { dialog_id, title } => {
                 if !valid_title(&title, self.dependencies.settings.max_message_bytes()) {
                     queue_error(output, request_id, ProtocolErrorCode::ContentTooLong)?;
@@ -682,7 +734,7 @@ struct ActiveTurn {
 }
 
 struct BackgroundTask {
-    cancellation: CancellationToken,
+    cancellation: InspectionCancellation,
     task: JoinHandle<()>,
 }
 
@@ -937,46 +989,58 @@ fn start_dialog_list(
     request_id: RequestId,
     events: mpsc::Sender<InternalEvent>,
 ) -> BackgroundTask {
-    let cancellation = CancellationToken::new();
+    let cancellation = InspectionCancellation::new();
     let task_cancellation = cancellation.clone();
     let task = tokio::task::spawn_blocking(move || {
-        let dialogs = match store.list_dialogs() {
-            Ok(dialogs) => dialogs,
-            Err(_) => {
-                send_protocol_error(&events, request_id, &task_cancellation);
+        let mut after = None;
+        let mut sequence = 0_u64;
+        loop {
+            if task_cancellation.is_cancelled() {
                 return;
             }
-        };
-        if dialogs.is_empty() {
-            let _ = send_internal(
-                &events,
-                request_id,
-                ServerEvent::DialogList {
-                    sequence: 0,
-                    dialogs: Vec::new(),
-                    complete: true,
-                },
-                &task_cancellation,
-            );
-            return;
-        }
-        let total = dialogs.len();
-        for (index, dialog) in dialogs.into_iter().enumerate() {
+            let page = match store.list_dialogs_page(after, DIALOG_FETCH_LIMIT) {
+                Ok(page) => page,
+                Err(_) => {
+                    send_protocol_error(&events, request_id, &task_cancellation);
+                    return;
+                }
+            };
+            let Some(dialog) = page.first() else {
+                if sequence == 0 {
+                    let _ = send_internal(
+                        &events,
+                        request_id,
+                        ServerEvent::DialogList {
+                            sequence,
+                            dialogs: Vec::new(),
+                            complete: true,
+                        },
+                        &task_cancellation,
+                    );
+                }
+                return;
+            };
+            let complete = page.len() == 1;
+            after = Some(dialog.id);
             if !send_internal(
                 &events,
                 request_id,
                 ServerEvent::DialogList {
-                    sequence: index as u64,
+                    sequence,
                     dialogs: vec![crate::protocol::DialogSummary {
                         id: dialog.id,
-                        title: dialog.title,
+                        title: dialog.title.clone(),
                     }],
-                    complete: index + 1 == total,
+                    complete,
                 },
                 &task_cancellation,
             ) {
                 return;
             }
+            if complete {
+                return;
+            }
+            sequence += 1;
         }
     });
     BackgroundTask { cancellation, task }
@@ -988,13 +1052,15 @@ fn start_inspection(
     kind: InspectKind,
     events: mpsc::Sender<InternalEvent>,
 ) -> BackgroundTask {
-    let cancellation = CancellationToken::new();
+    let cancellation = InspectionCancellation::new();
     let task_cancellation = cancellation.clone();
     let task = tokio::task::spawn_blocking(move || {
         if task_cancellation.is_cancelled() {
             return;
         }
-        let mut snapshot = match service.snapshot(inspect_query(&kind)) {
+        let mut snapshot = match service
+            .snapshot_with_cancellation(inspect_query(&kind), task_cancellation.clone())
+        {
             Ok(value) => value,
             Err(_) => {
                 send_protocol_error(&events, request_id, &task_cancellation);
@@ -1083,7 +1149,7 @@ fn send_internal(
     events: &mpsc::Sender<InternalEvent>,
     request_id: RequestId,
     event: ServerEvent,
-    cancellation: &CancellationToken,
+    cancellation: &InspectionCancellation,
 ) -> bool {
     let mut pending = InternalEvent {
         request_id,
@@ -1109,7 +1175,7 @@ fn send_internal(
 fn send_protocol_error(
     events: &mpsc::Sender<InternalEvent>,
     request_id: RequestId,
-    cancellation: &CancellationToken,
+    cancellation: &InspectionCancellation,
 ) {
     if !cancellation.is_cancelled() {
         let _ = send_internal(
@@ -1128,7 +1194,7 @@ struct ChunkWriter {
     events: mpsc::Sender<InternalEvent>,
     sequence: u64,
     buffer: Vec<u8>,
-    cancellation: CancellationToken,
+    cancellation: InspectionCancellation,
     total_bytes: u64,
     digest: Sha256,
 }
@@ -1176,7 +1242,7 @@ fn start_export(
     request_id: RequestId,
     events: mpsc::Sender<InternalEvent>,
 ) -> BackgroundTask {
-    let cancellation = CancellationToken::new();
+    let cancellation = InspectionCancellation::new();
     let task_cancellation = cancellation.clone();
     let task = tokio::task::spawn_blocking(move || {
         let mut writer = ChunkWriter {
@@ -1188,7 +1254,9 @@ fn start_export(
             total_bytes: 0,
             digest: Sha256::new(),
         };
-        let mut snapshot = match service.snapshot(InspectQuery::Dump) {
+        let mut snapshot = match service
+            .snapshot_with_cancellation(InspectQuery::Dump, task_cancellation.clone())
+        {
             Ok(snapshot) => snapshot,
             Err(_) => {
                 send_protocol_error(&events, request_id, &task_cancellation);
@@ -1405,5 +1473,104 @@ mod tests {
         assert_eq!(broker.resolve(request_id, prompt.request.id, true), Ok(()));
         assert!(task.await.unwrap().unwrap().is_error);
         assert!(store.list_jobs().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unanswered_confirmation_expires_without_a_real_five_minute_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+        let dialog = store.create_dialog("dialog").unwrap().id;
+        let synchronizer = Arc::new(
+            CronSynchronizer::new(
+                store.clone(),
+                Arc::new(Backend),
+                dir.path().join("cron.lock"),
+                PathBuf::from("/opt/light-agent/bin/light-agent"),
+            )
+            .unwrap(),
+        );
+        let clock = Arc::new(MutableClock(Arc::new(Mutex::new(
+            Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap(),
+        ))));
+        let request_id = RequestId::new();
+        let (broker, mut prompts) = SessionConfirmationBroker::pair_with_clock_and_timeout(
+            clock.clone(),
+            std::time::Duration::from_millis(20),
+        );
+        let executor = Arc::new(SchedulerToolExecutor::new_with_clock(
+            store.clone(),
+            synchronizer,
+            broker.clone(),
+            dialog,
+            request_id,
+            clock,
+        ));
+        let task = tokio::spawn(async move { executor.call(&create_call("expires")).await });
+        let prompt = prompts.recv().await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(250), task)
+            .await
+            .expect("unanswered confirmation must expire")
+            .unwrap()
+            .unwrap();
+        assert!(result.is_error);
+        assert!(store.list_jobs().unwrap().is_empty());
+        assert_eq!(
+            broker.resolve(request_id, prompt.request.id, true),
+            Err(ConfirmationError::AlreadyUsed)
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmation_and_expiry_race_has_one_single_use_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+        let dialog = store.create_dialog("dialog").unwrap().id;
+        let synchronizer = Arc::new(
+            CronSynchronizer::new(
+                store.clone(),
+                Arc::new(Backend),
+                dir.path().join("cron.lock"),
+                PathBuf::from("/opt/light-agent/bin/light-agent"),
+            )
+            .unwrap(),
+        );
+        let clock = Arc::new(MutableClock(Arc::new(Mutex::new(
+            Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap(),
+        ))));
+        let request_id = RequestId::new();
+        let (broker, mut prompts) = SessionConfirmationBroker::pair_with_clock_and_timeout(
+            clock.clone(),
+            std::time::Duration::from_millis(20),
+        );
+        let executor = Arc::new(SchedulerToolExecutor::new_with_clock(
+            store.clone(),
+            synchronizer,
+            broker.clone(),
+            dialog,
+            request_id,
+            clock,
+        ));
+        let task = tokio::spawn(async move { executor.call(&create_call("race")).await });
+        let prompt = prompts.recv().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let resolution = broker.resolve(request_id, prompt.request.id, true);
+        let result = task.await.unwrap().unwrap();
+
+        match resolution {
+            Ok(()) => {
+                assert!(!result.is_error);
+                assert_eq!(store.list_jobs().unwrap().len(), 1);
+            }
+            Err(ConfirmationError::AlreadyUsed | ConfirmationError::Expired) => {
+                assert!(result.is_error);
+                assert!(store.list_jobs().unwrap().is_empty());
+            }
+            other => panic!("unexpected race result: {other:?}"),
+        }
+        assert_eq!(
+            broker.resolve(request_id, prompt.request.id, true),
+            Err(ConfirmationError::AlreadyUsed)
+        );
     }
 }
