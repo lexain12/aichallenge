@@ -31,7 +31,8 @@ pub struct SchedulePreview {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_id: Option<JobId>,
     pub name: String,
-    pub schedule: String,
+    pub schedule_kind: String,
+    pub schedule_value: String,
     pub timezone: String,
     pub prompt: String,
 }
@@ -535,18 +536,21 @@ fn preview_for(
     schedule: &ScheduleSpec,
     prompt: &str,
 ) -> SchedulePreview {
-    let schedule_text = match schedule {
-        ScheduleSpec::Cron { expression, .. } => expression.clone(),
-        ScheduleSpec::OnceAt { at, timezone } => at
-            .with_timezone(timezone)
-            .format("%Y-%m-%dT%H:%M")
-            .to_string(),
+    let (schedule_kind, schedule_value) = match schedule {
+        ScheduleSpec::Cron { expression, .. } => ("cron", expression.clone()),
+        ScheduleSpec::OnceAt { at, timezone } => (
+            "once_at",
+            at.with_timezone(timezone)
+                .format("%Y-%m-%dT%H:%M")
+                .to_string(),
+        ),
     };
     SchedulePreview {
         action,
         job_id,
         name: name.to_owned(),
-        schedule: schedule_text,
+        schedule_kind: schedule_kind.to_owned(),
+        schedule_value,
         timezone: schedule.timezone().to_string(),
         prompt: prompt.to_owned(),
     }

@@ -1,9 +1,10 @@
 use base64::Engine as _;
 use deepseek_cli::domain::{ConfirmationId, DialogId, JobId, RequestId};
 use deepseek_cli::protocol::{
-    ClientRequest, DialogSummary, EXPORT_CHUNK_BYTES, InspectKind, MAX_CONTENT_BYTES,
-    MAX_LINE_BYTES, NdjsonReader, NdjsonWriter, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
-    RequestEnvelope, ServerEnvelope, ServerEvent,
+    ClientRequest, ConfirmationAction, ConfirmationScheduleKind, DialogSummary, EXPORT_CHUNK_BYTES,
+    InspectKind, MAX_CONTENT_BYTES, MAX_LINE_BYTES, NdjsonReader, NdjsonWriter, PROTOCOL_VERSION,
+    ProtocolError, ProtocolErrorCode, RequestEnvelope, ScheduleConfirmationPreview, ServerEnvelope,
+    ServerEvent,
 };
 use serde_json::json;
 use tokio::io::AsyncReadExt;
@@ -47,9 +48,11 @@ fn round_trips_every_request_and_event() {
         },
         ClientRequest::ConfirmAction {
             confirmation_id: confirmation_id(),
+            originating_request_id: request_id(),
         },
         ClientRequest::CancelAction {
             confirmation_id: confirmation_id(),
+            originating_request_id: request_id(),
         },
         ClientRequest::Inspect {
             kind: InspectKind::Job { job_id: job_id() },
@@ -96,8 +99,19 @@ fn round_trips_every_request_and_event() {
         },
         ServerEvent::ConfirmationRequired {
             confirmation_id: confirmation_id(),
-            description: "Run daily".into(),
-            prompt: "Summarize".into(),
+            preview: ScheduleConfirmationPreview {
+                action: ConfirmationAction::Create,
+                job_id: None,
+                name: "Run daily".into(),
+                schedule_kind: ConfirmationScheduleKind::Cron,
+                schedule_value: "0 9 * * *".into(),
+                timezone: "Europe/Moscow".into(),
+                task: "Summarize".into(),
+            },
+        },
+        ServerEvent::ConfirmationResolved {
+            confirmation_id: confirmation_id(),
+            accepted: true,
         },
         ServerEvent::TurnPrepared {
             answer: "Hello".into(),
@@ -331,8 +345,15 @@ async fn rejects_message_and_prompt_over_256_kib() {
         request_id: request_id(),
         event: ServerEvent::ConfirmationRequired {
             confirmation_id: confirmation_id(),
-            description: "create job".into(),
-            prompt: long,
+            preview: ScheduleConfirmationPreview {
+                action: ConfirmationAction::Create,
+                job_id: None,
+                name: "create job".into(),
+                schedule_kind: ConfirmationScheduleKind::Cron,
+                schedule_value: "0 9 * * *".into(),
+                timezone: "Europe/Moscow".into(),
+                task: long,
+            },
         },
     };
     let error = writer.write_event(&event).await.unwrap_err();

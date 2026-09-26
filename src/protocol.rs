@@ -14,6 +14,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_LINE_BYTES: usize = 1_048_576;
 pub const MAX_CONTENT_BYTES: usize = 262_144;
 pub const EXPORT_CHUNK_BYTES: usize = 65_536;
+const MAX_CONFIRMATION_NAME_BYTES: usize = 256;
+const MAX_CONFIRMATION_SCHEDULE_BYTES: usize = 128;
+const MAX_CONFIRMATION_TIMEZONE_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -100,9 +103,11 @@ pub enum ClientRequest {
     },
     ConfirmAction {
         confirmation_id: ConfirmationId,
+        originating_request_id: RequestId,
     },
     CancelAction {
         confirmation_id: ConfirmationId,
+        originating_request_id: RequestId,
     },
     Inspect {
         kind: InspectKind,
@@ -127,6 +132,36 @@ pub enum InspectKind {
     },
     Audit,
     Dump,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmationAction {
+    Create,
+    Update,
+    Enable,
+    Disable,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmationScheduleKind {
+    Cron,
+    OnceAt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleConfirmationPreview {
+    pub action: ConfirmationAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<JobId>,
+    pub name: String,
+    pub schedule_kind: ConfirmationScheduleKind,
+    pub schedule_value: String,
+    pub timezone: String,
+    pub task: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -171,8 +206,11 @@ pub enum ServerEvent {
     },
     ConfirmationRequired {
         confirmation_id: ConfirmationId,
-        description: String,
-        prompt: String,
+        preview: ScheduleConfirmationPreview,
+    },
+    ConfirmationResolved {
+        confirmation_id: ConfirmationId,
+        accepted: bool,
     },
     /// The full answer has reached the transport, but the durable turn has not
     /// yet been committed. Clients must wait for `turn_completed`.
@@ -227,8 +265,15 @@ impl ServerEnvelope {
             ServerEvent::TextDelta { text } if text.len() > MAX_CONTENT_BYTES => {
                 Err(ProtocolError::ContentTooLong)
             }
-            ServerEvent::ConfirmationRequired { prompt, .. }
-                if prompt.len() > MAX_CONTENT_BYTES =>
+            ServerEvent::ConfirmationRequired { preview, .. }
+                if preview.name.is_empty()
+                    || preview.name.len() > MAX_CONFIRMATION_NAME_BYTES
+                    || preview.schedule_value.is_empty()
+                    || preview.schedule_value.len() > MAX_CONFIRMATION_SCHEDULE_BYTES
+                    || preview.timezone.is_empty()
+                    || preview.timezone.len() > MAX_CONFIRMATION_TIMEZONE_BYTES
+                    || preview.task.is_empty()
+                    || preview.task.len() > MAX_CONTENT_BYTES =>
             {
                 Err(ProtocolError::ContentTooLong)
             }

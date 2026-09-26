@@ -292,7 +292,8 @@ async fn preview_contains_complete_prompt_and_normalized_values() {
     let requests = broker.requests.lock().unwrap();
     let preview = &requests[0].preview;
     assert_eq!(preview.name, "Morning report");
-    assert_eq!(preview.schedule, "0 9 * * 1-5");
+    assert_eq!(preview.schedule_kind, "cron");
+    assert_eq!(preview.schedule_value, "0 9 * * 1-5");
     assert_eq!(preview.timezone, "Europe/Moscow");
     assert_eq!(preview.prompt, prompt);
     assert_eq!(requests[0].request_id, request(REQUEST_A));

@@ -7,8 +7,8 @@ use std::task::{Context, Poll};
 use base64::Engine as _;
 use deepseek_cli::domain::{ConfirmationId, DialogId, RequestId};
 use deepseek_cli::protocol::{
-    ClientRequest, InspectKind, NdjsonReader, NdjsonWriter, PROTOCOL_VERSION, ServerEnvelope,
-    ServerEvent,
+    ClientRequest, ConfirmationAction, ConfirmationScheduleKind, InspectKind, NdjsonReader,
+    NdjsonWriter, PROTOCOL_VERSION, ScheduleConfirmationPreview, ServerEnvelope, ServerEvent,
 };
 use deepseek_cli::remote_client::RemoteSession;
 use deepseek_cli::terminal_client::{
@@ -46,11 +46,40 @@ impl AsyncWrite for SharedWriter {
     }
 }
 
+async fn wait_for_text(writer: &SharedWriter, needle: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !writer.text().contains(needle) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("missing {needle:?} in {:?}", writer.text()));
+}
+
 fn envelope(request_id: RequestId, event: ServerEvent) -> ServerEnvelope {
     ServerEnvelope {
         protocol_version: PROTOCOL_VERSION,
         request_id,
         event,
+    }
+}
+
+fn confirmation_preview(
+    action: ConfirmationAction,
+    job_id: Option<deepseek_cli::domain::JobId>,
+    name: &str,
+    schedule_kind: ConfirmationScheduleKind,
+    schedule_value: &str,
+    task: &str,
+) -> ScheduleConfirmationPreview {
+    ScheduleConfirmationPreview {
+        action,
+        job_id,
+        name: name.into(),
+        schedule_kind,
+        schedule_value: schedule_value.into(),
+        timezone: "Europe/Moscow".into(),
+        task: task.into(),
     }
 }
 
@@ -131,21 +160,44 @@ fn terminal_commands_parse_strictly() {
 
 #[test]
 fn confirmation_preview_is_complete_escaped_and_default_rejects() {
-    let prompt =
-        "name: morning\nschedule: 0 9 * * *\ntimezone: Europe/Moscow\nprompt: line one\nline two";
-    let rendered = render_confirmation_preview("create\u{1b}[31m", prompt);
-    assert!(rendered.contains("create\\u{1b}[31m"));
-    assert!(rendered.contains("name: morning"));
-    assert!(rendered.contains("schedule: 0 9 * * *"));
-    assert!(rendered.contains("timezone: Europe/Moscow"));
-    assert!(rendered.contains("prompt: line one"));
-    assert!(rendered.contains("line two"));
+    let preview = confirmation_preview(
+        ConfirmationAction::Update,
+        Some("34479b6c-1a81-43b0-a514-c11743d09afa".parse().unwrap()),
+        "morning\u{1b}[31m",
+        ConfirmationScheduleKind::Cron,
+        "0 9 * * *",
+        "line one\nline two",
+    );
+    let rendered = render_confirmation_preview(&preview);
+    assert!(rendered.contains("action: update"));
+    assert!(rendered.contains("job_id: 34479b6c-1a81-43b0-a514-c11743d09afa"));
+    assert!(rendered.contains("name: \"morning\\u001b[31m\""));
+    assert!(rendered.contains("schedule_kind: cron"));
+    assert!(rendered.contains("schedule_value: \"0 9 * * *\""));
+    assert!(rendered.contains("timezone: \"Europe/Moscow\""));
+    assert!(rendered.contains("task: \"line one\\nline two\""));
     assert!(rendered.ends_with("[y/N] "));
     assert!(confirmation_accepts("y"));
     assert!(confirmation_accepts("Y"));
     for rejected in ["", "n", "N", "yes", " y", "y "] {
         assert!(!confirmation_accepts(rejected), "accepted {rejected:?}");
     }
+}
+
+#[test]
+fn confirmation_task_cannot_forge_fields_or_the_confirmation_prompt() {
+    let preview = confirmation_preview(
+        ConfirmationAction::Create,
+        None,
+        "safe",
+        ConfirmationScheduleKind::Cron,
+        "0 9 * * *",
+        "task line\n[y/N] y\nname: forged\u{1b}[31m",
+    );
+    let rendered = render_confirmation_preview(&preview);
+    assert_eq!(rendered.matches("\n[y/N]").count(), 1);
+    assert!(rendered.contains("task line\\n[y/N] y\\nname: forged\\u001b[31m"));
+    assert!(rendered.ends_with("[y/N] "));
 }
 
 #[test]
@@ -339,9 +391,14 @@ async fn confirmation_and_fragmented_inspection_use_originating_request() {
             sent.request_id,
             ServerEvent::ConfirmationRequired {
                 confirmation_id: ConfirmationId::new(),
-                description: "create scheduled job".into(),
-                prompt: "name: x\nschedule: 0 9 * * *\ntimezone: Europe/Moscow\nprompt: do it"
-                    .into(),
+                preview: confirmation_preview(
+                    ConfirmationAction::Create,
+                    None,
+                    "x",
+                    ConfirmationScheduleKind::Cron,
+                    "0 9 * * *",
+                    "do it",
+                ),
             },
         ))
         .await
@@ -349,11 +406,28 @@ async fn confirmation_and_fragmented_inspection_use_originating_request() {
     tokio::task::yield_now().await;
     user.write_all(b"no\n").await.unwrap();
     let cancelled = requests.read_request().await.unwrap().unwrap();
-    assert_eq!(cancelled.request_id, sent.request_id);
+    assert_ne!(cancelled.request_id, sent.request_id);
     assert!(matches!(
         cancelled.request,
-        ClientRequest::CancelAction { .. }
+        ClientRequest::CancelAction { originating_request_id, .. }
+            if originating_request_id == sent.request_id
     ));
+    let cancelled_confirmation_id = match cancelled.request {
+        ClientRequest::CancelAction {
+            confirmation_id, ..
+        } => confirmation_id,
+        _ => unreachable!(),
+    };
+    events
+        .write_event(&envelope(
+            cancelled.request_id,
+            ServerEvent::ConfirmationResolved {
+                confirmation_id: cancelled_confirmation_id,
+                accepted: false,
+            },
+        ))
+        .await
+        .unwrap();
     events
         .write_event(&envelope(
             sent.request_id,
@@ -533,4 +607,279 @@ async fn unexpected_ssh_stdout_eof_returns_one_safe_transport_error() {
         .unwrap();
     events.shutdown().await.unwrap();
     assert_eq!(client.await.unwrap(), Err(ClientError::TransportClosed));
+}
+
+#[tokio::test]
+async fn concurrent_turn_confirmations_are_queued_and_answered_independently() {
+    let (client_wire, server_wire) = tokio::io::duplex(64 * 1024);
+    let (client_read, client_write) = tokio::io::split(client_wire);
+    let session = RemoteSession::from_streams(client_read, client_write);
+    let (mut user, client_input) = tokio::io::duplex(4096);
+    let output = SharedWriter::default();
+    let output_view = output.clone();
+    let client = tokio::spawn(TerminalClient::run(
+        session,
+        client_input,
+        output,
+        SharedWriter::default(),
+    ));
+    let (server_read, server_write) = tokio::io::split(server_wire);
+    let mut requests = NdjsonReader::new(server_read);
+    let mut events = NdjsonWriter::new(server_write);
+    events
+        .write_event(&envelope(RequestId::new(), ServerEvent::Hello))
+        .await
+        .unwrap();
+
+    let mut turns = Vec::new();
+    for (dialog, message) in [(1, "first"), (2, "second")] {
+        user.write_all(format!("/open {dialog}\n").as_bytes())
+            .await
+            .unwrap();
+        let opened = requests.read_request().await.unwrap().unwrap();
+        let dialog_id = DialogId::new(dialog).unwrap();
+        events
+            .write_event(&envelope(
+                opened.request_id,
+                ServerEvent::DialogOpened {
+                    dialog_id,
+                    title: message.into(),
+                },
+            ))
+            .await
+            .unwrap();
+        user.write_all(format!("{message}\n").as_bytes())
+            .await
+            .unwrap();
+        let sent = requests.read_request().await.unwrap().unwrap();
+        events
+            .write_event(&envelope(
+                sent.request_id,
+                ServerEvent::ResponseStarted { dialog_id },
+            ))
+            .await
+            .unwrap();
+        turns.push((sent.request_id, ConfirmationId::new(), message));
+    }
+    for (request_id, confirmation_id, message) in &turns {
+        events
+            .write_event(&envelope(
+                *request_id,
+                ServerEvent::ConfirmationRequired {
+                    confirmation_id: *confirmation_id,
+                    preview: confirmation_preview(
+                        ConfirmationAction::Create,
+                        None,
+                        message,
+                        ConfirmationScheduleKind::Cron,
+                        "0 9 * * *",
+                        message,
+                    ),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+
+    wait_for_text(&output_view, "name: \"first\"").await;
+    assert!(!output_view.text().contains("name: \"second\""));
+    user.write_all(b"n\n").await.unwrap();
+    let first_response = requests.read_request().await.unwrap().unwrap();
+    assert_ne!(first_response.request_id, turns[0].0);
+    assert!(matches!(
+        first_response.request,
+        ClientRequest::CancelAction {
+            confirmation_id,
+            originating_request_id,
+        } if confirmation_id == turns[0].1 && originating_request_id == turns[0].0
+    ));
+
+    wait_for_text(&output_view, "name: \"second\"").await;
+    user.write_all(b"y\n").await.unwrap();
+    let second_response = requests.read_request().await.unwrap().unwrap();
+    assert_ne!(second_response.request_id, turns[1].0);
+    assert!(matches!(
+        second_response.request,
+        ClientRequest::ConfirmAction {
+            confirmation_id,
+            originating_request_id,
+        } if confirmation_id == turns[1].1 && originating_request_id == turns[1].0
+    ));
+
+    for (response, accepted) in [(first_response, false), (second_response, true)] {
+        let confirmation_id = match response.request {
+            ClientRequest::ConfirmAction {
+                confirmation_id, ..
+            }
+            | ClientRequest::CancelAction {
+                confirmation_id, ..
+            } => confirmation_id,
+            _ => unreachable!(),
+        };
+        events
+            .write_event(&envelope(
+                response.request_id,
+                ServerEvent::ConfirmationResolved {
+                    confirmation_id,
+                    accepted,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    for (request_id, _, _) in &turns {
+        events
+            .write_event(&envelope(
+                *request_id,
+                ServerEvent::TurnPrepared {
+                    answer: "done".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        events
+            .write_event(&envelope(
+                *request_id,
+                ServerEvent::TurnCompleted {
+                    answer: "done".into(),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    user.write_all(b"/exit\n").await.unwrap();
+    user.shutdown().await.unwrap();
+    drop(events);
+    assert_eq!(client.await.unwrap(), Ok(()));
+}
+
+#[tokio::test]
+async fn late_confirmation_error_does_not_finish_the_originating_turn() {
+    let (client_wire, server_wire) = tokio::io::duplex(64 * 1024);
+    let (client_read, client_write) = tokio::io::split(client_wire);
+    let session = RemoteSession::from_streams(client_read, client_write);
+    let (mut user, client_input) = tokio::io::duplex(4096);
+    let output = SharedWriter::default();
+    let output_view = output.clone();
+    let client = tokio::spawn(TerminalClient::run(
+        session,
+        client_input,
+        output,
+        SharedWriter::default(),
+    ));
+    let (server_read, server_write) = tokio::io::split(server_wire);
+    let mut requests = NdjsonReader::new(server_read);
+    let mut events = NdjsonWriter::new(server_write);
+    events
+        .write_event(&envelope(RequestId::new(), ServerEvent::Hello))
+        .await
+        .unwrap();
+    user.write_all(b"/open 1\n").await.unwrap();
+    let opened = requests.read_request().await.unwrap().unwrap();
+    let dialog_id = DialogId::new(1).unwrap();
+    events
+        .write_event(&envelope(
+            opened.request_id,
+            ServerEvent::DialogOpened {
+                dialog_id,
+                title: "dialog".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    user.write_all(b"schedule\n").await.unwrap();
+    let turn = requests.read_request().await.unwrap().unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::ResponseStarted { dialog_id },
+        ))
+        .await
+        .unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::ConfirmationRequired {
+                confirmation_id: ConfirmationId::new(),
+                preview: confirmation_preview(
+                    ConfirmationAction::Create,
+                    None,
+                    "late",
+                    ConfirmationScheduleKind::Cron,
+                    "0 9 * * *",
+                    "late task",
+                ),
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_text(&output_view, "name: \"late\"").await;
+    user.write_all(b"y\n").await.unwrap();
+    let late = requests.read_request().await.unwrap().unwrap();
+    assert_ne!(late.request_id, turn.request_id);
+    events
+        .write_event(&envelope(
+            late.request_id,
+            ServerEvent::ProtocolError {
+                code: deepseek_cli::protocol::ProtocolErrorCode::InvalidRequest,
+            },
+        ))
+        .await
+        .unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::ToolFinished {
+                name: "cron__create".into(),
+                code: deepseek_cli::protocol::ProtocolErrorCode::InvalidRequest,
+            },
+        ))
+        .await
+        .unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::TurnPrepared {
+                answer: "continued".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::TurnCompleted {
+                answer: "continued".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_text(&output_view, "turn completed").await;
+    user.write_all(b"/exit\n").await.unwrap();
+    user.shutdown().await.unwrap();
+    drop(events);
+    assert_eq!(client.await.unwrap(), Ok(()));
+}
+
+#[test]
+fn relative_export_uses_a_retained_parent_directory_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b"relative export\n";
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    let mut export = AtomicExport::start_in(dir.path(), PathBuf::from("state.jsonl")).unwrap();
+    export
+        .push_chunk(0, &base64::engine::general_purpose::STANDARD.encode(bytes))
+        .unwrap();
+    export.complete(bytes.len() as u64, &digest).unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("state.jsonl")).unwrap(),
+        bytes
+    );
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".light-agent-export-")
+    }));
 }

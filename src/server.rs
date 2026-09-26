@@ -25,8 +25,9 @@ use crate::{
         InspectQuery, InspectionCancellation, InspectionError, InspectionService, LogicalExportV1,
     },
     protocol::{
-        EXPORT_CHUNK_BYTES, InspectKind, NdjsonReader, NdjsonWriter, PROTOCOL_VERSION,
-        ProtocolError, ProtocolErrorCode, RequestEnvelope, ServerEnvelope, ServerEvent,
+        ConfirmationAction, ConfirmationScheduleKind, EXPORT_CHUNK_BYTES, InspectKind,
+        NdjsonReader, NdjsonWriter, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+        RequestEnvelope, ScheduleConfirmationPreview, ServerEnvelope, ServerEvent,
     },
     provider::Provider,
     scheduler::CronSynchronizer,
@@ -36,7 +37,7 @@ use crate::{
         CompositeToolExecutor, ToolExecutor,
         scheduler::{
             ConfirmationBroker, ConfirmationClock, ConfirmationError, ConfirmationFuture,
-            ConfirmationRequest, ScheduleAction, SchedulerToolExecutor,
+            ConfirmationRequest, ScheduleAction, SchedulePreview, SchedulerToolExecutor,
         },
     },
 };
@@ -399,11 +400,10 @@ impl StdioServer {
                     }
                 }
                 Some(prompt) = prompts_rx.recv() => {
-                    let description = action_description(prompt.request.preview.action).to_owned();
+                    let preview = wire_confirmation_preview(prompt.request.preview)?;
                     if let Err(error) = queue_event(&output_tx, prompt.request_id, ServerEvent::ConfirmationRequired {
                         confirmation_id: prompt.request.id,
-                        description,
-                        prompt: prompt.request.preview.prompt,
+                        preview,
                     }, None) {
                         break Err(error);
                     }
@@ -566,14 +566,46 @@ impl StdioServer {
                     }
                 }
             }
-            ConfirmAction { confirmation_id } => {
-                if broker.resolve(request_id, confirmation_id, true).is_err() {
+            ConfirmAction {
+                confirmation_id,
+                originating_request_id,
+            } => {
+                if broker
+                    .resolve(originating_request_id, confirmation_id, true)
+                    .is_err()
+                {
                     queue_error(output, request_id, ProtocolErrorCode::InvalidRequest)?;
+                } else {
+                    queue_event(
+                        output,
+                        request_id,
+                        ServerEvent::ConfirmationResolved {
+                            confirmation_id,
+                            accepted: true,
+                        },
+                        None,
+                    )?;
                 }
             }
-            CancelAction { confirmation_id } => {
-                if broker.resolve(request_id, confirmation_id, false).is_err() {
+            CancelAction {
+                confirmation_id,
+                originating_request_id,
+            } => {
+                if broker
+                    .resolve(originating_request_id, confirmation_id, false)
+                    .is_err()
+                {
                     queue_error(output, request_id, ProtocolErrorCode::InvalidRequest)?;
+                } else {
+                    queue_event(
+                        output,
+                        request_id,
+                        ServerEvent::ConfirmationResolved {
+                            confirmation_id,
+                            accepted: false,
+                        },
+                        None,
+                    )?;
                 }
             }
             Inspect { kind } => {
@@ -978,14 +1010,30 @@ fn valid_title(title: &str, max: usize) -> bool {
     !title.trim().is_empty() && title.len() <= max
 }
 
-fn action_description(action: ScheduleAction) -> &'static str {
-    match action {
-        ScheduleAction::Create => "create scheduled job",
-        ScheduleAction::Update => "update scheduled job",
-        ScheduleAction::Enable => "enable scheduled job",
-        ScheduleAction::Disable => "disable scheduled job",
-        ScheduleAction::Delete => "delete scheduled job",
-    }
+fn wire_confirmation_preview(
+    preview: SchedulePreview,
+) -> Result<ScheduleConfirmationPreview, ServerError> {
+    let action = match preview.action {
+        ScheduleAction::Create => ConfirmationAction::Create,
+        ScheduleAction::Update => ConfirmationAction::Update,
+        ScheduleAction::Enable => ConfirmationAction::Enable,
+        ScheduleAction::Disable => ConfirmationAction::Disable,
+        ScheduleAction::Delete => ConfirmationAction::Delete,
+    };
+    let schedule_kind = match preview.schedule_kind.as_str() {
+        "cron" => ConfirmationScheduleKind::Cron,
+        "once_at" => ConfirmationScheduleKind::OnceAt,
+        _ => return Err(ServerError::Protocol),
+    };
+    Ok(ScheduleConfirmationPreview {
+        action,
+        job_id: preview.job_id,
+        name: preview.name,
+        schedule_kind,
+        schedule_value: preview.schedule_value,
+        timezone: preview.timezone,
+        task: preview.prompt,
+    })
 }
 
 fn inspect_query(kind: &InspectKind) -> InspectQuery {

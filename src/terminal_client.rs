@@ -1,6 +1,6 @@
 //! Interactive terminal coordination and safe local export handling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
@@ -16,8 +16,9 @@ use tokio::sync::mpsc;
 
 use crate::domain::{ConfirmationId, DialogId, JobId, RequestId};
 use crate::protocol::{
-    ClientRequest, EXPORT_CHUNK_BYTES, InspectKind, MAX_CONTENT_BYTES, PROTOCOL_VERSION,
-    ProtocolErrorCode, RequestEnvelope, ServerEnvelope, ServerEvent,
+    ClientRequest, ConfirmationAction, ConfirmationScheduleKind, EXPORT_CHUNK_BYTES, InspectKind,
+    MAX_CONTENT_BYTES, PROTOCOL_VERSION, ProtocolErrorCode, RequestEnvelope,
+    ScheduleConfirmationPreview, ServerEnvelope, ServerEvent,
 };
 use crate::remote_client::RemoteSession;
 
@@ -161,27 +162,36 @@ pub fn confirmation_accepts(input: &str) -> bool {
     matches!(input, "y" | "Y")
 }
 
-pub fn render_confirmation_preview(description: &str, prompt: &str) -> String {
+pub fn render_confirmation_preview(preview: &ScheduleConfirmationPreview) -> String {
+    let action = match preview.action {
+        ConfirmationAction::Create => "create",
+        ConfirmationAction::Update => "update",
+        ConfirmationAction::Enable => "enable",
+        ConfirmationAction::Disable => "disable",
+        ConfirmationAction::Delete => "delete",
+    };
+    let schedule_kind = match preview.schedule_kind {
+        ConfirmationScheduleKind::Cron => "cron",
+        ConfirmationScheduleKind::OnceAt => "once_at",
+    };
+    let job_id = preview
+        .job_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "new".into());
     format!(
-        "Confirm {}:\n{}\n[y/N] ",
-        escape_terminal_bounded(description, MAX_LABEL_BYTES),
-        escape_terminal(prompt)
+        "Confirm scheduled job change:\naction: {}\njob_id: {}\nname: {}\nschedule_kind: {}\nschedule_value: {}\ntimezone: {}\ntask: {}\n[y/N] ",
+        action,
+        job_id,
+        quoted_terminal_field(&preview.name),
+        schedule_kind,
+        quoted_terminal_field(&preview.schedule_value),
+        quoted_terminal_field(&preview.timezone),
+        quoted_terminal_field(&preview.task),
     )
 }
 
-fn escape_terminal(value: &str) -> String {
-    let mut escaped = String::new();
-    for character in value.chars() {
-        match character {
-            '\n' => escaped.push('\n'),
-            '\t' => escaped.push('\t'),
-            character if character.is_control() => {
-                escaped.extend(character.escape_default());
-            }
-            character => escaped.push(character),
-        }
-    }
-    escaped
+fn quoted_terminal_field(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
 fn escape_terminal_bounded(value: &str, maximum: usize) -> String {
@@ -200,6 +210,7 @@ fn escape_terminal_bounded(value: &str, maximum: usize) -> String {
 pub struct AtomicExport {
     destination: PathBuf,
     temporary: PathBuf,
+    directory: File,
     file: Option<File>,
     sequence: u64,
     total_bytes: u64,
@@ -209,8 +220,24 @@ pub struct AtomicExport {
 
 impl AtomicExport {
     pub fn start(destination: impl AsRef<Path>) -> Result<Self, ClientError> {
-        let destination = destination.as_ref().to_owned();
-        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        let current_directory = std::env::current_dir().map_err(|_| ClientError::Export)?;
+        Self::start_in(current_directory, destination)
+    }
+
+    pub fn start_in(
+        current_directory: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<Self, ClientError> {
+        let destination = if destination.as_ref().is_absolute() {
+            destination.as_ref().to_owned()
+        } else {
+            current_directory.as_ref().join(destination)
+        };
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = File::open(parent).map_err(|_| ClientError::Export)?;
         let name = destination
             .file_name()
             .and_then(|value| value.to_str())
@@ -230,6 +257,7 @@ impl AtomicExport {
         Ok(Self {
             destination,
             temporary,
+            directory,
             file: Some(file),
             sequence: 0,
             total_bytes: 0,
@@ -273,11 +301,7 @@ impl AtomicExport {
         file.sync_all().map_err(|_| ClientError::Export)?;
         drop(file);
         std::fs::rename(&self.temporary, &self.destination).map_err(|_| ClientError::Export)?;
-        if let Some(parent) = self.destination.parent()
-            && let Ok(directory) = File::open(parent)
-        {
-            directory.sync_all().map_err(|_| ClientError::Export)?;
-        }
+        self.directory.sync_all().map_err(|_| ClientError::Export)?;
         self.committed = true;
         Ok(())
     }
@@ -325,16 +349,31 @@ impl TerminalClient {
                 input = input_rx.recv() => {
                     match input {
                         Some(TerminalInput::Line(line)) => {
-                            if let Some(confirmation) = state.confirmation.take() {
+                            if let Some(confirmation) = state.confirmations.pop_front() {
                                 let accepted = confirmation_accepts(&line);
                                 let request = if accepted {
-                                    ClientRequest::ConfirmAction { confirmation_id: confirmation.confirmation_id }
+                                    ClientRequest::ConfirmAction {
+                                        confirmation_id: confirmation.confirmation_id,
+                                        originating_request_id: confirmation.originating_request_id,
+                                    }
                                 } else {
-                                    ClientRequest::CancelAction { confirmation_id: confirmation.confirmation_id }
+                                    ClientRequest::CancelAction {
+                                        confirmation_id: confirmation.confirmation_id,
+                                        originating_request_id: confirmation.originating_request_id,
+                                    }
                                 };
-                                if let Err(failure) = send_request(&mut session, confirmation.request_id, request).await {
+                                let response_id = RequestId::new();
+                                if let Err(failure) = send_request(&mut session, response_id, request).await {
                                     break Err(failure);
                                 }
+                                state.pending.insert(
+                                    response_id,
+                                    PendingRequest::ConfirmationResponse {
+                                        confirmation_id: confirmation.confirmation_id,
+                                        accepted,
+                                    },
+                                );
+                                render_next_confirmation(&state, &mut output).await?;
                             } else {
                                 match parse_terminal_input(&line) {
                                     Ok(ClientAction::Exit) => break Ok(()),
@@ -352,9 +391,12 @@ impl TerminalClient {
                             }
                         }
                         Some(TerminalInput::Eof) | None => {
-                            if let Some(confirmation) = state.confirmation.take() {
-                                let request = ClientRequest::CancelAction { confirmation_id: confirmation.confirmation_id };
-                                let _ = send_request(&mut session, confirmation.request_id, request).await;
+                            while let Some(confirmation) = state.confirmations.pop_front() {
+                                let request = ClientRequest::CancelAction {
+                                    confirmation_id: confirmation.confirmation_id,
+                                    originating_request_id: confirmation.originating_request_id,
+                                };
+                                let _ = send_request(&mut session, RequestId::new(), request).await;
                             }
                             break Ok(());
                         }
@@ -462,12 +504,13 @@ where
 struct ClientState {
     active_dialog: Option<DialogId>,
     pending: HashMap<RequestId, PendingRequest>,
-    confirmation: Option<PendingConfirmation>,
+    confirmations: VecDeque<PendingConfirmation>,
 }
 
 struct PendingConfirmation {
-    request_id: RequestId,
+    originating_request_id: RequestId,
     confirmation_id: ConfirmationId,
+    preview: ScheduleConfirmationPreview,
 }
 
 enum PendingRequest {
@@ -481,6 +524,10 @@ enum PendingRequest {
     Turn {
         dialog_id: DialogId,
         prepared: bool,
+    },
+    ConfirmationResponse {
+        confirmation_id: ConfirmationId,
+        accepted: bool,
     },
     Inspection(InspectionAssembler),
     Export(AtomicExport),
@@ -594,6 +641,7 @@ where
         .get_mut(&request_id)
         .ok_or(ClientError::Protocol)?;
     let mut finished = false;
+    let mut drop_confirmations = false;
     match (&mut *pending, envelope.event) {
         (
             PendingRequest::Dialogs { sequence, deleted },
@@ -676,28 +724,31 @@ where
                 .write_all(line.as_bytes())
                 .await
                 .map_err(|_| ClientError::Output)?;
+            drop_confirmations = true;
         }
         (
             PendingRequest::Turn { .. },
             ServerEvent::ConfirmationRequired {
                 confirmation_id,
-                description,
-                prompt,
+                preview,
             },
         ) => {
-            if state.confirmation.is_some() {
+            if state
+                .confirmations
+                .iter()
+                .any(|pending| pending.confirmation_id == confirmation_id)
+            {
                 return Err(ClientError::Protocol);
             }
-            let preview = render_confirmation_preview(&description, &prompt);
-            output
-                .write_all(preview.as_bytes())
-                .await
-                .map_err(|_| ClientError::Output)?;
-            output.flush().await.map_err(|_| ClientError::Output)?;
-            state.confirmation = Some(PendingConfirmation {
-                request_id,
+            let display_now = state.confirmations.is_empty();
+            state.confirmations.push_back(PendingConfirmation {
+                originating_request_id: request_id,
                 confirmation_id,
+                preview,
             });
+            if display_now {
+                render_next_confirmation(state, output).await?;
+            }
         }
         (PendingRequest::Turn { prepared, .. }, ServerEvent::TurnPrepared { .. }) => {
             if *prepared {
@@ -718,6 +769,7 @@ where
                 .await
                 .map_err(|_| ClientError::Output)?;
             finished = true;
+            drop_confirmations = true;
         }
         (PendingRequest::Turn { .. }, ServerEvent::TurnFailed { code }) => {
             let line = format!("turn failed: {}\n", safe_code(code));
@@ -725,6 +777,19 @@ where
                 .write_all(line.as_bytes())
                 .await
                 .map_err(|_| ClientError::Output)?;
+            finished = true;
+            drop_confirmations = true;
+        }
+        (
+            PendingRequest::ConfirmationResponse {
+                confirmation_id: expected,
+                accepted: expected_accepted,
+            },
+            ServerEvent::ConfirmationResolved {
+                confirmation_id,
+                accepted,
+            },
+        ) if confirmation_id == *expected && accepted == *expected_accepted => {
             finished = true;
         }
         (
@@ -783,19 +848,49 @@ where
                 .write_all(line.as_bytes())
                 .await
                 .map_err(|_| ClientError::Output)?;
+            drop_confirmations = matches!(pending, PendingRequest::Turn { .. });
             finished = true;
         }
         _ => return Err(ClientError::Protocol),
     }
+    if drop_confirmations {
+        remove_confirmations_for_request(state, request_id, output).await?;
+    }
     if finished {
-        if state
-            .confirmation
-            .as_ref()
-            .is_some_and(|confirmation| confirmation.request_id == request_id)
-        {
-            state.confirmation = None;
-        }
         state.pending.remove(&request_id);
+    }
+    Ok(())
+}
+
+async fn render_next_confirmation<O: AsyncWrite + Unpin>(
+    state: &ClientState,
+    output: &mut O,
+) -> Result<(), ClientError> {
+    let Some(confirmation) = state.confirmations.front() else {
+        return Ok(());
+    };
+    let rendered = render_confirmation_preview(&confirmation.preview);
+    output
+        .write_all(rendered.as_bytes())
+        .await
+        .map_err(|_| ClientError::Output)?;
+    output.flush().await.map_err(|_| ClientError::Output)
+}
+
+async fn remove_confirmations_for_request<O: AsyncWrite + Unpin>(
+    state: &mut ClientState,
+    request_id: RequestId,
+    output: &mut O,
+) -> Result<(), ClientError> {
+    let removed_front = state
+        .confirmations
+        .front()
+        .is_some_and(|confirmation| confirmation.originating_request_id == request_id);
+    state
+        .confirmations
+        .retain(|confirmation| confirmation.originating_request_id != request_id);
+    if removed_front {
+        render_next_confirmation(state, output).await?;
     }
     Ok(())
 }

@@ -4,8 +4,8 @@ use deepseek_cli::{
     domain::{RequestId, ToolOwner, ToolRunStatus},
     inspection::InspectionService,
     protocol::{
-        ClientRequest, InspectKind, MAX_LINE_BYTES, NdjsonReader, NdjsonWriter, PROTOCOL_VERSION,
-        RequestEnvelope, ServerEvent,
+        ClientRequest, ConfirmationAction, ConfirmationScheduleKind, InspectKind, MAX_LINE_BYTES,
+        NdjsonReader, NdjsonWriter, PROTOCOL_VERSION, RequestEnvelope, ServerEvent,
     },
     provider::{
         AssistantTurn, ModelToolCall, ModelToolDefinition, Provider, ProviderError, ProviderFuture,
@@ -15,6 +15,7 @@ use deepseek_cli::{
     server::{ServerDependencies, StdioServer},
     settings::ServerSettings,
     store::{JobCreate, SafeErrorCode, Store, ToolRunStart},
+    terminal_client::render_confirmation_preview,
     tools::{ToolExecutionError, ToolExecutor, ToolFuture, ToolRoute},
 };
 use serde_json::json;
@@ -462,10 +463,28 @@ async fn confirmation_routes_only_to_originating_request() {
         match event.event {
             ServerEvent::ConfirmationRequired {
                 confirmation_id: id,
-                prompt,
+                preview,
                 ..
             } => {
-                assert_eq!(prompt, "prepare report");
+                assert_eq!(preview.task, "prepare report");
+                assert_eq!(preview.action, ConfirmationAction::Create);
+                assert_eq!(preview.job_id, None);
+                assert_eq!(preview.name, "report");
+                assert_eq!(preview.schedule_kind, ConfirmationScheduleKind::Cron);
+                assert_eq!(preview.schedule_value, "0 9 * * *");
+                assert_eq!(preview.timezone, "Europe/Moscow");
+                let rendered = render_confirmation_preview(&preview);
+                for expected in [
+                    "action: create",
+                    "job_id: new",
+                    "name: \"report\"",
+                    "schedule_kind: cron",
+                    "schedule_value: \"0 9 * * *\"",
+                    "timezone: \"Europe/Moscow\"",
+                    "task: \"prepare report\"",
+                ] {
+                    assert!(rendered.contains(expected), "missing {expected:?}");
+                }
                 confirmation_id = Some(id);
             }
             ServerEvent::ToolStarted { .. } => tool_started = true,
@@ -476,31 +495,151 @@ async fn confirmation_routes_only_to_originating_request() {
     let confirmation_id = confirmation_id.unwrap();
     let wrong = req();
     session
-        .send(wrong, ClientRequest::ConfirmAction { confirmation_id })
+        .send(
+            wrong,
+            ClientRequest::ConfirmAction {
+                confirmation_id,
+                originating_request_id: wrong,
+            },
+        )
         .await;
     let rejected = session.event().await;
     assert_eq!(rejected.request_id, wrong);
     assert!(matches!(rejected.event, ServerEvent::ProtocolError { .. }));
     assert!(store.list_jobs().unwrap().is_empty());
+    let accepted = req();
     session
-        .send(origin, ClientRequest::ConfirmAction { confirmation_id })
+        .send(
+            accepted,
+            ClientRequest::ConfirmAction {
+                confirmation_id,
+                originating_request_id: origin,
+            },
+        )
         .await;
     loop {
-        if matches!(
-            session.event().await.event,
-            ServerEvent::TurnCompleted { .. }
-        ) {
+        let event = session.event().await;
+        if event.request_id == accepted {
+            assert!(matches!(
+                event.event,
+                ServerEvent::ConfirmationResolved { accepted: true, .. }
+            ));
+        } else if matches!(event.event, ServerEvent::TurnCompleted { .. }) {
             break;
         }
     }
     assert_eq!(store.list_jobs().unwrap().len(), 1);
+    let replay = req();
     session
-        .send(origin, ClientRequest::ConfirmAction { confirmation_id })
+        .send(
+            replay,
+            ClientRequest::ConfirmAction {
+                confirmation_id,
+                originating_request_id: origin,
+            },
+        )
         .await;
+    let replay_event = session.event().await;
+    assert_eq!(replay_event.request_id, replay);
     assert!(matches!(
-        session.event().await.event,
+        replay_event.event,
         ServerEvent::ProtocolError { .. }
     ));
+}
+
+#[tokio::test]
+async fn existing_job_confirmation_wire_renders_the_complete_normalized_snapshot() {
+    let provider = FakeProvider::new([]);
+    let fixture = Fixture::new(provider.clone());
+    let dialog = fixture.store.create_dialog("chat").unwrap().id;
+    let job = fixture
+        .store
+        .create_job(JobCreate {
+            source_dialog_id: dialog,
+            name: "existing report".into(),
+            schedule: ScheduleSpec::parse_cron("5 10 * * 1-5", Moscow).unwrap(),
+            prompt: "full existing task\nsecond line".into(),
+        })
+        .unwrap();
+    let call = ModelToolCall {
+        id: "disable".into(),
+        name: "cron__disable".into(),
+        arguments: json!({"job_id":job.id}).to_string(),
+    };
+    provider
+        .replies
+        .lock()
+        .unwrap()
+        .extend([Reply::ToolCall(call), Reply::Final("not changed".into())]);
+    let mut session = Session::start(fixture.server).await;
+    session.event().await;
+    let origin = req();
+    session
+        .send(
+            origin,
+            ClientRequest::SendMessage {
+                dialog_id: dialog,
+                message: "disable it".into(),
+            },
+        )
+        .await;
+    let (confirmation_id, rendered) = loop {
+        let event = session.event().await;
+        assert_eq!(event.request_id, origin);
+        if let ServerEvent::ConfirmationRequired {
+            confirmation_id,
+            preview,
+        } = event.event
+        {
+            assert_eq!(preview.action, ConfirmationAction::Disable);
+            assert_eq!(preview.job_id, Some(job.id));
+            assert_eq!(preview.name, "existing report");
+            assert_eq!(preview.schedule_kind, ConfirmationScheduleKind::Cron);
+            assert_eq!(preview.schedule_value, "5 10 * * 1-5");
+            assert_eq!(preview.timezone, "Europe/Moscow");
+            assert_eq!(preview.task, "full existing task\nsecond line");
+            break (confirmation_id, render_confirmation_preview(&preview));
+        }
+    };
+    for expected in [
+        "action: disable",
+        &format!("job_id: {}", job.id),
+        "name: \"existing report\"",
+        "schedule_kind: cron",
+        "schedule_value: \"5 10 * * 1-5\"",
+        "timezone: \"Europe/Moscow\"",
+        "task: \"full existing task\\nsecond line\"",
+    ] {
+        assert!(rendered.contains(expected), "missing {expected:?}");
+    }
+    let response = req();
+    session
+        .send(
+            response,
+            ClientRequest::CancelAction {
+                confirmation_id,
+                originating_request_id: origin,
+            },
+        )
+        .await;
+    loop {
+        let event = session.event().await;
+        if event.request_id == response {
+            assert!(matches!(
+                event.event,
+                ServerEvent::ConfirmationResolved {
+                    accepted: false,
+                    ..
+                }
+            ));
+        } else if matches!(event.event, ServerEvent::TurnCompleted { .. }) {
+            break;
+        }
+    }
+    assert_eq!(
+        fixture.store.get_job(job.id).unwrap().desired_state,
+        deepseek_cli::domain::JobDesiredState::Active
+    );
 }
 
 #[tokio::test]
@@ -579,11 +718,18 @@ async fn unanswered_confirmation_expires_and_finalizes_audited_turn() {
         ["schedule it", "not scheduled"]
     );
 
+    let late = req();
     session
-        .send(origin, ClientRequest::ConfirmAction { confirmation_id })
+        .send(
+            late,
+            ClientRequest::ConfirmAction {
+                confirmation_id,
+                originating_request_id: origin,
+            },
+        )
         .await;
     let replay = session.event().await;
-    assert_eq!(replay.request_id, origin);
+    assert_eq!(replay.request_id, late);
     assert!(matches!(replay.event, ServerEvent::ProtocolError { .. }));
 }
 
@@ -1255,7 +1401,10 @@ async fn blocked_stdout_still_processes_confirmation_and_eof() {
         .write_request(&RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id: wrong,
-            request: ClientRequest::ConfirmAction { confirmation_id },
+            request: ClientRequest::ConfirmAction {
+                confirmation_id,
+                originating_request_id: wrong,
+            },
         })
         .await
         .unwrap();
@@ -1272,6 +1421,7 @@ async fn blocked_stdout_still_processes_confirmation_and_eof() {
             request_id: req(),
             request: ClientRequest::CancelAction {
                 confirmation_id: deepseek_cli::domain::ConfirmationId::new(),
+                originating_request_id: origin,
             },
         })
         .await
@@ -1279,8 +1429,11 @@ async fn blocked_stdout_still_processes_confirmation_and_eof() {
     requests
         .write_request(&RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
-            request_id: origin,
-            request: ClientRequest::ConfirmAction { confirmation_id },
+            request_id: req(),
+            request: ClientRequest::ConfirmAction {
+                confirmation_id,
+                originating_request_id: origin,
+            },
         })
         .await
         .unwrap();
