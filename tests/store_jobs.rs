@@ -60,6 +60,52 @@ fn create_starts_active_pending() {
 }
 
 #[test]
+fn invalid_public_schedule_values_never_mutate_jobs() {
+    let (_dir, store, dialog) = setup();
+    let invalid_cron = ScheduleSpec::Cron {
+        expression: "0 9 * * *\n/bin/evil".into(),
+        timezone: Moscow,
+    };
+    assert!(matches!(
+        store.create_job(JobCreate {
+            source_dialog_id: dialog,
+            name: "invalid".into(),
+            schedule: invalid_cron,
+            prompt: "must not persist".into(),
+        }),
+        Err(StoreError::InvalidMetadata)
+    ));
+    assert!(store.list_jobs().unwrap().is_empty());
+
+    let original = store
+        .create_job(JobCreate {
+            source_dialog_id: dialog,
+            name: "normalized".into(),
+            schedule: ScheduleSpec::Cron {
+                expression: "0 09 * * 1-5".into(),
+                timezone: Moscow,
+            },
+            prompt: "valid prompt".into(),
+        })
+        .unwrap();
+    assert_eq!(original.schedule.expression(), Some("0 9 * * 1-5"));
+    let invalid_once = ScheduleSpec::OnceAt {
+        at: Utc.with_ymd_and_hms(2026, 9, 26, 7, 30, 1).unwrap(),
+        timezone: Moscow,
+    };
+    assert!(matches!(
+        store.update_job(
+            original.id,
+            "poisoned".into(),
+            invalid_once,
+            "poisoned prompt".into(),
+        ),
+        Err(StoreError::InvalidMetadata)
+    ));
+    assert_eq!(store.get_job(original.id).unwrap(), original);
+}
+
+#[test]
 fn disabled_or_deleted_job_never_claims_even_with_stale_line() {
     let (_dir, store, dialog) = setup();
     let disabled = store.create_job(recurring(dialog)).unwrap();

@@ -105,12 +105,16 @@ impl Store {
     pub fn create_job(&self, create: JobCreate) -> Result<CronJob, StoreError> {
         validate_job_text(&create.name, MAX_JOB_NAME_BYTES)?;
         validate_job_text(&create.prompt, MAX_JOB_TEXT_BYTES)?;
+        let schedule = create
+            .schedule
+            .validate_and_normalize()
+            .map_err(|_| StoreError::InvalidMetadata)?;
         let mut db = self.connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         dialog_exists(&tx, create.source_dialog_id)?;
         let id = JobId::new();
         let timestamp = now();
-        let (kind, value, timezone) = create.schedule.kind_and_value();
+        let (kind, value, timezone) = schedule.kind_and_value();
         execute_one(
             &tx,
             "INSERT INTO cron_jobs(id,source_dialog_id,name,schedule_kind,schedule_value,timezone,prompt,desired_state,sync_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'active','pending',?,?)",
@@ -139,6 +143,9 @@ impl Store {
     ) -> Result<CronJob, StoreError> {
         validate_job_text(&name, MAX_JOB_NAME_BYTES)?;
         validate_job_text(&prompt, MAX_JOB_TEXT_BYTES)?;
+        let schedule = schedule
+            .validate_and_normalize()
+            .map_err(|_| StoreError::InvalidMetadata)?;
         let (kind, value, timezone) = schedule.kind_and_value();
         let db = self.connection()?;
         let changed = db.execute(

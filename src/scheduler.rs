@@ -11,7 +11,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Datelike, LocalResult, NaiveDateTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use fs2::FileExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -22,11 +22,37 @@ pub const MANAGED_START: &str = "# BEGIN LIGHT-AGENT MANAGED JOBS";
 pub const MANAGED_END: &str = "# END LIGHT-AGENT MANAGED JOBS";
 const MAX_CRON_EXPRESSION_BYTES: usize = 128;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScheduleSpec {
     Cron { expression: String, timezone: Tz },
     OnceAt { at: DateTime<Utc>, timezone: Tz },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum UncheckedScheduleSpec {
+    Cron { expression: String, timezone: Tz },
+    OnceAt { at: DateTime<Utc>, timezone: Tz },
+}
+
+impl<'de> Deserialize<'de> for ScheduleSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let unchecked = UncheckedScheduleSpec::deserialize(deserializer)?;
+        let schedule = match unchecked {
+            UncheckedScheduleSpec::Cron {
+                expression,
+                timezone,
+            } => Self::Cron {
+                expression,
+                timezone,
+            },
+            UncheckedScheduleSpec::OnceAt { at, timezone } => Self::OnceAt { at, timezone },
+        };
+        schedule
+            .validate_and_normalize()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl ScheduleSpec {
@@ -67,7 +93,30 @@ impl ScheduleSpec {
                 return Err(SchedulerError::InvalidSchedule);
             }
         };
-        Ok(Self::OnceAt { at, timezone })
+        Self::OnceAt { at, timezone }.validate_and_normalize()
+    }
+
+    pub fn validate_and_normalize(&self) -> Result<Self, SchedulerError> {
+        match self {
+            Self::Cron {
+                expression,
+                timezone,
+            } => Self::parse_cron(expression, *timezone),
+            Self::OnceAt { at, timezone } => {
+                if at.second() != 0 || at.nanosecond() != 0 {
+                    return Err(SchedulerError::InvalidSchedule);
+                }
+                let local = at.with_timezone(timezone).naive_local();
+                match timezone.from_local_datetime(&local) {
+                    LocalResult::Single(round_trip) if round_trip.with_timezone(&Utc) == *at => {
+                        Ok(self.clone())
+                    }
+                    LocalResult::Single(_) | LocalResult::Ambiguous(_, _) | LocalResult::None => {
+                        Err(SchedulerError::InvalidSchedule)
+                    }
+                }
+            }
+        }
     }
 
     pub fn timezone(&self) -> Tz {
@@ -114,7 +163,9 @@ impl ScheduleSpec {
                 let at = DateTime::parse_from_rfc3339(value)
                     .map_err(|_| rusqlite::Error::InvalidQuery)?
                     .with_timezone(&Utc);
-                Ok(Self::OnceAt { at, timezone })
+                Self::OnceAt { at, timezone }
+                    .validate_and_normalize()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)
             }
             _ => Err(rusqlite::Error::InvalidQuery),
         }
@@ -221,10 +272,11 @@ impl CronRenderer {
             if job.desired_state != crate::domain::JobDesiredState::Active {
                 continue;
             }
+            let schedule = job.schedule.validate_and_normalize()?;
             output.push_str("CRON_TZ=");
-            output.push_str(&job.schedule.timezone().to_string());
+            output.push_str(&schedule.timezone().to_string());
             output.push('\n');
-            match &job.schedule {
+            match &schedule {
                 ScheduleSpec::Cron { expression, .. } => output.push_str(expression),
                 ScheduleSpec::OnceAt { at, timezone } => {
                     let local = at.with_timezone(timezone);
@@ -343,6 +395,8 @@ impl SystemCrontabBackend {
     ) -> Result<std::process::Output, SchedulerError> {
         let mut child = Command::new(&self.executable)
             .args(arguments)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -368,6 +422,8 @@ impl CrontabBackend for SystemCrontabBackend {
         Box::pin(async move {
             let output = Command::new(&self.executable)
                 .arg("-l")
+                .env("LC_ALL", "C")
+                .env("LANG", "C")
                 .stdin(Stdio::null())
                 .output()
                 .await
@@ -412,6 +468,8 @@ impl CrontabBackend for SystemCrontabBackend {
         Box::pin(async move {
             let version = Command::new(&self.executable)
                 .arg("-V")
+                .env("LC_ALL", "C")
+                .env("LANG", "C")
                 .stdin(Stdio::null())
                 .output()
                 .await

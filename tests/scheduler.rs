@@ -64,6 +64,16 @@ fn once_at_rejects_invalid_zone_local_gaps_and_ambiguity() {
 }
 
 #[test]
+fn deserialize_rejects_schedule_values_that_bypass_parsers() {
+    let invalid_cron =
+        r#"{"kind":"cron","expression":"0 9 * * *\n/bin/evil","timezone":"Europe/Moscow"}"#;
+    assert!(serde_json::from_str::<ScheduleSpec>(invalid_cron).is_err());
+    let invalid_once =
+        r#"{"kind":"once_at","at":"2026-09-26T07:30:01Z","timezone":"Europe/Moscow"}"#;
+    assert!(serde_json::from_str::<ScheduleSpec>(invalid_once).is_err());
+}
+
+#[test]
 fn renderer_contains_only_timezone_fixed_binary_and_canonical_job_id() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
@@ -100,6 +110,42 @@ fn renderer_contains_only_timezone_fixed_binary_and_canonical_job_id() {
     for secret in ["secret name", "secret prompt", "$(id)", "another secret"] {
         assert!(!output.contains(secret));
     }
+}
+
+#[test]
+fn renderer_defensively_rejects_direct_invalid_schedule_and_normalizes_valid_cron() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    let dialog = store.create_dialog("source").unwrap().id;
+    let mut job = store
+        .create_job(JobCreate {
+            source_dialog_id: dialog,
+            name: "job".into(),
+            schedule: ScheduleSpec::parse_cron("0 9 * * *", Moscow).unwrap(),
+            prompt: "prompt".into(),
+        })
+        .unwrap();
+    let renderer = CronRenderer::new(PathBuf::from("/opt/light-agent/bin/light-agent")).unwrap();
+
+    job.schedule = ScheduleSpec::Cron {
+        expression: "0 09 * * 1-5".into(),
+        timezone: Moscow,
+    };
+    assert!(
+        renderer
+            .render(&[job.clone()])
+            .unwrap()
+            .contains("0 9 * * 1-5 ")
+    );
+
+    job.schedule = ScheduleSpec::Cron {
+        expression: "0 9 * * *;id".into(),
+        timezone: Moscow,
+    };
+    assert_eq!(
+        renderer.render(&[job]).unwrap_err(),
+        SchedulerError::InvalidSchedule
+    );
 }
 
 #[test]
@@ -304,7 +350,7 @@ fn fake_crontab(dir: &std::path::Path, version: &str) -> (PathBuf, PathBuf, Path
     let log = dir.join("argv.log");
     let installed = dir.join("installed");
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  -V) printf '%s\\n' '{}' ;;\n  -T) input=$(cat); case \"$input\" in *CRON_TZ=*) exit 0 ;; *) exit 9 ;; esac ;;\n  -l) printf 'no crontab for test\\n' >&2; exit 1 ;;\n  -) cat > '{}' ;;\n  *) exit 8 ;;\nesac\n",
+        "#!/bin/sh\n[ \"$LC_ALL\" = C ] && [ \"$LANG\" = C ] || exit 7\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  -V) printf '%s\\n' '{}' ;;\n  -T) input=$(cat); case \"$input\" in *CRON_TZ=*) exit 0 ;; *) exit 9 ;; esac ;;\n  -l) printf 'no crontab for test\\n' >&2; exit 1 ;;\n  -) cat > '{}' ;;\n  *) exit 8 ;;\nesac\n",
         log.display(),
         version,
         installed.display()
