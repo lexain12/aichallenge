@@ -211,8 +211,9 @@ impl InspectionService {
         })
     }
 
-    /// Number of currently owned inspection worker transactions. This is
-    /// operational metadata only; it exposes no database or query content.
+    /// Number of currently owned inspection workers, including connection
+    /// startup. This is operational metadata only; it exposes no database or
+    /// query content.
     pub fn active_snapshots(&self) -> usize {
         self.active_snapshots.load(Ordering::Acquire)
     }
@@ -233,7 +234,8 @@ impl InspectionService {
         let page_size = self.page_size;
         let active_snapshots = self.active_snapshots.clone();
         let deadline = Instant::now() + self.snapshot_timeout;
-        let worker = thread::Builder::new()
+        active_snapshots.fetch_add(1, Ordering::AcqRel);
+        let worker = match thread::Builder::new()
             .name("light-agent-inspection".into())
             .spawn(move || {
                 run_snapshot_worker(
@@ -245,9 +247,20 @@ impl InspectionService {
                     ready_tx,
                     active_snapshots,
                 )
-            })
-            .map_err(|_| InspectionError::Store)?;
-        match ready_rx.recv_timeout(self.snapshot_timeout) {
+            }) {
+            Ok(worker) => worker,
+            Err(_) => {
+                self.active_snapshots.fetch_sub(1, Ordering::AcqRel);
+                return Err(InspectionError::Store);
+            }
+        };
+        let startup_remaining = deadline.saturating_duration_since(Instant::now());
+        if startup_remaining.is_zero() {
+            drop(commands);
+            drop(worker);
+            return Err(InspectionError::SnapshotExpired);
+        }
+        match ready_rx.recv_timeout(startup_remaining) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 let _ = worker.join();
@@ -385,19 +398,14 @@ fn run_snapshot_worker(
     ready: SyncSender<Result<(), InspectionError>>,
     active_snapshots: Arc<AtomicUsize>,
 ) {
-    let db = match store.connection() {
+    let _active_guard = ActiveSnapshotGuard(active_snapshots);
+    let db = match open_snapshot_connection(&store, deadline) {
         Ok(db) => db,
-        Err(_) => {
-            let _ = ready.send(Err(InspectionError::Store));
+        Err(error) => {
+            let _ = ready.send(Err(error));
             return;
         }
     };
-    if db.execute_batch("BEGIN DEFERRED TRANSACTION").is_err() {
-        let _ = ready.send(Err(InspectionError::Store));
-        return;
-    }
-    active_snapshots.fetch_add(1, Ordering::AcqRel);
-    let _active_guard = ActiveSnapshotGuard(active_snapshots);
     if db
         .progress_handler(1_000, Some(move || Instant::now() >= deadline))
         .is_err()
@@ -454,6 +462,106 @@ impl Drop for ActiveSnapshotGuard {
     }
 }
 
+fn open_snapshot_connection(
+    store: &Store,
+    deadline: Instant,
+) -> Result<Connection, InspectionError> {
+    deadline_remaining(deadline)?;
+    let db = map_snapshot_db(
+        deadline,
+        Connection::open_with_flags(
+            store.database_path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ),
+    )?;
+
+    configure_snapshot_connection(&db, deadline)?;
+    // Validate a real read before BEGIN. If database startup is locked until
+    // the deadline, the worker must exit without opening a late transaction.
+    read_schema_version_until_deadline(&db, deadline)?;
+    deadline_remaining(deadline)?;
+    map_snapshot_db(deadline, db.execute_batch("BEGIN DEFERRED TRANSACTION"))?;
+    if let Err(error) = deadline_remaining(deadline) {
+        let _ = db.execute_batch("ROLLBACK");
+        return Err(error);
+    }
+    // BEGIN DEFERRED alone does not establish a read snapshot. This read does,
+    // so mutations after snapshot() returns cannot enter later pages.
+    if let Err(error) = read_schema_version_until_deadline(&db, deadline) {
+        let _ = db.execute_batch("ROLLBACK");
+        return Err(error);
+    }
+    Ok(db)
+}
+
+fn configure_snapshot_connection(
+    db: &Connection,
+    deadline: Instant,
+) -> Result<(), InspectionError> {
+    let remaining = deadline_remaining(deadline)?;
+    map_snapshot_db(deadline, db.busy_timeout(remaining))?;
+    deadline_remaining(deadline)?;
+    map_snapshot_db(deadline, db.pragma_update(None, "query_only", true))?;
+    deadline_remaining(deadline)?;
+    Ok(())
+}
+
+fn read_schema_version_until_deadline(
+    db: &Connection,
+    deadline: Instant,
+) -> Result<(), InspectionError> {
+    loop {
+        let remaining = deadline_remaining(deadline)?;
+        map_snapshot_db(deadline, db.busy_timeout(remaining))?;
+        let result = db.query_row("SELECT version FROM schema_version LIMIT 1", [], |_| Ok(()));
+        match result {
+            Ok(()) => return deadline_remaining(deadline).map(|_| ()),
+            Err(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) =>
+            {
+                deadline_remaining(deadline)?;
+            }
+            Err(error) => return map_snapshot_db(deadline, Err(error)),
+        }
+    }
+}
+
+fn deadline_remaining(deadline: Instant) -> Result<Duration, InspectionError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(InspectionError::SnapshotExpired)
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn map_snapshot_db<T>(
+    deadline: Instant,
+    result: rusqlite::Result<T>,
+) -> Result<T, InspectionError> {
+    match result {
+        Ok(_value) if Instant::now() >= deadline => Err(InspectionError::SnapshotExpired),
+        Ok(value) => Ok(value),
+        Err(_) if Instant::now() >= deadline => Err(InspectionError::SnapshotExpired),
+        Err(_) => Err(InspectionError::Store),
+    }
+}
+
+fn map_snapshot_query<T>(
+    deadline: Instant,
+    result: Result<T, InspectionError>,
+) -> Result<T, InspectionError> {
+    match result {
+        Ok(_value) if Instant::now() >= deadline => Err(InspectionError::SnapshotExpired),
+        Ok(value) => Ok(value),
+        Err(_) if Instant::now() >= deadline => Err(InspectionError::SnapshotExpired),
+        Err(error) => Err(error),
+    }
+}
+
 fn read_snapshot_page(
     db: &Connection,
     query: &InspectQuery,
@@ -461,28 +569,29 @@ fn read_snapshot_page(
     offset: &mut u64,
     deadline: Instant,
 ) -> Result<InspectionResult, InspectionError> {
-    if Instant::now() >= deadline {
-        return Err(InspectionError::SnapshotExpired);
-    }
+    let remaining = deadline_remaining(deadline)?;
+    map_snapshot_db(deadline, db.busy_timeout(remaining))?;
     let scope = CursorScope::from(query);
-    let mut items = match query.clone() {
-        InspectQuery::Dialogs => query_dialogs(db, *offset, page_size + 1)?,
-        InspectQuery::History(dialog_id) => query_history(db, dialog_id, *offset, page_size + 1)?,
-        InspectQuery::Jobs => query_jobs(db, *offset, page_size + 1)?,
-        InspectQuery::Job(job_id) => {
-            let rows = query_one_job(db, job_id, *offset)?;
-            if *offset == 0 && rows.is_empty() {
-                return Err(StoreError::NotFound.into());
+    let mut items = map_snapshot_query(
+        deadline,
+        (|| match query.clone() {
+            InspectQuery::Dialogs => query_dialogs(db, *offset, page_size + 1),
+            InspectQuery::History(dialog_id) => {
+                query_history(db, dialog_id, *offset, page_size + 1)
             }
-            rows
-        }
-        InspectQuery::Runs(job_id) => query_runs(db, job_id, *offset, page_size + 1)?,
-        InspectQuery::Audit => query_audit(db, *offset, page_size + 1)?,
-        InspectQuery::Dump => query_dump(db, *offset, page_size + 1)?,
-    };
-    if Instant::now() >= deadline {
-        return Err(InspectionError::SnapshotExpired);
-    }
+            InspectQuery::Jobs => query_jobs(db, *offset, page_size + 1),
+            InspectQuery::Job(job_id) => {
+                let rows = query_one_job(db, job_id, *offset)?;
+                if *offset == 0 && rows.is_empty() {
+                    return Err(StoreError::NotFound.into());
+                }
+                Ok(rows)
+            }
+            InspectQuery::Runs(job_id) => query_runs(db, job_id, *offset, page_size + 1),
+            InspectQuery::Audit => query_audit(db, *offset, page_size + 1),
+            InspectQuery::Dump => query_dump(db, *offset, page_size + 1),
+        })(),
+    )?;
     let has_more = items.len() > page_size;
     if has_more {
         items.truncate(page_size);

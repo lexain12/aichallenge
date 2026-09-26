@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use chrono::{TimeZone, Utc};
 use chrono_tz::Europe::Moscow;
 use deepseek_cli::domain::{JobDesiredState, ToolOwner};
-use deepseek_cli::inspection::{InspectQuery, InspectionService};
+use deepseek_cli::inspection::{InspectQuery, InspectionError, InspectionService};
 use deepseek_cli::scheduler::ScheduleSpec;
 use deepseek_cli::store::{
     CronRunFinish, JobCreate, RunClaim, SafeErrorCode, Store, ToolRunFinish, ToolRunStart,
@@ -324,4 +324,101 @@ fn stalled_snapshot_worker_releases_wal_at_the_hard_deadline() {
         snapshot.next_page().unwrap_err(),
         deepseek_cli::inspection::InspectionError::SnapshotExpired
     );
+}
+
+#[test]
+fn deadline_interrupted_page_is_reported_as_snapshot_expired() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.sqlite");
+    let store = Store::open(&path).unwrap();
+    let setup = rusqlite::Connection::open(&path).unwrap();
+    setup
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE dialogs;
+             CREATE TABLE inspection_slow_source(n INTEGER PRIMARY KEY);
+             WITH digits(d) AS (
+               VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+             )
+             INSERT INTO inspection_slow_source(n)
+             SELECT hundreds.d * 100 + tens.d * 10 + ones.d
+             FROM digits hundreds, digits tens, digits ones;
+             CREATE VIEW dialogs AS
+             SELECT a.n * 1000000 + b.n * 1000 + c.n AS id,
+                    'slow' AS title,
+                    '2026-09-26T00:00:00Z' AS created_at,
+                    '2026-09-26T00:00:00Z' AS updated_at
+             FROM inspection_slow_source a
+             CROSS JOIN inspection_slow_source b
+             CROSS JOIN inspection_slow_source c;",
+        )
+        .unwrap();
+    drop(setup);
+
+    let service =
+        InspectionService::with_snapshot_timeout(store, 2, Duration::from_millis(30)).unwrap();
+    let mut snapshot = service.snapshot(InspectQuery::Dialogs).unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        snapshot.next_page().unwrap_err(),
+        InspectionError::SnapshotExpired
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[test]
+fn locked_database_startup_expires_and_releases_the_worker_before_unlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.sqlite");
+    let store = Store::open(&path).unwrap();
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.pragma_update(None, "journal_mode", "DELETE").unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let service =
+        InspectionService::with_snapshot_timeout(store.clone(), 2, Duration::from_millis(120))
+            .unwrap();
+    let worker_service = service.clone();
+    let started = Instant::now();
+    let startup = std::thread::spawn(move || worker_service.snapshot(InspectQuery::Dialogs));
+
+    let observing_started = Instant::now();
+    let mut observed_worker = false;
+    while observing_started.elapsed() < Duration::from_millis(80) {
+        if service.active_snapshots() == 1 {
+            observed_worker = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let result = startup.join().unwrap();
+    assert!(
+        matches!(result, Err(InspectionError::SnapshotExpired)),
+        "locked startup must fail closed with snapshot_expired"
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+
+    let release_started = Instant::now();
+    while service.active_snapshots() != 0 && release_started.elapsed() < Duration::from_millis(500)
+    {
+        std::thread::yield_now();
+    }
+    assert!(
+        observed_worker,
+        "startup must be included in worker ownership"
+    );
+    assert_eq!(
+        service.active_snapshots(),
+        0,
+        "worker must terminate while the exclusive lock is still held"
+    );
+
+    lock.execute_batch("ROLLBACK").unwrap();
+    lock.pragma_update(None, "journal_mode", "WAL").unwrap();
+    store.create_dialog("after-expired-startup").unwrap();
+    let checkpoint = rusqlite::Connection::open(&path).unwrap();
+    let busy: i64 = checkpoint
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(busy, 0, "expired startup must not create a later WAL pin");
 }

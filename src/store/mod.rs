@@ -153,6 +153,10 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         Ok(connection)
     }
+
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.path
+    }
 }
 
 pub(crate) fn now() -> String {
