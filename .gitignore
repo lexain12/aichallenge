@@ -17,3 +17,4 @@
 *.sqlite3-journal
 *.sqlite3-wal
 *.sqlite3-shm
+*.light-agent-export-*.part

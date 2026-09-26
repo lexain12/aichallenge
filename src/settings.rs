@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use chrono_tz::Tz;
@@ -473,11 +473,19 @@ impl ClientSettings {
             return Err(SettingsError::Invalid("remote_command"));
         }
         let ssh_host = nonblank(raw.ssh_host, "ssh_host")?;
-        if ssh_host.starts_with('-') || ssh_host.chars().any(char::is_whitespace) {
+        if ssh_host.len() > 255
+            || !ssh_host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !ssh_host
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+        {
             return Err(SettingsError::Invalid("ssh_host"));
         }
         let ssh_binary = raw.ssh_binary.unwrap_or_else(|| PathBuf::from("ssh"));
-        if ssh_binary.as_os_str().is_empty() {
+        if !ssh_binary_is_safe(&ssh_binary) {
             return Err(SettingsError::Invalid("ssh_binary"));
         }
         Ok(Self {
@@ -494,6 +502,25 @@ impl ClientSettings {
     }
     pub fn remote_command(&self) -> &'static str {
         REMOTE_COMMAND
+    }
+}
+
+fn ssh_binary_is_safe(path: &Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    if text.is_empty()
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.'))
+    {
+        return false;
+    }
+    if path.is_absolute() {
+        path.components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+    } else {
+        path.components().count() == 1
     }
 }
 
