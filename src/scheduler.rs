@@ -578,7 +578,15 @@ impl CronSynchronizer {
         let lock_name_text = lock_name.to_str().ok_or(SchedulerError::InvalidPath)?;
         let coordinator_name = format!("{database_name}.runtime.lock");
         let owner_prefix = format!("{database_name}.runtime.owner.");
+        let sqlite_sidecars = [
+            format!("{database_name}-wal"),
+            format!("{database_name}-shm"),
+            format!("{database_name}-journal"),
+        ];
         if lock_name_text == database_name
+            || sqlite_sidecars
+                .iter()
+                .any(|reserved| lock_name_text == reserved)
             || lock_name_text == coordinator_name
             || lock_name_text.starts_with(&owner_prefix)
         {

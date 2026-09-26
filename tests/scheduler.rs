@@ -261,14 +261,56 @@ fn synchronizer_rejects_lock_outside_the_store_trusted_directory() {
     drop(store_dir);
 }
 
+#[cfg(unix)]
 #[test]
-fn synchronizer_rejects_database_and_runtime_lock_namespace_collisions() {
+fn synchronizer_rejects_database_sqlite_sidecars_and_runtime_lock_collisions_without_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
     let (dir, store, _) = sync_fixture();
+    let database = dir.path().join("agent.sqlite");
+    let wal_connection = rusqlite::Connection::open(&database).unwrap();
+    wal_connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .unwrap();
+    wal_connection
+        .execute_batch("BEGIN IMMEDIATE; UPDATE dialogs SET updated_at=updated_at;")
+        .unwrap();
+    assert!(dir.path().join("agent.sqlite-wal").exists());
+    assert!(dir.path().join("agent.sqlite-shm").exists());
+    let journal = dir.path().join("agent.sqlite-journal");
+    std::fs::write(&journal, b"sentinel journal").unwrap();
+    std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+
     for name in [
         "agent.sqlite",
+        "agent.sqlite-wal",
+        "agent.sqlite-shm",
+        "agent.sqlite-journal",
         "agent.sqlite.runtime.lock",
         "agent.sqlite.runtime.owner.123e4567-e89b-42d3-a456-426614174000.lock",
         "agent.sqlite.runtime.owner.reserved-future-name",
+    ] {
+        let path = dir.path().join(name);
+        let before = std::fs::read(&path).ok();
+        let result = CronSynchronizer::new(
+            store.clone(),
+            Arc::new(FakeBackend::success("")),
+            path.clone(),
+            PathBuf::from("/opt/light-agent/bin/light-agent"),
+        );
+        assert!(
+            matches!(result, Err(SchedulerError::InvalidPath)),
+            "accepted colliding lock name {name}"
+        );
+        assert_eq!(std::fs::read(&path).ok(), before, "mutated {name}");
+    }
+
+    for name in [
+        "agent.sqlite-wal.lock",
+        "agent.sqlite-shm.backup",
+        "agent.sqlite-journaled",
+        "agent.sqlite2",
+        "safe-agent.sqlite-wal",
     ] {
         let result = CronSynchronizer::new(
             store.clone(),
@@ -276,11 +318,10 @@ fn synchronizer_rejects_database_and_runtime_lock_namespace_collisions() {
             dir.path().join(name),
             PathBuf::from("/opt/light-agent/bin/light-agent"),
         );
-        assert!(
-            matches!(result, Err(SchedulerError::InvalidPath)),
-            "accepted colliding lock name {name}"
-        );
+        assert!(result.is_ok(), "rejected unrelated safe lock name {name}");
     }
+
+    wal_connection.execute_batch("ROLLBACK").unwrap();
 }
 
 #[cfg(unix)]
