@@ -143,24 +143,18 @@ pub struct DialogSummary {
     pub title: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DialogMessage {
-    pub role: String,
-    pub content: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerEvent {
     Hello,
     DialogList {
+        sequence: u64,
         dialogs: Vec<DialogSummary>,
+        complete: bool,
     },
     DialogOpened {
         dialog_id: DialogId,
         title: String,
-        messages: Vec<DialogMessage>,
     },
     ResponseStarted {
         dialog_id: DialogId,
@@ -187,7 +181,10 @@ pub enum ServerEvent {
         code: ProtocolErrorCode,
     },
     InspectionResult {
-        payload: InspectionPayload,
+        kind: InspectKind,
+        sequence: u64,
+        items: Vec<Value>,
+        complete: bool,
     },
     ExportChunk {
         sequence: u64,
@@ -222,13 +219,6 @@ impl ServerEnvelope {
             return Err(ProtocolError::UnsupportedVersion);
         }
         match &self.event {
-            ServerEvent::DialogOpened { messages, .. }
-                if messages
-                    .iter()
-                    .any(|message| message.content.len() > MAX_CONTENT_BYTES) =>
-            {
-                Err(ProtocolError::ContentTooLong)
-            }
             ServerEvent::TextDelta { text } if text.len() > MAX_CONTENT_BYTES => {
                 Err(ProtocolError::ContentTooLong)
             }

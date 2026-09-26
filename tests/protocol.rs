@@ -1,10 +1,9 @@
 use base64::Engine as _;
 use deepseek_cli::domain::{ConfirmationId, DialogId, JobId, RequestId};
 use deepseek_cli::protocol::{
-    ClientRequest, DialogMessage, DialogSummary, EXPORT_CHUNK_BYTES, InspectKind,
-    InspectionPayload, MAX_CONTENT_BYTES, MAX_LINE_BYTES, NdjsonReader, NdjsonWriter,
-    PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, RequestEnvelope, ServerEnvelope,
-    ServerEvent,
+    ClientRequest, DialogSummary, EXPORT_CHUNK_BYTES, InspectKind, MAX_CONTENT_BYTES,
+    MAX_LINE_BYTES, NdjsonReader, NdjsonWriter, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+    RequestEnvelope, ServerEnvelope, ServerEvent,
 };
 use serde_json::json;
 use tokio::io::AsyncReadExt;
@@ -71,18 +70,16 @@ fn round_trips_every_request_and_event() {
     let events = [
         ServerEvent::Hello,
         ServerEvent::DialogList {
+            sequence: 0,
             dialogs: vec![DialogSummary {
                 id: dialog_id(),
                 title: "Work".into(),
             }],
+            complete: true,
         },
         ServerEvent::DialogOpened {
             dialog_id: dialog_id(),
             title: "Work".into(),
-            messages: vec![DialogMessage {
-                role: "user".into(),
-                content: "Hi".into(),
-            }],
         },
         ServerEvent::ResponseStarted {
             dialog_id: dialog_id(),
@@ -109,10 +106,10 @@ fn round_trips_every_request_and_event() {
             code: ProtocolErrorCode::InternalError,
         },
         ServerEvent::InspectionResult {
-            payload: InspectionPayload {
-                kind: InspectKind::Dialogs,
-                data: json!({"dialogs": []}),
-            },
+            kind: InspectKind::Dialogs,
+            sequence: 0,
+            items: vec![json!({"id": 1})],
+            complete: true,
         },
         ServerEvent::ExportChunk {
             sequence: 0,
@@ -135,6 +132,131 @@ fn round_trips_every_request_and_event() {
         let bytes = serde_json::to_vec(&envelope).unwrap();
         let decoded: ServerEnvelope = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, envelope);
+    }
+}
+
+#[tokio::test]
+async fn dialog_list_pages_cover_more_than_one_mib_and_open_is_metadata_only() {
+    let dialogs: Vec<_> = (1..=2_200)
+        .map(|id| DialogSummary {
+            id: DialogId::new(id).unwrap(),
+            title: "d".repeat(512),
+        })
+        .collect();
+    assert!(serde_json::to_vec(&dialogs).unwrap().len() > MAX_LINE_BYTES);
+
+    let (mut read, write) = tokio::io::duplex(MAX_LINE_BYTES * 2);
+    let mut writer = NdjsonWriter::new(write);
+    for (sequence, page) in dialogs.chunks(500).enumerate() {
+        writer
+            .write_event(&ServerEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: request_id(),
+                event: ServerEvent::DialogList {
+                    sequence: sequence as u64,
+                    dialogs: page.to_vec(),
+                    complete: (sequence + 1) * 500 >= dialogs.len(),
+                },
+            })
+            .await
+            .unwrap();
+    }
+    writer
+        .write_event(&ServerEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request_id(),
+            event: ServerEvent::DialogOpened {
+                dialog_id: dialog_id(),
+                title: "Work".into(),
+            },
+        })
+        .await
+        .unwrap();
+    drop(writer);
+    let mut output = Vec::new();
+    read.read_to_end(&mut output).await.unwrap();
+    let lines: Vec<_> = output
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(lines.len(), 6);
+    for (sequence, line) in lines[..5].iter().enumerate() {
+        assert!(line.len() + 1 <= MAX_LINE_BYTES);
+        let page: ServerEnvelope = serde_json::from_slice(line).unwrap();
+        match page.event {
+            ServerEvent::DialogList {
+                sequence: actual,
+                dialogs: page_dialogs,
+                complete,
+            } => {
+                assert_eq!(actual, sequence as u64);
+                assert_eq!(
+                    page_dialogs,
+                    dialogs[sequence * 500..((sequence + 1) * 500).min(dialogs.len())]
+                );
+                assert_eq!(complete, sequence == 4);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    let opened: serde_json::Value = serde_json::from_slice(lines[5]).unwrap();
+    assert_eq!(
+        opened["event"],
+        json!({"type": "dialog_opened", "dialog_id": 1, "title": "Work"})
+    );
+}
+
+#[tokio::test]
+async fn inspection_pages_cover_more_than_one_mib() {
+    let items: Vec<_> = (0..5)
+        .map(|id| json!({"id": id, "content": "x".repeat(240_000)}))
+        .collect();
+    assert!(serde_json::to_vec(&items).unwrap().len() > MAX_LINE_BYTES);
+    let kind = InspectKind::History {
+        dialog_id: Some(dialog_id()),
+    };
+    let (mut read, write) = tokio::io::duplex(MAX_LINE_BYTES * 2);
+    let mut writer = NdjsonWriter::new(write);
+    for (sequence, item) in items.iter().enumerate() {
+        writer
+            .write_event(&ServerEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: request_id(),
+                event: ServerEvent::InspectionResult {
+                    kind: kind.clone(),
+                    sequence: sequence as u64,
+                    items: vec![item.clone()],
+                    complete: sequence + 1 == items.len(),
+                },
+            })
+            .await
+            .unwrap();
+    }
+    drop(writer);
+    let mut output = Vec::new();
+    read.read_to_end(&mut output).await.unwrap();
+    let lines: Vec<_> = output
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(lines.len(), items.len());
+    for (sequence, line) in lines.iter().enumerate() {
+        assert!(line.len() + 1 <= MAX_LINE_BYTES);
+        let page: ServerEnvelope = serde_json::from_slice(line).unwrap();
+        match page.event {
+            ServerEvent::InspectionResult {
+                kind: actual_kind,
+                sequence: actual_sequence,
+                items: page_items,
+                complete,
+            } => {
+                assert_eq!(actual_kind, kind);
+                assert_eq!(actual_sequence, sequence as u64);
+                assert_eq!(page_items, vec![items[sequence].clone()]);
+                assert_eq!(complete, sequence + 1 == items.len());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }
 
