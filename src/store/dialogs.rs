@@ -86,6 +86,14 @@ impl Store {
         let mut db = self.connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         dialog_exists(&tx, id)?;
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM turns WHERE dialog_id=? AND status='pending')",
+            [id.get()],
+            |r| r.get(0),
+        )?;
+        if pending {
+            return Err(StoreError::Busy);
+        }
         // Polymorphic audit owners cannot use a normal foreign key. Delete
         // interactive audit records before cascading turns/messages atomically.
         let expected_audits: i64 = tx.query_row("SELECT count(*) FROM tool_runs WHERE owner_kind='interactive_turn' AND owner_id IN (SELECT id FROM turns WHERE dialog_id=?)", [id.get()], |r| r.get(0))?;

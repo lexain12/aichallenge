@@ -22,6 +22,16 @@ fn start(owner: ToolOwner, read_only: bool) -> ToolRunStart {
     }
 }
 
+fn complete_work(store: &Store, owner: ToolOwner, audit_id: i64) {
+    store
+        .finish_tool_run(audit_id, ToolRunFinish::completed())
+        .unwrap();
+    let ToolOwner::InteractiveTurn(turn_id) = owner else {
+        panic!("expected interactive test owner")
+    };
+    store.complete_turn(turn_id, "answer").unwrap();
+}
+
 #[test]
 fn tool_run_stores_route_status_and_read_only_but_no_arguments() {
     let (_dir, store, db, owner) = setup();
@@ -98,16 +108,22 @@ fn read_only_recovery_becomes_failed() {
 #[test]
 fn dialog_delete_is_transactional() {
     let (_dir, store, db, owner) = setup();
-    store.start_tool_run(start(owner, true)).unwrap();
+    let audit_id = store.start_tool_run(start(owner, true)).unwrap();
+    complete_work(&store, owner, audit_id);
     let d = store.list_dialogs().unwrap()[0].id;
     db.execute_batch("CREATE TRIGGER reject_delete BEFORE DELETE ON dialogs BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
     assert!(store.delete_dialog(d).is_err());
-    for table in ["dialogs", "turns", "messages", "tool_runs"] {
+    for (table, expected) in [
+        ("dialogs", 1),
+        ("turns", 1),
+        ("messages", 2),
+        ("tool_runs", 1),
+    ] {
         assert_eq!(
             db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            1
+            expected
         );
     }
     db.execute_batch("DROP TRIGGER reject_delete").unwrap();
@@ -120,6 +136,60 @@ fn dialog_delete_is_transactional() {
             0
         );
     }
+}
+
+#[test]
+fn active_turn_blocks_dialog_deletion_and_preserves_pending_work() {
+    let (_dir, store, db, owner) = setup();
+    let mut write = start(owner, false);
+    write.tool_name = "send_message".into();
+    let audit_id = store.start_tool_run(write).unwrap();
+    let dialogs_before = store.list_dialogs().unwrap();
+    let audits_before = store.list_tool_runs().unwrap();
+    let dialog_id = dialogs_before[0].id;
+    let ToolOwner::InteractiveTurn(turn_id) = owner else {
+        panic!("expected interactive test owner")
+    };
+
+    assert!(matches!(
+        store.clone().delete_dialog(dialog_id),
+        Err(StoreError::Busy)
+    ));
+
+    assert_eq!(store.list_dialogs().unwrap(), dialogs_before);
+    assert_eq!(store.list_tool_runs().unwrap(), audits_before);
+    assert_eq!(audits_before[0].id, audit_id);
+    assert_eq!(audits_before[0].status, ToolRunStatus::Pending);
+    assert_eq!(
+        db.query_row(
+            "SELECT status FROM turns WHERE id=? AND dialog_id=?",
+            [turn_id.get(), dialog_id.get()],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT role,content FROM messages WHERE turn_id=? AND dialog_id=?",
+            [turn_id.get(), dialog_id.get()],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        )
+        .unwrap(),
+        ("user".into(), "question".into())
+    );
+    for table in ["dialogs", "turns", "messages", "tool_runs"] {
+        assert_eq!(
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    // The first session can still record uncertainty after the rejected delete.
+    store
+        .finish_tool_run(audit_id, ToolRunFinish::uncertain(SafeErrorCode::TimedOut))
+        .unwrap();
 }
 
 #[test]
@@ -197,6 +267,8 @@ fn ignored_audit_writes_and_dialog_deletion_are_conflicts() {
         store.list_tool_runs().unwrap()[0].status,
         ToolRunStatus::Pending
     );
+    db.execute_batch("DROP TRIGGER ignore_finish").unwrap();
+    complete_work(&store, owner, id);
     db.execute_batch(
         "CREATE TRIGGER ignore_delete BEFORE DELETE ON dialogs BEGIN SELECT RAISE(IGNORE); END;",
     )
@@ -209,7 +281,8 @@ fn ignored_audit_writes_and_dialog_deletion_are_conflicts() {
 #[test]
 fn ignored_audit_deletion_cannot_leave_orphaned_owners() {
     let (_dir, store, db, owner) = setup();
-    store.start_tool_run(start(owner, true)).unwrap();
+    let audit_id = store.start_tool_run(start(owner, true)).unwrap();
+    complete_work(&store, owner, audit_id);
     let d = store.list_dialogs().unwrap()[0].id;
     db.execute_batch("CREATE TRIGGER ignore_audit_delete BEFORE DELETE ON tool_runs BEGIN SELECT RAISE(IGNORE); END;").unwrap();
     assert!(matches!(store.delete_dialog(d), Err(StoreError::Conflict)));
