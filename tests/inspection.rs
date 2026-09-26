@@ -11,16 +11,16 @@ use deepseek_cli::store::{
 use serde_json::Value;
 
 fn all_items(service: &InspectionService, query: InspectQuery) -> Vec<Value> {
-    let mut page = service.inspect(query.clone()).unwrap();
+    let mut snapshot = service.snapshot(query).unwrap();
     let mut items = Vec::new();
-    loop {
+    while let Some(mut page) = snapshot.next_page().unwrap() {
         items.append(&mut page.items);
-        let Some(cursor) = page.next_cursor else {
+        if page.complete {
             assert!(page.complete);
             break;
-        };
-        page = service.inspect_page(query.clone(), cursor).unwrap();
+        }
     }
+    snapshot.close().unwrap();
     items
 }
 
@@ -219,17 +219,68 @@ fn inspection_pages_are_bounded_and_cursor_order_is_deterministic() {
         store.create_dialog(&format!("dialog-{index}")).unwrap();
     }
     let service = InspectionService::with_page_size(store, 3).unwrap();
-    let first = service.inspect(InspectQuery::Dialogs).unwrap();
+    let mut snapshot = service.snapshot(InspectQuery::Dialogs).unwrap();
+    let first = snapshot.next_page().unwrap().unwrap();
     assert_eq!(first.items.len(), 3);
     assert!(!first.complete);
-    let second = service
-        .inspect_page(InspectQuery::Dialogs, first.next_cursor.unwrap())
-        .unwrap();
+    let second = snapshot.next_page().unwrap().unwrap();
     assert_eq!(second.items.len(), 3);
     assert!(!second.complete);
-    let third = service
-        .inspect_page(InspectQuery::Dialogs, second.next_cursor.unwrap())
-        .unwrap();
+    let third = snapshot.next_page().unwrap().unwrap();
     assert_eq!(third.items.len(), 1);
     assert!(third.complete);
+    assert!(snapshot.next_page().unwrap().is_none());
+    snapshot.close().unwrap();
+}
+
+#[test]
+fn inspection_snapshot_is_consistent_across_pages_during_concurrent_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    let original = (0..5)
+        .map(|index| store.create_dialog(&format!("original-{index}")).unwrap())
+        .collect::<Vec<_>>();
+    let service = InspectionService::with_page_size(store.clone(), 2).unwrap();
+    let mut snapshot = service.snapshot(InspectQuery::Dialogs).unwrap();
+
+    let first = snapshot.next_page().unwrap().unwrap();
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|item| item["title"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["original-0", "original-1"]
+    );
+
+    store.delete_dialog(original[0].id).unwrap();
+    store.create_dialog("inserted-after-snapshot").unwrap();
+
+    let mut remaining = Vec::new();
+    while let Some(page) = snapshot.next_page().unwrap() {
+        remaining.extend(page.items);
+    }
+    snapshot.close().unwrap();
+    assert_eq!(
+        remaining
+            .iter()
+            .map(|item| item["title"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["original-2", "original-3", "original-4"]
+    );
+
+    let fresh = all_items(&service, InspectQuery::Dialogs);
+    assert_eq!(
+        fresh
+            .iter()
+            .map(|item| item["title"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "original-1",
+            "original-2",
+            "original-3",
+            "original-4",
+            "inserted-after-snapshot"
+        ]
+    );
 }

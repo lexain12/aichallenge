@@ -84,6 +84,7 @@ fn output_rows_cells_input_and_execution_are_bounded() {
             max_rows: 3,
             max_columns: 8,
             max_cell_bytes: 16,
+            max_output_bytes: 4_096,
             max_query_time: Duration::from_millis(10),
         },
     )
@@ -117,6 +118,48 @@ fn output_rows_cells_input_and_execution_are_bounded() {
     )
     .unwrap_err();
     assert_eq!(timeout, InspectionError::QueryTimedOut);
+}
+
+#[test]
+fn native_value_limit_and_aggregate_output_budget_fail_closed() {
+    let (_dir, path) = setup();
+    let native_limited = ReadonlyDbShell::with_limits(
+        &path,
+        DbShellLimits {
+            max_sql_bytes: 512,
+            max_rows: 10,
+            max_columns: 8,
+            max_cell_bytes: 128,
+            max_output_bytes: 4_096,
+            max_query_time: Duration::from_millis(100),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        run(&native_limited, "SELECT zeroblob(129)\n").unwrap_err(),
+        InspectionError::ResourceLimit
+    );
+
+    let output_limited = ReadonlyDbShell::with_limits(
+        path,
+        DbShellLimits {
+            max_sql_bytes: 512,
+            max_rows: 100,
+            max_columns: 8,
+            max_cell_bytes: 128,
+            max_output_bytes: 120,
+            max_query_time: Duration::from_millis(100),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        run(
+            &output_limited,
+            "WITH RECURSIVE n(v) AS (VALUES(1) UNION ALL SELECT v+1 FROM n WHERE v<20) SELECT printf('%016d',v) FROM n;\n"
+        )
+        .unwrap_err(),
+        InspectionError::OutputTooLarge
+    );
 }
 
 #[test]

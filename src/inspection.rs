@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,13 @@ use crate::store::{Store, StoreError};
 
 const DEFAULT_PAGE_SIZE: usize = 128;
 const MAX_PAGE_SIZE: usize = 1024;
+const MAX_SNAPSHOT_DURATION: Duration = Duration::from_secs(30);
+const HARD_MAX_SQL_BYTES: usize = 1_048_576;
+const HARD_MAX_ROWS: usize = 10_000;
+const HARD_MAX_COLUMNS: usize = 256;
+const HARD_MAX_CELL_BYTES: usize = 1_048_576;
+const HARD_MAX_OUTPUT_BYTES: usize = 67_108_864;
+const HARD_MAX_QUERY_TIME: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +89,18 @@ pub struct InspectionService {
     page_size: usize,
 }
 
+/// A bounded-lifetime read transaction used to stream every page from one
+/// consistent SQLite snapshot. Call [`Self::close`] as soon as the response
+/// stream is complete; dropping it also rolls the read transaction back.
+pub struct InspectionSnapshot {
+    db: Option<Connection>,
+    query: InspectQuery,
+    page_size: usize,
+    offset: u64,
+    complete: bool,
+    deadline: Instant,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExportSummary {
     pub total_bytes: u64,
@@ -128,6 +148,12 @@ pub enum InspectionError {
     CellTooLarge,
     #[error("query_timed_out")]
     QueryTimedOut,
+    #[error("resource_limit")]
+    ResourceLimit,
+    #[error("output_too_large")]
+    OutputTooLarge,
+    #[error("snapshot_expired")]
+    SnapshotExpired,
 }
 
 impl From<StoreError> for InspectionError {
@@ -152,66 +178,31 @@ impl InspectionService {
     }
 
     pub fn inspect(&self, query: InspectQuery) -> Result<InspectionResult, InspectionError> {
-        self.inspect_at(query, 0)
+        let mut snapshot = self.snapshot(query)?;
+        let result = snapshot
+            .next_page()?
+            .ok_or(InspectionError::InvalidCursor)?;
+        snapshot.close()?;
+        Ok(result)
     }
 
-    pub fn inspect_page(
-        &self,
-        query: InspectQuery,
-        cursor: InspectionCursor,
-    ) -> Result<InspectionResult, InspectionError> {
-        if cursor.scope != CursorScope::from(&query) {
-            return Err(InspectionError::InvalidCursor);
-        }
-        self.inspect_at(query, cursor.offset)
-    }
-
-    fn inspect_at(
-        &self,
-        query: InspectQuery,
-        offset: u64,
-    ) -> Result<InspectionResult, InspectionError> {
+    pub fn snapshot(&self, query: InspectQuery) -> Result<InspectionSnapshot, InspectionError> {
         let db = self.store.connection()?;
-        let scope = CursorScope::from(&query);
-        let mut items = match query {
-            InspectQuery::Dialogs => query_dialogs(&db, offset, self.page_size + 1)?,
-            InspectQuery::History(dialog_id) => {
-                query_history(&db, dialog_id, offset, self.page_size + 1)?
-            }
-            InspectQuery::Jobs => query_jobs(&db, offset, self.page_size + 1)?,
-            InspectQuery::Job(job_id) => {
-                let rows = query_one_job(&db, job_id, offset)?;
-                if offset == 0 && rows.is_empty() {
-                    return Err(StoreError::NotFound.into());
-                }
-                rows
-            }
-            InspectQuery::Runs(job_id) => query_runs(&db, job_id, offset, self.page_size + 1)?,
-            InspectQuery::Audit => query_audit(&db, offset, self.page_size + 1)?,
-            InspectQuery::Dump => query_dump(&db, offset, self.page_size + 1)?,
-        };
-        let has_more = items.len() > self.page_size;
-        if has_more {
-            items.truncate(self.page_size);
-        }
-        let next_cursor = has_more.then_some(InspectionCursor {
-            offset: offset
-                .checked_add(items.len() as u64)
-                .ok_or(InspectionError::InvalidCursor)?,
-            scope,
-        });
-        Ok(InspectionResult {
-            items,
-            next_cursor,
-            complete: !has_more,
+        map_db(db.execute_batch("BEGIN DEFERRED TRANSACTION"))?;
+        Ok(InspectionSnapshot {
+            db: Some(db),
+            query,
+            page_size: self.page_size,
+            offset: 0,
+            complete: false,
+            deadline: Instant::now() + MAX_SNAPSHOT_DURATION,
         })
     }
 
     /// Writes versioned JSONL directly to the supplied local stream. No path
     /// or remote destination is accepted at this boundary.
     pub fn write_export<W: Write>(&self, writer: &mut W) -> Result<ExportSummary, InspectionError> {
-        let mut db = self.store.connection()?;
-        let snapshot = map_db(db.transaction())?;
+        let mut snapshot = self.snapshot(InspectQuery::Dump)?;
         let mut writer = DigestWriter::new(writer);
         write_json_line(
             &mut writer,
@@ -221,25 +212,13 @@ impl InspectionService {
             },
         )?;
         let mut records = 0_u64;
-        let mut offset = 0_u64;
-        loop {
-            let mut page = query_dump(&snapshot, offset, self.page_size + 1)?;
-            let has_more = page.len() > self.page_size;
-            if has_more {
-                page.truncate(self.page_size);
-            }
-            for record in page {
+        while let Some(page) = snapshot.next_page()? {
+            for record in page.items {
                 write_json_line(&mut writer, &LogicalExportV1::Record { record })?;
                 records += 1;
             }
-            if !has_more {
-                break;
-            }
-            offset = offset
-                .checked_add(self.page_size as u64)
-                .ok_or(InspectionError::InvalidCursor)?;
         }
-        map_db(snapshot.commit())?;
+        snapshot.close()?;
         writer.flush().map_err(|_| InspectionError::Io)?;
         let (total_bytes, sha256) = writer.finish();
         Ok(ExportSummary {
@@ -250,12 +229,126 @@ impl InspectionService {
     }
 }
 
+impl InspectionSnapshot {
+    pub fn next_page(&mut self) -> Result<Option<InspectionResult>, InspectionError> {
+        if self.complete {
+            return Ok(None);
+        }
+        if Instant::now() >= self.deadline {
+            self.finish_transaction()?;
+            self.complete = true;
+            return Err(InspectionError::SnapshotExpired);
+        }
+        let db = self.db.as_ref().ok_or(InspectionError::InvalidCursor)?;
+        let scope = CursorScope::from(&self.query);
+        let mut items = match self.query.clone() {
+            InspectQuery::Dialogs => query_dialogs(db, self.offset, self.page_size + 1)?,
+            InspectQuery::History(dialog_id) => {
+                query_history(db, dialog_id, self.offset, self.page_size + 1)?
+            }
+            InspectQuery::Jobs => query_jobs(db, self.offset, self.page_size + 1)?,
+            InspectQuery::Job(job_id) => {
+                let rows = query_one_job(db, job_id, self.offset)?;
+                if self.offset == 0 && rows.is_empty() {
+                    return Err(StoreError::NotFound.into());
+                }
+                rows
+            }
+            InspectQuery::Runs(job_id) => query_runs(db, job_id, self.offset, self.page_size + 1)?,
+            InspectQuery::Audit => query_audit(db, self.offset, self.page_size + 1)?,
+            InspectQuery::Dump => query_dump(db, self.offset, self.page_size + 1)?,
+        };
+        let has_more = items.len() > self.page_size;
+        if has_more {
+            items.truncate(self.page_size);
+        }
+        self.offset = self
+            .offset
+            .checked_add(items.len() as u64)
+            .ok_or(InspectionError::InvalidCursor)?;
+        self.complete = !has_more;
+        let next_cursor = has_more.then_some(InspectionCursor {
+            offset: self.offset,
+            scope,
+        });
+        let result = InspectionResult {
+            items,
+            next_cursor,
+            complete: !has_more,
+        };
+        if self.complete {
+            self.finish_transaction()?;
+        }
+        Ok(Some(result))
+    }
+
+    pub fn close(mut self) -> Result<(), InspectionError> {
+        self.finish_transaction()
+    }
+
+    fn finish_transaction(&mut self) -> Result<(), InspectionError> {
+        self.db
+            .take()
+            .map(|db| map_db(db.execute_batch("ROLLBACK")))
+            .unwrap_or(Ok(()))
+    }
+}
+
+impl Drop for InspectionSnapshot {
+    fn drop(&mut self) {
+        if let Some(db) = self.db.take() {
+            let _ = db.execute_batch("ROLLBACK");
+        }
+    }
+}
+
 fn write_json_line<W: Write, T: Serialize>(
     writer: &mut W,
     value: &T,
 ) -> Result<(), InspectionError> {
     serde_json::to_writer(&mut *writer, value).map_err(|_| InspectionError::Serialization)?;
     writer.write_all(b"\n").map_err(|_| InspectionError::Io)
+}
+
+fn write_bounded_json_line<W: Write, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+    total: &mut usize,
+    maximum: usize,
+) -> Result<(), InspectionError> {
+    let mut counter = CountingWriter::default();
+    serde_json::to_writer(&mut counter, value).map_err(|_| InspectionError::Serialization)?;
+    let required = counter
+        .bytes
+        .checked_add(1)
+        .and_then(|line| total.checked_add(line))
+        .ok_or(InspectionError::OutputTooLarge)?;
+    if required > maximum {
+        return Err(InspectionError::OutputTooLarge);
+    }
+    serde_json::to_writer(&mut *writer, value).map_err(|_| InspectionError::Io)?;
+    writer.write_all(b"\n").map_err(|_| InspectionError::Io)?;
+    *total = required;
+    Ok(())
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("count_overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct DigestWriter<'a, W> {
@@ -623,6 +716,7 @@ pub struct DbShellLimits {
     pub max_rows: usize,
     pub max_columns: usize,
     pub max_cell_bytes: usize,
+    pub max_output_bytes: usize,
     pub max_query_time: Duration,
 }
 
@@ -633,6 +727,7 @@ impl Default for DbShellLimits {
             max_rows: 1_000,
             max_columns: 128,
             max_cell_bytes: 262_144,
+            max_output_bytes: 8_388_608,
             max_query_time: Duration::from_secs(2),
         }
     }
@@ -660,9 +755,16 @@ impl ReadonlyDbShell {
             || limits.max_rows == 0
             || limits.max_columns == 0
             || limits.max_cell_bytes == 0
+            || limits.max_output_bytes == 0
             || limits.max_query_time.is_zero()
+            || limits.max_sql_bytes > HARD_MAX_SQL_BYTES
+            || limits.max_rows > HARD_MAX_ROWS
+            || limits.max_columns > HARD_MAX_COLUMNS
+            || limits.max_cell_bytes > HARD_MAX_CELL_BYTES
+            || limits.max_output_bytes > HARD_MAX_OUTPUT_BYTES
+            || limits.max_query_time > HARD_MAX_QUERY_TIME
         {
-            return Err(InspectionError::RejectedQuery);
+            return Err(InspectionError::ResourceLimit);
         }
         Ok(Self {
             path: path.as_ref().to_owned(),
@@ -687,16 +789,43 @@ impl ReadonlyDbShell {
             .map_err(|_| InspectionError::DatabaseOpen)?;
         db.busy_timeout(self.limits.max_query_time)
             .map_err(|_| InspectionError::DatabaseOpen)?;
+        // Force the trusted Day 18 schema to be parsed before lowering limits;
+        // otherwise a deliberately tiny user result limit can reject SQLite's
+        // own schema rows rather than the operator query.
+        db.query_row("SELECT version FROM schema_version LIMIT 1", [], |_| Ok(()))
+            .map_err(|_| InspectionError::DatabaseOpen)?;
+        self.apply_native_limits(&db)?;
         db.authorizer(Some(authorize_readonly))
             .map_err(|_| InspectionError::DatabaseOpen)?;
 
+        let mut output_bytes = 0_usize;
         while let Some(line) = read_bounded_line(&mut input, self.limits.max_sql_bytes)? {
             let sql = line.trim();
             if sql.is_empty() {
                 continue;
             }
             validate_sql(sql)?;
-            self.execute_one(&db, sql, &mut output)?;
+            self.execute_one(&db, sql, &mut output, &mut output_bytes)?;
+        }
+        Ok(())
+    }
+
+    fn apply_native_limits(&self, db: &Connection) -> Result<(), InspectionError> {
+        let length = i32::try_from(self.limits.max_cell_bytes)
+            .map_err(|_| InspectionError::ResourceLimit)?;
+        let sql_length =
+            i32::try_from(self.limits.max_sql_bytes).map_err(|_| InspectionError::ResourceLimit)?;
+        let columns =
+            i32::try_from(self.limits.max_columns).map_err(|_| InspectionError::ResourceLimit)?;
+        for (kind, value) in [
+            (Limit::SQLITE_LIMIT_LENGTH, length),
+            (Limit::SQLITE_LIMIT_SQL_LENGTH, sql_length),
+            (Limit::SQLITE_LIMIT_COLUMN, columns),
+            (Limit::SQLITE_LIMIT_ATTACHED, 0),
+            (Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 0),
+        ] {
+            db.set_limit(kind, value)
+                .map_err(|_| InspectionError::DatabaseOpen)?;
         }
         Ok(())
     }
@@ -706,6 +835,7 @@ impl ReadonlyDbShell {
         db: &Connection,
         sql: &str,
         output: &mut W,
+        output_bytes: &mut usize,
     ) -> Result<(), InspectionError> {
         let mut statement = match db.prepare(sql) {
             Ok(statement) => statement,
@@ -718,6 +848,7 @@ impl ReadonlyDbShell {
             {
                 return Err(InspectionError::RejectedQuery);
             }
+            Err(error) if is_resource_limit(&error) => return Err(InspectionError::ResourceLimit),
             Err(_) => return Err(InspectionError::Query),
         };
         if !statement.readonly() {
@@ -735,7 +866,12 @@ impl ReadonlyDbShell {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        write_json_line(output, &json!({ "columns": columns }))?;
+        write_bounded_json_line(
+            output,
+            &json!({ "columns": columns }),
+            output_bytes,
+            self.limits.max_output_bytes,
+        )?;
 
         let timed_out = Arc::new(AtomicBool::new(false));
         let timed_out_hook = timed_out.clone();
@@ -754,7 +890,7 @@ impl ReadonlyDbShell {
         .map_err(|_| InspectionError::Query)?;
 
         let result = (|| {
-            let mut rows = statement.query([]).map_err(|_| InspectionError::Query)?;
+            let mut rows = statement.query([]).map_err(map_query_error)?;
             let mut count = 0_usize;
             let mut truncated = false;
             loop {
@@ -764,7 +900,7 @@ impl ReadonlyDbShell {
                     Err(_) if timed_out.load(Ordering::Relaxed) => {
                         return Err(InspectionError::QueryTimedOut);
                     }
-                    Err(_) => return Err(InspectionError::Query),
+                    Err(error) => return Err(map_query_error(error)),
                 };
                 if count == self.limits.max_rows {
                     truncated = true;
@@ -772,13 +908,23 @@ impl ReadonlyDbShell {
                 }
                 let mut cells = Vec::with_capacity(column_count);
                 for index in 0..column_count {
-                    let value = row.get_ref(index).map_err(|_| InspectionError::Query)?;
+                    let value = row.get_ref(index).map_err(map_query_error)?;
                     cells.push(cell_value(value, self.limits.max_cell_bytes)?);
                 }
-                write_json_line(output, &json!({ "row": cells }))?;
+                write_bounded_json_line(
+                    output,
+                    &json!({ "row": cells }),
+                    output_bytes,
+                    self.limits.max_output_bytes,
+                )?;
                 count += 1;
             }
-            write_json_line(output, &json!({ "rows": count, "truncated": truncated }))?;
+            write_bounded_json_line(
+                output,
+                &json!({ "rows": count, "truncated": truncated }),
+                output_bytes,
+                self.limits.max_output_bytes,
+            )?;
             Ok(())
         })();
         drop(statement);
@@ -800,6 +946,18 @@ fn authorize_readonly(context: AuthContext<'_>) -> Authorization {
             Authorization::Allow
         }
         _ => Authorization::Deny,
+    }
+}
+
+fn is_resource_limit(error: &rusqlite::Error) -> bool {
+    error.sqlite_error_code() == Some(rusqlite::ErrorCode::TooBig)
+}
+
+fn map_query_error(error: rusqlite::Error) -> InspectionError {
+    if is_resource_limit(&error) {
+        InspectionError::ResourceLimit
+    } else {
+        InspectionError::Query
     }
 }
 
