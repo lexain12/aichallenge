@@ -137,14 +137,14 @@ enum CanonicalAction {
     },
     Update {
         source_dialog_id: DialogId,
-        job_id: JobId,
+        expected: CronJob,
         name: String,
         schedule: ScheduleSpec,
         prompt: String,
     },
     SetState {
         source_dialog_id: DialogId,
-        job_id: JobId,
+        expected: CronJob,
         state: JobDesiredState,
         preview: SchedulePreview,
     },
@@ -160,14 +160,14 @@ impl CanonicalAction {
                 ..
             } => preview_for(ScheduleAction::Create, None, name, schedule, prompt),
             Self::Update {
-                job_id,
+                expected,
                 name,
                 schedule,
                 prompt,
                 ..
             } => preview_for(
                 ScheduleAction::Update,
-                Some(*job_id),
+                Some(expected.id),
                 name,
                 schedule,
                 prompt,
@@ -239,7 +239,8 @@ impl SchedulerToolExecutor {
 
     fn parse_update(&self, arguments: &str) -> Result<CanonicalAction, ToolExecutionError> {
         let arguments: UpdateArguments = parse_arguments(arguments)?;
-        if self.require_existing_job(arguments.job_id)?.desired_state == JobDesiredState::Deleted {
+        let expected = self.require_existing_job(arguments.job_id)?;
+        if expected.desired_state == JobDesiredState::Deleted {
             return Err(ToolExecutionError::InvalidArguments);
         }
         let name = normalize_name(arguments.name)?;
@@ -247,7 +248,7 @@ impl SchedulerToolExecutor {
         let schedule = arguments.schedule.normalize(arguments.timezone)?;
         Ok(CanonicalAction::Update {
             source_dialog_id: self.source_dialog_id,
-            job_id: arguments.job_id,
+            expected,
             name,
             schedule,
             prompt: arguments.prompt,
@@ -268,7 +269,7 @@ impl SchedulerToolExecutor {
         let preview = preview_for(action, Some(job.id), &job.name, &job.schedule, &job.prompt);
         Ok(CanonicalAction::SetState {
             source_dialog_id: self.source_dialog_id,
-            job_id: job.id,
+            expected: job,
             state,
             preview,
         })
@@ -298,42 +299,58 @@ impl SchedulerToolExecutor {
             return Ok(safe_error("confirmation_rejected"));
         }
 
-        let mutated = match action {
+        let (mutated, snapshot_bound) = match action {
             CanonicalAction::Create {
                 source_dialog_id,
                 name,
                 schedule,
                 prompt,
-            } => self.store.create_job(JobCreate {
-                source_dialog_id,
-                name,
-                schedule,
-                prompt,
-            }),
+            } => (
+                self.store.create_job(JobCreate {
+                    source_dialog_id,
+                    name,
+                    schedule,
+                    prompt,
+                }),
+                false,
+            ),
             CanonicalAction::Update {
-                job_id,
+                expected,
                 name,
                 schedule,
                 prompt,
                 ..
-            } => self.store.update_job(job_id, name, schedule, prompt),
-            CanonicalAction::SetState { job_id, state, .. } => {
-                self.store.set_job_desired_state(job_id, state)
-            }
+            } => (
+                self.store
+                    .update_job_if_unchanged(&expected, name, schedule, prompt),
+                true,
+            ),
+            CanonicalAction::SetState {
+                expected, state, ..
+            } => (
+                self.store
+                    .set_job_desired_state_if_unchanged(&expected, state),
+                true,
+            ),
         };
         let job = match mutated {
             Ok(job) => job,
+            Err(crate::store::StoreError::Conflict | crate::store::StoreError::NotFound)
+                if snapshot_bound =>
+            {
+                return Ok(safe_error("job_changed"));
+            }
             Err(_) => return Ok(safe_error("store_error")),
         };
         match self.synchronizer.sync().await {
-            Ok(SyncReport::Installed { .. }) => {
-                let job = self.store.get_job(job.id).unwrap_or(job);
-                Ok(success("installed", &job))
-            }
-            Ok(SyncReport::SavedNotInstalled { .. }) => {
-                let job = self.store.get_job(job.id).unwrap_or(job);
-                Ok(sync_failure(&job))
-            }
+            Ok(SyncReport::Installed { .. }) => match self.store.get_job(job.id) {
+                Ok(job) => Ok(success("installed", &job)),
+                Err(_) => Ok(safe_error("store_error")),
+            },
+            Ok(SyncReport::SavedNotInstalled { .. }) => match self.store.get_job(job.id) {
+                Ok(job) => Ok(sync_failure(&job)),
+                Err(_) => Ok(safe_error("store_error")),
+            },
             Err(_) => {
                 if self.store.mark_job_sync_failed(job.id).is_err() {
                     return Ok(safe_error("store_error"));

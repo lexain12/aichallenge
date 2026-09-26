@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use deepseek_cli::domain::{DialogId, JobDesiredState, JobSyncState, RequestId};
+use deepseek_cli::domain::{DialogId, JobDesiredState, JobId, JobSyncState, RequestId};
 use deepseek_cli::provider::ModelToolCall;
 use deepseek_cli::scheduler::{CronSynchronizer, CrontabBackend, CrontabFuture, SchedulerError};
 use deepseek_cli::store::Store;
@@ -367,7 +367,7 @@ async fn rejection_changes_no_state() {
 }
 
 #[tokio::test]
-async fn confirmation_is_single_use() {
+async fn broker_already_used_rejection_changes_no_state() {
     assert_confirmation_error_changes_no_state(ConfirmationError::AlreadyUsed).await;
 }
 
@@ -411,13 +411,115 @@ async fn confirmation_expires_at_five_minutes() {
 }
 
 #[tokio::test]
-async fn cross_request_and_cross_session_ids_fail_closed() {
+async fn broker_request_or_session_rejection_changes_no_state() {
     for error in [
         ConfirmationError::WrongRequest,
         ConfirmationError::WrongSession,
     ] {
         assert_confirmation_error_changes_no_state(error).await;
     }
+}
+
+#[tokio::test]
+async fn stale_state_preview_fails_before_mutation_or_crontab_sync() {
+    let fixture = Fixture::new(FakeBackend::success());
+    let creator = fixture.executor(ImmediateBroker::accepting(), request(REQUEST_A));
+    let created = creator
+        .call(&call("cron__create", create_arguments("original task")))
+        .await
+        .unwrap();
+    let job_id = JobId::from_str(parse_result(&created)["job"]["id"].as_str().unwrap()).unwrap();
+    let original = fixture.store.get_job(job_id).unwrap();
+    let install_count = fixture.backend.installed.lock().unwrap().len();
+
+    let (response_tx, response_rx) = oneshot::channel();
+    let broker = Arc::new(BlockingBroker {
+        request: Arc::new(Mutex::new(None)),
+        seen: Arc::new(Notify::new()),
+        response: Mutex::new(Some(response_rx)),
+    });
+    let notified = broker.seen.notified();
+    let executor = Arc::new(fixture.executor(broker.clone(), request(REQUEST_B)));
+    let task = tokio::spawn(async move {
+        executor
+            .call(&call("cron__disable", json!({"job_id":job_id})))
+            .await
+    });
+    notified.await;
+    fixture
+        .store
+        .update_job(
+            job_id,
+            "Concurrent edit".into(),
+            original.schedule,
+            "new task from another request".into(),
+        )
+        .unwrap();
+    response_tx.send(Ok(())).unwrap();
+
+    let result = task.await.unwrap().unwrap();
+    assert!(result.is_error);
+    assert_eq!(result.error_code.as_deref(), Some("job_changed"));
+    let current = fixture.store.get_job(job_id).unwrap();
+    assert_eq!(current.name, "Concurrent edit");
+    assert_eq!(current.desired_state, JobDesiredState::Active);
+    assert_eq!(
+        fixture.backend.installed.lock().unwrap().len(),
+        install_count
+    );
+}
+
+#[tokio::test]
+async fn stale_update_preview_fails_before_overwrite_or_crontab_sync() {
+    let fixture = Fixture::new(FakeBackend::success());
+    let creator = fixture.executor(ImmediateBroker::accepting(), request(REQUEST_A));
+    let created = creator
+        .call(&call("cron__create", create_arguments("original task")))
+        .await
+        .unwrap();
+    let job_id = JobId::from_str(parse_result(&created)["job"]["id"].as_str().unwrap()).unwrap();
+    let install_count = fixture.backend.installed.lock().unwrap().len();
+
+    let (response_tx, response_rx) = oneshot::channel();
+    let broker = Arc::new(BlockingBroker {
+        request: Arc::new(Mutex::new(None)),
+        seen: Arc::new(Notify::new()),
+        response: Mutex::new(Some(response_rx)),
+    });
+    let notified = broker.seen.notified();
+    let executor = Arc::new(fixture.executor(broker.clone(), request(REQUEST_B)));
+    let task = tokio::spawn(async move {
+        executor
+            .call(&call(
+                "cron__update",
+                json!({
+                    "job_id":job_id,
+                    "name":"Confirmed replacement",
+                    "prompt":"confirmed replacement task",
+                    "timezone":"Europe/Moscow",
+                    "schedule":{"kind":"cron","expression":"15 10 * * *"}
+                }),
+            ))
+            .await
+    });
+    notified.await;
+    fixture
+        .store
+        .set_job_desired_state(job_id, JobDesiredState::Disabled)
+        .unwrap();
+    response_tx.send(Ok(())).unwrap();
+
+    let result = task.await.unwrap().unwrap();
+    assert!(result.is_error);
+    assert_eq!(result.error_code.as_deref(), Some("job_changed"));
+    let current = fixture.store.get_job(job_id).unwrap();
+    assert_eq!(current.name, "Morning report");
+    assert_eq!(current.prompt, "original task");
+    assert_eq!(current.desired_state, JobDesiredState::Disabled);
+    assert_eq!(
+        fixture.backend.installed.lock().unwrap().len(),
+        install_count
+    );
 }
 
 async fn assert_confirmation_error_changes_no_state(error: ConfirmationError) {

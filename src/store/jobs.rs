@@ -158,6 +158,54 @@ impl Store {
         self.get_job(id)
     }
 
+    /// Atomically applies an update only while every persisted field still
+    /// matches the snapshot shown to the confirmer.
+    pub fn update_job_if_unchanged(
+        &self,
+        expected: &CronJob,
+        name: String,
+        schedule: ScheduleSpec,
+        prompt: String,
+    ) -> Result<CronJob, StoreError> {
+        validate_job_text(&name, MAX_JOB_NAME_BYTES)?;
+        validate_job_text(&prompt, MAX_JOB_TEXT_BYTES)?;
+        let schedule = schedule
+            .validate_and_normalize()
+            .map_err(|_| StoreError::InvalidMetadata)?;
+        let (kind, value, timezone) = schedule.kind_and_value();
+        let (expected_kind, expected_value, expected_timezone) = expected.schedule.kind_and_value();
+        let mut db = self.connection()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE cron_jobs SET name=?,schedule_kind=?,schedule_value=?,timezone=?,prompt=?,desired_state='active',sync_state='pending',safe_sync_error_code=NULL,updated_at=? WHERE id=? AND source_dialog_id IS ? AND name=? AND schedule_kind=? AND schedule_value=? AND timezone=? AND prompt=? AND desired_state=? AND sync_state=? AND safe_sync_error_code IS ? AND created_at=? AND updated_at=?",
+            params![
+                name,
+                kind,
+                value,
+                timezone,
+                prompt,
+                now(),
+                expected.id.to_string(),
+                expected.source_dialog_id.map(DialogId::get),
+                expected.name,
+                expected_kind,
+                expected_value,
+                expected_timezone,
+                expected.prompt,
+                desired_state_str(expected.desired_state),
+                sync_state_str(expected.sync_state),
+                expected.safe_sync_error_code.map(SafeErrorCode::as_str),
+                expected.created_at,
+                expected.updated_at,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        tx.commit()?;
+        self.get_job(expected.id)
+    }
+
     pub fn set_job_desired_state(
         &self,
         id: JobId,
@@ -183,6 +231,42 @@ impl Store {
             };
         }
         self.get_job(id)
+    }
+
+    /// Atomically applies a desired-state change only while the row still
+    /// equals the exact snapshot used for its confirmation preview.
+    pub fn set_job_desired_state_if_unchanged(
+        &self,
+        expected: &CronJob,
+        state: JobDesiredState,
+    ) -> Result<CronJob, StoreError> {
+        let (expected_kind, expected_value, expected_timezone) = expected.schedule.kind_and_value();
+        let mut db = self.connection()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE cron_jobs SET desired_state=?,sync_state='pending',safe_sync_error_code=NULL,updated_at=? WHERE id=? AND source_dialog_id IS ? AND name=? AND schedule_kind=? AND schedule_value=? AND timezone=? AND prompt=? AND desired_state=? AND sync_state=? AND safe_sync_error_code IS ? AND created_at=? AND updated_at=?",
+            params![
+                desired_state_str(state),
+                now(),
+                expected.id.to_string(),
+                expected.source_dialog_id.map(DialogId::get),
+                expected.name,
+                expected_kind,
+                expected_value,
+                expected_timezone,
+                expected.prompt,
+                desired_state_str(expected.desired_state),
+                sync_state_str(expected.sync_state),
+                expected.safe_sync_error_code.map(SafeErrorCode::as_str),
+                expected.created_at,
+                expected.updated_at,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        tx.commit()?;
+        self.get_job(expected.id)
     }
 
     pub fn get_job(&self, id: JobId) -> Result<CronJob, StoreError> {
@@ -548,6 +632,14 @@ fn desired_state_str(value: JobDesiredState) -> &'static str {
         JobDesiredState::Active => "active",
         JobDesiredState::Disabled => "disabled",
         JobDesiredState::Deleted => "deleted",
+    }
+}
+
+fn sync_state_str(value: JobSyncState) -> &'static str {
+    match value {
+        JobSyncState::Pending => "pending",
+        JobSyncState::Applied => "applied",
+        JobSyncState::Failed => "failed",
     }
 }
 
