@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeSet,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -26,6 +26,7 @@ const SEND_TOOL: &str = "telegram__send_message";
 struct SavedMessagesOnlyExecutor {
     inner: Arc<dyn ToolExecutor>,
     marker: String,
+    saved_chat_id: Mutex<Option<String>>,
     write_started: AtomicBool,
     send_finished: AtomicBool,
     post_send_marker_verified: AtomicBool,
@@ -36,6 +37,7 @@ impl SavedMessagesOnlyExecutor {
         Self {
             inner,
             marker,
+            saved_chat_id: Mutex::new(None),
             write_started: AtomicBool::new(false),
             send_finished: AtomicBool::new(false),
             post_send_marker_verified: AtomicBool::new(false),
@@ -45,6 +47,21 @@ impl SavedMessagesOnlyExecutor {
     fn model_verified_marker_after_send(&self) -> bool {
         self.post_send_marker_verified.load(Ordering::SeqCst)
     }
+
+    fn saved_chat_id(&self) -> Option<String> {
+        self.saved_chat_id.lock().unwrap().clone()
+    }
+}
+
+fn saved_messages_chat_id(content: &str) -> Option<String> {
+    let result: Value = serde_json::from_str(content).ok()?;
+    let mut matches = result
+        .get("chats")?
+        .as_array()?
+        .iter()
+        .filter(|chat| chat.get("is_self").and_then(Value::as_bool) == Some(true));
+    let chat_id = matches.next()?.get("chat_id")?.as_str()?.to_owned();
+    matches.next().is_none().then_some(chat_id)
 }
 
 impl ToolExecutor for SavedMessagesOnlyExecutor {
@@ -72,12 +89,14 @@ impl ToolExecutor for SavedMessagesOnlyExecutor {
             let is_write = self.inner.is_read_only(&call.name) != Some(true)
                 || call.name == SEND_TOOL
                 || route.tool_name == "send_message";
+            let saved_chat_id = self.saved_chat_id();
             if is_write {
                 let permitted = call.name == SEND_TOOL
                     && route.server_name == "telegram"
                     && route.tool_name == "send_message"
                     && arguments.len() == 2
-                    && arguments.get("chat").and_then(Value::as_str) == Some("me")
+                    && arguments.get("chat_id").and_then(Value::as_str) == saved_chat_id.as_deref()
+                    && saved_chat_id.is_some()
                     && arguments.get("text").and_then(Value::as_str) == Some(self.marker.as_str());
                 if !permitted
                     || self
@@ -101,10 +120,19 @@ impl ToolExecutor for SavedMessagesOnlyExecutor {
                 && route.server_name == "telegram"
                 && route.tool_name == "read_chat"
                 && arguments.len() == 2
-                && arguments.get("chat").and_then(Value::as_str) == Some("me")
+                && arguments.get("chat_id").and_then(Value::as_str) == saved_chat_id.as_deref()
+                && saved_chat_id.is_some()
                 && arguments.get("limit").and_then(Value::as_u64) == Some(100);
             let result = self.inner.call(call).await;
-            if is_write {
+            if route.server_name == "telegram" && route.tool_name == "list_chats" {
+                if let Ok(output) = &result
+                    && !output.is_error
+                    && !output.delivery_uncertain
+                    && let Some(chat_id) = saved_messages_chat_id(&output.content)
+                {
+                    *self.saved_chat_id.lock().unwrap() = Some(chat_id);
+                }
+            } else if is_write {
                 self.send_finished.store(true, Ordering::SeqCst);
             } else if post_send_read
                 && result.as_ref().is_ok_and(|output| {
@@ -225,14 +253,12 @@ async fn rust_registry_lists_and_reads_saved_messages() {
     .await;
     let chats: Value = serde_json::from_str(&chats.content)
         .unwrap_or_else(|_| panic!("invalid_list_chats_result"));
-    assert!(
-        chats.get("chats").and_then(Value::as_array).is_some(),
-        "invalid_list_chats_result"
-    );
+    let chat_id = saved_messages_chat_id(&chats.to_string())
+        .unwrap_or_else(|| panic!("saved_messages_chat_id_missing"));
     let read = live_call(
         registry.as_ref(),
         "telegram__read_chat",
-        json!({"chat":"me","limit":5}),
+        json!({"chat_id":chat_id,"limit":5}),
     )
     .await;
     marker_occurrences(&read.content, "").unwrap_or_else(|safe_code| panic!("{safe_code}"));
@@ -283,9 +309,10 @@ log_payloads = false
         .with_tool_executor(executor.clone());
     let prompt = format!(
         "Perform this acceptance check in order: call telegram__list_chats with limit=1; \
-         call telegram__read_chat with chat=me and limit=1; send exactly this text once \
-         using telegram__send_message with chat=me: {marker}\n\
-         Then use telegram__read_chat with chat=me and limit=100 to verify the exact marker \
+         take the chat_id from the result whose is_self is true; call telegram__read_chat \
+         with that chat_id and limit=1; send exactly this text once using \
+         telegram__send_message with the same chat_id: {marker}\n\
+         Then use telegram__read_chat with the same chat_id and limit=100 to verify the exact marker \
          appears once. Never retry a send, including after errors or uncertainty. \
          Do not send other text or write to another destination. Your final answer must \
          be a brief status without names, identifiers, message contents, or the marker."
@@ -336,8 +363,14 @@ log_payloads = false
     println!("saved_messages_write_attempted={write_started}; automatic_send_retry=false");
     // This is a read, even if the agent failed after starting a write. Never
     // rerun the agent or call send_message to repair an uncertain outcome.
+    let diagnostic_chat_id = executor
+        .saved_chat_id()
+        .unwrap_or_else(|| panic!("saved_messages_chat_id_missing"));
     let diagnostic = registry
-        .call(&call("telegram__read_chat", r#"{"chat":"me","limit":100}"#))
+        .call(&call(
+            "telegram__read_chat",
+            &json!({"chat_id":diagnostic_chat_id,"limit":100}).to_string(),
+        ))
         .await;
     match diagnostic {
         Ok(read) if !read.is_error => match marker_occurrences(&read.content, &marker) {
@@ -441,6 +474,13 @@ mod deterministic {
             Box::pin(async move {
                 if call.name == "telegram__read_chat" {
                     self.read_result.clone()
+                } else if call.name == "telegram__list_chats" {
+                    Ok(ToolExecutionResult {
+                        content: json!({"chats":[{"chat_id":"7","is_self":true}]}).to_string(),
+                        is_error: false,
+                        error_code: None,
+                        delivery_uncertain: false,
+                    })
                 } else {
                     Ok(ToolExecutionResult {
                         content: "{}".into(),
@@ -461,8 +501,8 @@ mod deterministic {
         let executor = SavedMessagesOnlyExecutor::new(inner.clone(), MARKER.into());
         for request in [
             call("telegram__list_chats", "{}"),
-            call("telegram__read_chat", r#"{"chat":"me","limit":100}"#),
-            send_call("me", MARKER),
+            call("telegram__read_chat", r#"{"chat_id":"7","limit":100}"#),
+            send_call("7", MARKER),
         ] {
             let _ = executor.call(&request).await;
         }
@@ -479,7 +519,10 @@ mod deterministic {
         let (inner, executor) = model_sequence(SequenceExecutor::new(), None).await;
         assert!(!executor.model_verified_marker_after_send());
         let diagnostic = inner
-            .call(&call("telegram__read_chat", r#"{"chat":"me","limit":100}"#))
+            .call(&call(
+                "telegram__read_chat",
+                r#"{"chat_id":"7","limit":100}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(marker_occurrences(&diagnostic.content, MARKER), Ok(1));
@@ -490,7 +533,7 @@ mod deterministic {
     async fn model_acceptance_requires_a_valid_post_send_marker_read() {
         let (_, executor) = model_sequence(
             SequenceExecutor::new(),
-            Some(json!({"chat":"me","limit":100})),
+            Some(json!({"chat_id":"7","limit":100})),
         )
         .await;
         assert!(executor.model_verified_marker_after_send());
@@ -499,10 +542,10 @@ mod deterministic {
     #[tokio::test]
     async fn model_acceptance_rejects_wrong_post_send_chat_limit_or_route() {
         for arguments in [
-            json!({"chat":"another","limit":100}),
-            json!({"chat":"me","limit":5}),
-            json!({"chat":"me","limit":"100"}),
-            json!({"chat":"me","limit":100,"extra":true}),
+            json!({"chat_id":"8","limit":100}),
+            json!({"chat_id":"7","limit":5}),
+            json!({"chat_id":"7","limit":"100"}),
+            json!({"chat_id":"7","limit":100,"extra":true}),
         ] {
             let (_, executor) = model_sequence(SequenceExecutor::new(), Some(arguments)).await;
             assert!(!executor.model_verified_marker_after_send());
@@ -519,7 +562,8 @@ mod deterministic {
         ] {
             let mut probe = SequenceExecutor::new();
             probe.read_route = read_route;
-            let (_, executor) = model_sequence(probe, Some(json!({"chat":"me","limit":100}))).await;
+            let (_, executor) =
+                model_sequence(probe, Some(json!({"chat_id":"7","limit":100}))).await;
             assert!(!executor.model_verified_marker_after_send());
         }
     }
@@ -534,7 +578,8 @@ mod deterministic {
         ] {
             let mut probe = SequenceExecutor::new();
             probe.read_result.as_mut().unwrap().content = content;
-            let (_, executor) = model_sequence(probe, Some(json!({"chat":"me","limit":100}))).await;
+            let (_, executor) =
+                model_sequence(probe, Some(json!({"chat_id":"7","limit":100}))).await;
             assert!(!executor.model_verified_marker_after_send());
         }
         for failure in [
@@ -554,7 +599,8 @@ mod deterministic {
         ] {
             let mut probe = SequenceExecutor::new();
             probe.read_result = failure;
-            let (_, executor) = model_sequence(probe, Some(json!({"chat":"me","limit":100}))).await;
+            let (_, executor) =
+                model_sequence(probe, Some(json!({"chat_id":"7","limit":100}))).await;
             assert!(!executor.model_verified_marker_after_send());
         }
     }
@@ -620,11 +666,15 @@ mod deterministic {
     fn guarded(probe: ProbeExecutor) -> (Arc<ProbeExecutor>, SavedMessagesOnlyExecutor) {
         let inner = Arc::new(probe);
         let executor = SavedMessagesOnlyExecutor::new(inner.clone(), MARKER.into());
+        *executor.saved_chat_id.lock().unwrap() = Some("7".into());
         (inner, executor)
     }
 
-    fn send_call(chat: &str, text: &str) -> ModelToolCall {
-        call(SEND_TOOL, &json!({"chat":chat,"text":text}).to_string())
+    fn send_call(chat_id: &str, text: &str) -> ModelToolCall {
+        call(
+            SEND_TOOL,
+            &json!({"chat_id":chat_id,"text":text}).to_string(),
+        )
     }
 
     fn was_rejected(result: Result<ToolExecutionResult, ToolExecutionError>) -> bool {
@@ -675,7 +725,7 @@ mod deterministic {
         });
         let (inner, executor) = guarded(probe);
         let result = executor
-            .call(&call("telegram__read_chat", r#"{"chat":"me","limit":5}"#))
+            .call(&call("telegram__read_chat", r#"{"chat_id":"7","limit":5}"#))
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -685,7 +735,7 @@ mod deterministic {
     #[tokio::test]
     async fn guard_allows_exact_marker_once_even_with_a_new_call_id() {
         let (inner, executor) = guarded(ProbeExecutor::new(SEND_TOOL, Some(false)));
-        let first = send_call("me", MARKER);
+        let first = send_call("7", MARKER);
         assert!(!executor.call(&first).await.unwrap().is_error);
         let mut second = first.clone();
         second.id = "another-provider-id".into();
@@ -698,7 +748,7 @@ mod deterministic {
         let mut probe = ProbeExecutor::new(SEND_TOOL, Some(false));
         probe.result = Err(ToolExecutionError::Timeout);
         let (inner, executor) = guarded(probe);
-        let write = send_call("me", MARKER);
+        let write = send_call("7", MARKER);
         assert_eq!(
             executor.call(&write).await,
             Err(ToolExecutionError::Timeout)
@@ -710,10 +760,10 @@ mod deterministic {
     #[tokio::test]
     async fn guard_rejects_another_chat_or_different_marker_before_dispatch() {
         for write in [
-            send_call("someone_else", MARKER),
-            send_call("ME", MARKER),
-            send_call("me", "another-text"),
-            send_call("me", &format!("{MARKER} extra")),
+            send_call("8", MARKER),
+            send_call("-7", MARKER),
+            send_call("7", "another-text"),
+            send_call("7", &format!("{MARKER} extra")),
         ] {
             let (inner, executor) = guarded(ProbeExecutor::new(SEND_TOOL, Some(false)));
             assert!(was_rejected(executor.call(&write).await));
@@ -725,7 +775,7 @@ mod deterministic {
     async fn guard_rejects_different_and_unknown_write_tools_before_dispatch() {
         for name in ["telegram__delete_message", "other__send_message"] {
             let (inner, executor) = guarded(ProbeExecutor::new(name, Some(false)));
-            let write = call(name, &json!({"chat":"me","text":MARKER}).to_string());
+            let write = call(name, &json!({"chat_id":"7","text":MARKER}).to_string());
             assert!(was_rejected(executor.call(&write).await));
             assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
         }
@@ -742,10 +792,10 @@ mod deterministic {
             "null",
             r#""text""#,
             "{}",
-            r#"{"chat":"me"}"#,
-            r#"{"chat":"me","text":4}"#,
-            r#"{"chat":["me"],"text":"synthetic-acceptance-marker"}"#,
-            r#"{"chat":"me","text":"synthetic-acceptance-marker","extra":true}"#,
+            r#"{"chat_id":"7"}"#,
+            r#"{"chat_id":"7","text":4}"#,
+            r#"{"chat_id":["7"],"text":"synthetic-acceptance-marker"}"#,
+            r#"{"chat_id":"7","text":"synthetic-acceptance-marker","extra":true}"#,
         ] {
             let (inner, executor) = guarded(ProbeExecutor::new(SEND_TOOL, Some(false)));
             assert!(was_rejected(
@@ -771,7 +821,7 @@ mod deterministic {
             let mut probe = ProbeExecutor::new(SEND_TOOL, Some(false));
             probe.route = route;
             let (inner, executor) = guarded(probe);
-            assert!(was_rejected(executor.call(&send_call("me", MARKER)).await));
+            assert!(was_rejected(executor.call(&send_call("7", MARKER)).await));
             assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
         }
         let mut probe = ProbeExecutor::new("read_without_route", Some(true));
@@ -787,9 +837,7 @@ mod deterministic {
     async fn guard_treats_missing_classification_as_write_and_checks_mislabelled_send() {
         for classification in [None, Some(true)] {
             let (inner, executor) = guarded(ProbeExecutor::new(SEND_TOOL, classification));
-            assert!(was_rejected(
-                executor.call(&send_call("someone_else", MARKER)).await
-            ));
+            assert!(was_rejected(executor.call(&send_call("8", MARKER)).await));
             assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
         }
         let mut probe = ProbeExecutor::new("unclassified", None);

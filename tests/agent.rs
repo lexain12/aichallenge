@@ -125,7 +125,11 @@ async fn legacy_agent_tool_executes_then_persists_only_final_text() {
     mount_sequence(
         &server,
         [
-            tool_response(&[("call_1", "telegram__read_chat", r#"{"chat":"SECRET_ARG"}"#)]),
+            tool_response(&[(
+                "call_1",
+                "telegram__read_chat",
+                r#"{"chat_id":"SECRET_ARG"}"#,
+            )]),
             sse("Done", 7, 2, 9),
         ],
     )
@@ -272,7 +276,7 @@ async fn server_reported_delivery_unknown_survives_registry_agent_and_audit() {
             tool_response(&[(
                 "server-uncertain",
                 "fixture__send_message",
-                r#"{"chat":"me","text":"synthetic-private-marker"}"#,
+                r#"{"chat_id":"7","text":"synthetic-private-marker"}"#,
             )]),
             sse(
                 "Delivery unknown; inspect the chat before another send.",
@@ -395,6 +399,39 @@ async fn tool_errors_are_safe_audited_and_returned_to_the_model() {
             Err(ToolExecutionError::InvalidArguments),
             ToolExecutionStatus::Failed,
             "invalid_arguments",
+        ),
+        (
+            true,
+            Ok(ToolExecutionResult {
+                content: r#"{"error":"rate_limited"}"#.into(),
+                is_error: true,
+                error_code: Some("rate_limited".into()),
+                delivery_uncertain: false,
+            }),
+            ToolExecutionStatus::Failed,
+            "rate_limited",
+        ),
+        (
+            true,
+            Ok(ToolExecutionResult {
+                content: r#"{"error":"chat_not_found"}"#.into(),
+                is_error: true,
+                error_code: Some("chat_not_found".into()),
+                delivery_uncertain: false,
+            }),
+            ToolExecutionStatus::Failed,
+            "chat_not_found",
+        ),
+        (
+            true,
+            Ok(ToolExecutionResult {
+                content: r#"{"error":"telegram_unauthorized"}"#.into(),
+                is_error: true,
+                error_code: Some("telegram_unauthorized".into()),
+                delivery_uncertain: false,
+            }),
+            ToolExecutionStatus::Failed,
+            "telegram_unauthorized",
         ),
         (
             true,

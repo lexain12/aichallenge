@@ -21,9 +21,9 @@ from telegram_mcp.models import (
 class TelegramGateway(Protocol):
     async def list_chats(self, query: str | None, limit: int) -> ChatListResult: ...
 
-    async def read_chat(self, chat: str, limit: int) -> ReadChatResult: ...
+    async def read_chat(self, chat_id: str, limit: int) -> ReadChatResult: ...
 
-    async def send_message(self, chat: str, text: str) -> SendMessageResult: ...
+    async def send_message(self, chat_id: str, text: str) -> SendMessageResult: ...
 
 
 class TelegramToolFailure(Exception):
@@ -87,7 +87,10 @@ class TelethonGateway:
         self._settings = settings
         self._client = client
         self._connect_lock = asyncio.Lock()
+        self._dialog_scan_lock = asyncio.Lock()
         self._me: object | None = None
+        self._chats_by_id: dict[str, _ResolvedChat] = {}
+        self._missing_chat_ids: set[str] = set()
 
     async def _ensure_connected(self) -> None:
         async with self._connect_lock:
@@ -131,93 +134,99 @@ class TelethonGateway:
             self._me,
         )
 
-    async def _all_chats(self) -> list[_ResolvedChat]:
-        await self._ensure_connected()
-        saved = self._saved_chat()
-        self_id = saved.summary.chat_id
-        chats = [saved]
-        try:
-            async for dialog in self._client.iter_dialogs():
-                if str(dialog.id) == self_id:
-                    continue
-                entity = dialog.entity
-                if getattr(entity, "bot", False):
-                    kind = "bot"
-                elif dialog.is_group or getattr(entity, "megagroup", False):
-                    kind = "group"
-                elif dialog.is_channel:
-                    kind = "channel"
-                else:
-                    kind = "private"
-                chats.append(
-                    _ResolvedChat(
-                        ChatSummary(
-                            chat_id=str(dialog.id),
-                            title=dialog.name,
-                            username=getattr(entity, "username", None),
-                            kind=kind,
-                            is_self=False,
-                        ),
-                        entity,
-                    )
-                )
-        except Exception as error:
-            raise _safe_failure(error) from None
-        return chats
+    @staticmethod
+    def _resolved_dialog(dialog: object) -> _ResolvedChat:
+        entity = dialog.entity
+        if getattr(entity, "bot", False):
+            kind = "bot"
+        elif dialog.is_group or getattr(entity, "megagroup", False):
+            kind = "group"
+        elif dialog.is_channel:
+            kind = "channel"
+        else:
+            kind = "private"
+        return _ResolvedChat(
+            ChatSummary(
+                chat_id=str(dialog.id),
+                title=dialog.name,
+                username=getattr(entity, "username", None),
+                kind=kind,
+                is_self=False,
+            ),
+            entity,
+        )
 
     async def list_chats(self, query: str | None, limit: int) -> ChatListResult:
+        await self._ensure_connected()
         needle = query.casefold() if query else None
         matches = []
-        for chat in await self._all_chats():
+
+        def consider(chat: _ResolvedChat) -> bool:
+            self._chats_by_id[chat.summary.chat_id] = chat
+            self._missing_chat_ids.discard(chat.summary.chat_id)
             summary = chat.summary
             if needle and needle not in summary.title.casefold() and needle not in (
                 summary.username or ""
             ).casefold():
-                continue
+                return False
             matches.append(summary)
-            if len(matches) >= limit:
-                break
+            return len(matches) >= limit
+
+        saved = self._saved_chat()
+        if consider(saved):
+            return ChatListResult(chats=matches)
+
+        async with self._dialog_scan_lock:
+            # A fresh list operation is also the explicit refresh mechanism for
+            # IDs that were absent during an earlier complete scan.
+            self._missing_chat_ids.clear()
+            try:
+                async for dialog in self._client.iter_dialogs():
+                    if str(dialog.id) == saved.summary.chat_id:
+                        continue
+                    if consider(self._resolved_dialog(dialog)):
+                        break
+            except Exception as error:
+                raise _safe_failure(error) from None
         return ChatListResult(chats=matches)
 
-    async def _resolve(self, chat: str) -> _ResolvedChat:
-        if chat.casefold() == "me":
-            await self._ensure_connected()
-            return self._saved_chat()
+    async def _resolve(self, chat_id: str) -> _ResolvedChat:
+        unsigned = chat_id.removeprefix("-")
+        if not unsigned or not unsigned.isascii() or not unsigned.isdecimal():
+            raise TelegramToolFailure("chat_not_found", "Chat ID was not found")
 
-        chats = await self._all_chats()
+        await self._ensure_connected()
+        saved = self._saved_chat()
+        self._chats_by_id.setdefault(saved.summary.chat_id, saved)
 
-        if chat.lstrip("-").isdecimal():
-            by_id = [item for item in chats if item.summary.chat_id == chat]
-            if by_id:
-                return by_id[0]
+        cached = self._chats_by_id.get(chat_id)
+        if cached is not None:
+            return cached
+        if chat_id in self._missing_chat_ids:
+            raise TelegramToolFailure("chat_not_found", "Chat ID was not found")
 
-        username = chat.removeprefix("@").casefold()
-        by_username = [
-            item for item in chats
-            if item.summary.username and item.summary.username.casefold() == username
-        ]
-        if by_username:
-            return self._unique(by_username)
+        async with self._dialog_scan_lock:
+            cached = self._chats_by_id.get(chat_id)
+            if cached is not None:
+                return cached
+            if chat_id in self._missing_chat_ids:
+                raise TelegramToolFailure("chat_not_found", "Chat ID was not found")
 
-        by_title = [
-            item for item in chats if item.summary.title.casefold() == chat.casefold()
-        ]
-        if by_title:
-            return self._unique(by_title)
-        raise TelegramToolFailure("chat_not_found", "Chat was not found")
+            try:
+                async for dialog in self._client.iter_dialogs():
+                    if str(dialog.id) == saved.summary.chat_id:
+                        continue
+                    resolved = self._resolved_dialog(dialog)
+                    self._chats_by_id[resolved.summary.chat_id] = resolved
+                    if resolved.summary.chat_id == chat_id:
+                        return resolved
+            except Exception as error:
+                raise _safe_failure(error) from None
+            self._missing_chat_ids.add(chat_id)
+        raise TelegramToolFailure("chat_not_found", "Chat ID was not found")
 
-    @staticmethod
-    def _unique(matches: list[_ResolvedChat]) -> _ResolvedChat:
-        if len(matches) > 1:
-            raise TelegramToolFailure(
-                "ambiguous_chat",
-                "Multiple chats match; choose a chat_id",
-                [item.summary for item in matches],
-            )
-        return matches[0]
-
-    async def read_chat(self, chat: str, limit: int) -> ReadChatResult:
-        resolved = await self._resolve(chat)
+    async def read_chat(self, chat_id: str, limit: int) -> ReadChatResult:
+        resolved = await self._resolve(chat_id)
         messages = []
         try:
             async for message in self._client.iter_messages(resolved.entity, limit=limit):
@@ -241,8 +250,8 @@ class TelethonGateway:
             messages=messages,
         )
 
-    async def send_message(self, chat: str, text: str) -> SendMessageResult:
-        resolved = await self._resolve(chat)
+    async def send_message(self, chat_id: str, text: str) -> SendMessageResult:
+        resolved = await self._resolve(chat_id)
         try:
             sent = await self._client.send_message(resolved.entity, text, parse_mode=None)
         except Exception as error:

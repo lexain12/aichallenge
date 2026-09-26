@@ -10,6 +10,9 @@
 
 /reports/*.md
 
+/log.jsonl
+/profiles/
+
 *.sqlite3
 *.sqlite3-journal
 *.sqlite3-wal

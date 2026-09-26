@@ -50,7 +50,7 @@ fn tool_definitions() -> Vec<ModelToolDefinition> {
         name: "telegram__read_chat".into(),
         description: Some("Read a chat".into()),
         parameters:
-            json!({"type":"object","properties":{"chat":{"type":"string"}},"required":["chat"]})
+            json!({"type":"object","properties":{"chat_id":{"type":"string"}},"required":["chat_id"]})
                 .as_object()
                 .unwrap()
                 .clone(),
@@ -98,7 +98,7 @@ async fn tool_request_serializes_provider_messages_and_function_envelope() {
     let call = ModelToolCall {
         id: "call_1".into(),
         name: "telegram__read_chat".into(),
-        arguments: r#"{"chat":"me"}"#.into(),
+        arguments: r#"{"chat_id":"7"}"#.into(),
     };
     let mut messages: Vec<_> = request_messages()
         .iter()
@@ -128,10 +128,10 @@ async fn tool_request_serializes_provider_messages_and_function_envelope() {
                 {"role":"system","content":"Be concise."},
                 {"role":"user","content":"Hello"},
                 {"role":"assistant","content":"Looking."},
-                {"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"telegram__read_chat","arguments":"{\"chat\":\"me\"}"}}]},
+                {"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"telegram__read_chat","arguments":"{\"chat_id\":\"7\"}"}}]},
                 {"role":"tool","content":"chat contents","tool_call_id":"call_1"}
             ],
-            "tools":[{"type":"function","function":{"name":"telegram__read_chat","description":"Read a chat","parameters":{"type":"object","properties":{"chat":{"type":"string"}},"required":["chat"]}}}]
+            "tools":[{"type":"function","function":{"name":"telegram__read_chat","description":"Read a chat","parameters":{"type":"object","properties":{"chat_id":{"type":"string"}},"required":["chat_id"]}}}]
         })
     );
 }
@@ -141,9 +141,9 @@ async fn tool_request_serializes_provider_messages_and_function_envelope() {
 async fn reassembles_fragmented_tool_calls_by_index() {
     let body = tool_sse(
         vec![
-            json!({"content":null,"tool_calls":[{"index":9,"id":"call_","type":"function","function":{"name":"telegram__send_","arguments":"{\"chat\":"}}]}),
-            json!({"content":"","tool_calls":[{"index":2,"id":"call_","type":"function","function":{"name":"telegram__","arguments":"{\"chat\":\""}},{"index":9,"id":"send","function":{"name":"message","arguments":"\"me\",\"text\":"}}]}),
-            json!({"tool_calls":[{"index":9,"function":{"arguments":"\"hi\"}"}},{"index":2,"id":"read","function":{"name":"read_chat","arguments":"me\"}"}}]}),
+            json!({"content":null,"tool_calls":[{"index":9,"id":"call_","type":"function","function":{"name":"telegram__send_","arguments":"{\"chat_id\":"}}]}),
+            json!({"content":"","tool_calls":[{"index":2,"id":"call_","type":"function","function":{"name":"telegram__","arguments":"{\"chat_id\":\""}},{"index":9,"id":"send","function":{"name":"message","arguments":"\"7\",\"text\":"}}]}),
+            json!({"tool_calls":[{"index":9,"function":{"arguments":"\"hi\"}"}},{"index":2,"id":"read","function":{"name":"read_chat","arguments":"7\"}"}}]}),
         ],
         true,
     );
@@ -166,12 +166,12 @@ async fn reassembles_fragmented_tool_calls_by_index() {
             ModelToolCall {
                 id: "call_read".into(),
                 name: "telegram__read_chat".into(),
-                arguments: r#"{"chat":"me"}"#.into()
+                arguments: r#"{"chat_id":"7"}"#.into()
             },
             ModelToolCall {
                 id: "call_send".into(),
                 name: "telegram__send_message".into(),
-                arguments: r#"{"chat":"me","text":"hi"}"#.into()
+                arguments: r#"{"chat_id":"7","text":"hi"}"#.into()
             },
         ]
     );

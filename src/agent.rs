@@ -1293,8 +1293,11 @@ where
             Err(ToolExecutionError::Transport) => Some("transport"),
             Ok(output) if output.is_error || output.delivery_uncertain => {
                 Some(match output.error_code.as_deref() {
-                    Some("unsupported_content") => "unsupported_content",
+                    Some("chat_not_found") => "chat_not_found",
                     Some("mcp_tool_error") => "mcp_tool_error",
+                    Some("rate_limited") => "rate_limited",
+                    Some("telegram_unauthorized") => "telegram_unauthorized",
+                    Some("unsupported_content") => "unsupported_content",
                     _ => "tool_error",
                 })
             }

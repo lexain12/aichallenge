@@ -237,15 +237,21 @@ struct SafeToolError {
     code: SafeToolErrorCode,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SafeToolErrorCode {
+    ChatNotFound,
     DeliveryUnknown,
+    RateLimited,
+    TelegramUnauthorized,
 }
 
 /// Accept only the versioned, allowlisted envelope, never free-form error
 /// messages. The Python SDK wraps ToolError in this exact original-name prefix.
-fn server_reports_delivery_unknown(result: &CallToolResult, original_name: &str) -> bool {
+fn server_reported_safe_error(
+    result: &CallToolResult,
+    original_name: &str,
+) -> Option<SafeToolErrorCode> {
     let envelope: Option<SafeToolErrorEnvelope> =
         if let Some(structured) = &result.structured_content {
             serde_json::from_value(structured.clone()).ok()
@@ -256,22 +262,24 @@ fn server_reports_delivery_unknown(result: &CallToolResult, original_name: &str)
         } else {
             None
         };
-    envelope.is_some_and(|envelope| {
-        envelope.mcp_error.version == 1
-            && matches!(envelope.mcp_error.code, SafeToolErrorCode::DeliveryUnknown)
-    })
+    envelope
+        .filter(|envelope| envelope.mcp_error.version == 1)
+        .map(|envelope| envelope.mcp_error.code)
 }
 
 fn convert_result(result: CallToolResult, route: &Route) -> ToolExecutionResult {
     let is_error = result.is_error.unwrap_or(false);
     if is_error {
-        let delivery_uncertain =
-            !route.read_only && server_reports_delivery_unknown(&result, &route.original_name);
-        let code = if delivery_uncertain {
-            "delivery_unknown"
-        } else {
-            "mcp_tool_error"
-        };
+        let (code, delivery_uncertain) =
+            match server_reported_safe_error(&result, &route.original_name) {
+                Some(SafeToolErrorCode::DeliveryUnknown) if !route.read_only => {
+                    ("delivery_unknown", true)
+                }
+                Some(SafeToolErrorCode::ChatNotFound) => ("chat_not_found", false),
+                Some(SafeToolErrorCode::RateLimited) => ("rate_limited", false),
+                Some(SafeToolErrorCode::TelegramUnauthorized) => ("telegram_unauthorized", false),
+                Some(SafeToolErrorCode::DeliveryUnknown) | None => ("mcp_tool_error", false),
+            };
         return ToolExecutionResult {
             content: serde_json::json!({"error":code}).to_string(),
             is_error: true,

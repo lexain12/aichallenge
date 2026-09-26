@@ -70,6 +70,8 @@ class FakeClient:
         self.authorized = True
         self.connect_calls = 0
         self.get_me_calls = 0
+        self.iter_dialogs_calls = 0
+        self.iter_dialogs_yields = 0
         self.sent = []
         self.failure = None
         self.dialogs_failure = None
@@ -89,9 +91,11 @@ class FakeClient:
         return self.me
 
     async def iter_dialogs(self):
+        self.iter_dialogs_calls += 1
         if self.dialogs_failure is not None:
             raise self.dialogs_failure
         for item in self.dialogs:
+            self.iter_dialogs_yields += 1
             yield item
 
     async def iter_messages(self, entity, *, limit):
@@ -114,7 +118,7 @@ async def test_saved_messages_use_get_me_even_without_a_dialog(fake_client) -> N
     gateway = TelethonGateway(settings(), client=fake_client)
 
     listed = await gateway.list_chats(None, 10)
-    sent = await gateway.send_message("me", "hello")
+    sent = await gateway.send_message(listed.chats[0].chat_id, "hello")
 
     assert isinstance(listed, ChatListResult)
     assert listed.model_dump(mode="json") == {
@@ -128,11 +132,11 @@ async def test_saved_messages_use_get_me_even_without_a_dialog(fake_client) -> N
     assert fake_client.get_me_calls == 1
 
 
-async def test_me_resolves_without_loading_dialogs(fake_client) -> None:
+async def test_self_chat_id_resolves_without_loading_dialogs(fake_client) -> None:
     fake_client.dialogs_failure = RuntimeError("unrelated dialog failure")
     gateway = TelethonGateway(settings(), client=fake_client)
 
-    result = await gateway.send_message("me", "hello")
+    result = await gateway.send_message("7", "hello")
 
     assert result.chat_id == "7"
     assert fake_client.sent == [(fake_client.me, "hello", None)]
@@ -226,7 +230,7 @@ async def test_dispatched_write_is_not_requeued_after_connection_loss(monkeypatc
 
     monkeypatch.setattr(telegram, "TelegramClient", OfflineTelegramClient)
     gateway = TelethonGateway(Settings(123, "synthetic-hash", ""))
-    task = asyncio.create_task(gateway.send_message("me", "synthetic pending write"))
+    task = asyncio.create_task(gateway.send_message("7", "synthetic pending write"))
     try:
         await asyncio.wait_for(connection.sent.wait(), timeout=1)
         sender = gateway._client._sender
@@ -293,7 +297,40 @@ async def test_list_chats_filters_title_and_username_case_insensitively(fake_cli
     ]
 
 
-async def test_exact_dialog_id_resolves_before_username_or_title(fake_client) -> None:
+async def test_list_chats_stops_before_loading_unneeded_dialogs(fake_client) -> None:
+    fake_client.dialogs = [dialog(10, "Team"), dialog(20, "Other")]
+    gateway = TelethonGateway(settings(), client=fake_client)
+
+    result = await gateway.list_chats(None, 1)
+
+    assert [chat.chat_id for chat in result.chats] == ["7"]
+    assert fake_client.iter_dialogs_yields == 0
+
+
+async def test_listed_chat_id_reuses_entity_without_reloading_dialogs(fake_client) -> None:
+    fake_client.dialogs = [dialog(10, "Team")]
+    gateway = TelethonGateway(settings(), client=fake_client)
+
+    listed = await gateway.list_chats("team", 1)
+    result = await gateway.read_chat(listed.chats[0].chat_id, 1)
+
+    assert result.chat.chat_id == "10"
+    assert fake_client.iter_dialogs_calls == 1
+
+
+async def test_non_id_selector_is_rejected_without_loading_dialogs(fake_client) -> None:
+    fake_client.dialogs = [dialog(10, "Team", "target")]
+    gateway = TelethonGateway(settings(), client=fake_client)
+
+    with pytest.raises(TelegramToolFailure) as caught:
+        await gateway.send_message("@target", "never")
+
+    assert caught.value.code == "chat_not_found"
+    assert fake_client.iter_dialogs_calls == 0
+    assert fake_client.sent == []
+
+
+async def test_uncached_dialog_id_refreshes_dialogs_once(fake_client) -> None:
     fake_client.dialogs = [dialog(10, "Chosen"), dialog(20, "10", "10")]
     gateway = TelethonGateway(settings(), client=fake_client)
 
@@ -301,42 +338,50 @@ async def test_exact_dialog_id_resolves_before_username_or_title(fake_client) ->
 
     assert result.chat_id == "10"
     assert fake_client.sent[0][0] is fake_client.dialogs[0].entity
+    assert fake_client.iter_dialogs_calls == 1
+    assert fake_client.iter_dialogs_yields == 1
 
 
-async def test_exact_username_resolves_before_title(fake_client) -> None:
-    fake_client.dialogs = [dialog(10, "Alias", "target"), dialog(20, "TARGET")]
+async def test_concurrent_uncached_ids_share_one_dialog_scan(fake_client) -> None:
+    scan_started = asyncio.Event()
+    release_scan = asyncio.Event()
+
+    async def blocked_iter_dialogs():
+        fake_client.iter_dialogs_calls += 1
+        scan_started.set()
+        await release_scan.wait()
+        for item in fake_client.dialogs:
+            fake_client.iter_dialogs_yields += 1
+            yield item
+
+    fake_client.dialogs = [dialog(10, "Team")]
+    fake_client.iter_dialogs = blocked_iter_dialogs
     gateway = TelethonGateway(settings(), client=fake_client)
 
-    result = await gateway.send_message("@TaRgEt", "hello")
+    first = asyncio.create_task(gateway.read_chat("999", 1))
+    await scan_started.wait()
+    second = asyncio.create_task(gateway.read_chat("999", 1))
+    await asyncio.sleep(0)
+    release_scan.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
 
-    assert result.chat_id == "10"
-    assert fake_client.sent[0][0] is fake_client.dialogs[0].entity
+    assert all(
+        isinstance(result, TelegramToolFailure) and result.code == "chat_not_found"
+        for result in results
+    )
+    assert fake_client.iter_dialogs_calls == 1
 
 
-async def test_exact_title_is_case_insensitive_and_not_fuzzy(fake_client) -> None:
-    fake_client.dialogs = [dialog(10, "Team Updates")]
+async def test_repeated_missing_chat_id_does_not_rescan_dialogs(fake_client) -> None:
+    fake_client.dialogs = [dialog(10, "Team")]
     gateway = TelethonGateway(settings(), client=fake_client)
 
-    result = await gateway.send_message("TEAM UPDATES", "hello")
-    assert result.chat_id == "10"
+    for _ in range(2):
+        with pytest.raises(TelegramToolFailure) as caught:
+            await gateway.read_chat("999", 1)
+        assert caught.value.code == "chat_not_found"
 
-    with pytest.raises(TelegramToolFailure) as caught:
-        await gateway.send_message("Team", "never")
-    assert caught.value.code == "chat_not_found"
-    assert len(fake_client.sent) == 1
-
-
-async def test_duplicate_title_is_ambiguous_and_never_sends(fake_client) -> None:
-    fake_client.dialogs = [dialog(10, "Team"), dialog(20, "team")]
-    gateway = TelethonGateway(settings(), client=fake_client)
-
-    with pytest.raises(TelegramToolFailure) as caught:
-        await gateway.send_message("TEAM", "do not deliver")
-
-    assert caught.value.code == "ambiguous_chat"
-    assert [candidate.chat_id for candidate in caught.value.candidates] == ["10", "20"]
-    assert "do not deliver" not in str(caught.value)
-    assert fake_client.sent == []
+    assert fake_client.iter_dialogs_calls == 1
 
 
 async def test_read_chat_returns_latest_messages_oldest_first(fake_client) -> None:

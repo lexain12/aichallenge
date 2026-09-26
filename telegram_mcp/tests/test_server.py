@@ -38,8 +38,8 @@ class FakeGateway:
             raise self.failure
         return ChatListResult(chats=[CHAT])
 
-    async def read_chat(self, chat: str, limit: int) -> ReadChatResult:
-        self.calls.append(("read_chat", chat, limit))
+    async def read_chat(self, chat_id: str, limit: int) -> ReadChatResult:
+        self.calls.append(("read_chat", chat_id, limit))
         if self.failure:
             raise self.failure
         return ReadChatResult(
@@ -50,8 +50,8 @@ class FakeGateway:
             )],
         )
 
-    async def send_message(self, chat: str, text: str) -> SendMessageResult:
-        self.calls.append(("send_message", chat, text))
+    async def send_message(self, chat_id: str, text: str) -> SendMessageResult:
+        self.calls.append(("send_message", chat_id, text))
         if self.failure:
             raise self.failure
         return SendMessageResult(sent=True, chat_id="7", message_id=12, sent_at=NOW)
@@ -71,15 +71,18 @@ async def test_server_exposes_exactly_three_tools_with_expected_schemas(fake_gat
     assert tools["list_chats"].annotations.read_only_hint is True
     assert tools["read_chat"].annotations.read_only_hint is True
     assert tools["send_message"].annotations.read_only_hint is False
+    assert "chat_id" in tools["list_chats"].description
+    assert "list_chats" in tools["read_chat"].description
+    assert "list_chats" in tools["send_message"].description
 
     assert set(tools["list_chats"].input_schema["properties"]) == {"query", "limit"}
     assert tools["list_chats"].input_schema["properties"]["limit"]["minimum"] == 1
     assert tools["list_chats"].input_schema["properties"]["limit"]["maximum"] == 200
     assert tools["list_chats"].input_schema["properties"]["limit"]["default"] == 100
-    assert set(tools["read_chat"].input_schema["properties"]) == {"chat", "limit"}
+    assert set(tools["read_chat"].input_schema["properties"]) == {"chat_id", "limit"}
     assert tools["read_chat"].input_schema["properties"]["limit"]["minimum"] == 1
     assert tools["read_chat"].input_schema["properties"]["limit"]["maximum"] == 100
-    assert set(tools["send_message"].input_schema["properties"]) == {"chat", "text"}
+    assert set(tools["send_message"].input_schema["properties"]) == {"chat_id", "text"}
     assert tools["send_message"].input_schema["properties"]["text"]["minLength"] == 1
     assert tools["send_message"].input_schema["properties"]["text"]["maxLength"] == 4096
     assert all(tool.output_schema is not None for tool in tools.values())
@@ -88,13 +91,13 @@ async def test_server_exposes_exactly_three_tools_with_expected_schemas(fake_gat
 async def test_successful_tools_return_typed_structured_results(fake_gateway) -> None:
     async with Client(build_server(fake_gateway)) as client:
         listed = await client.call_tool("list_chats", {"query": "saved"})
-        read = await client.call_tool("read_chat", {"chat": "me", "limit": 1})
-        sent = await client.call_tool("send_message", {"chat": "me", "text": "hello"})
+        read = await client.call_tool("read_chat", {"chat_id": "7", "limit": 1})
+        sent = await client.call_tool("send_message", {"chat_id": "7", "text": "hello"})
 
     assert fake_gateway.calls == [
         ("list_chats", "saved", 100),
-        ("read_chat", "me", 1),
-        ("send_message", "me", "hello"),
+        ("read_chat", "7", 1),
+        ("send_message", "7", "hello"),
     ]
     assert listed.is_error is False
     assert listed.structured_content == {"chats": [CHAT.model_dump(mode="json")]}
@@ -119,13 +122,16 @@ async def test_list_chats_accepts_150_and_passes_it_to_gateway(fake_gateway) -> 
 @pytest.mark.parametrize("tool,args", [
     ("list_chats", {"limit": 0}),
     ("list_chats", {"limit": 201}),
-    ("read_chat", {"chat": "me", "limit": 0}),
-    ("read_chat", {"chat": "me", "limit": 101}),
-    ("read_chat", {"chat": ""}),
-    ("send_message", {"chat": "", "text": "hello"}),
-    ("send_message", {"chat": "me", "text": ""}),
-    ("send_message", {"chat": "me", "text": " \t\n "}),
-    ("send_message", {"chat": "me", "text": "x" * 4097}),
+    ("read_chat", {"chat_id": "7", "limit": 0}),
+    ("read_chat", {"chat_id": "7", "limit": 101}),
+    ("read_chat", {"chat_id": ""}),
+    ("read_chat", {"chat_id": "not-an-id"}),
+    ("read_chat", {"chat_id": "١٢"}),
+    ("read_chat", {"chat": "7"}),
+    ("send_message", {"chat_id": "", "text": "hello"}),
+    ("send_message", {"chat_id": "7", "text": ""}),
+    ("send_message", {"chat_id": "7", "text": " \t\n "}),
+    ("send_message", {"chat_id": "7", "text": "x" * 4097}),
 ])
 async def test_invalid_arguments_never_reach_gateway(fake_gateway, tool, args) -> None:
     async with Client(build_server(fake_gateway)) as client:
@@ -135,48 +141,58 @@ async def test_invalid_arguments_never_reach_gateway(fake_gateway, tool, args) -
     assert fake_gateway.calls == []
 
 
-async def test_known_gateway_failure_is_a_safe_tool_error(fake_gateway) -> None:
+async def test_known_gateway_failure_uses_a_code_only_mcp_error_envelope(fake_gateway) -> None:
     fake_gateway.failure = TelegramToolFailure(
-        "ambiguous_chat", "Multiple chats match; choose a chat_id", [CHAT]
+        "rate_limited", "PRIVATE_GATEWAY_DETAIL", [CHAT]
     )
 
     async with Client(build_server(fake_gateway)) as client:
-        result = await client.call_tool("send_message", {"chat": "Saved Messages", "text": "hello"})
+        result = await client.call_tool("send_message", {"chat_id": "7", "text": "hello"})
 
     assert result.is_error is True
     prefix, separator, payload = result.content[0].text.partition(": ")
     assert (prefix, separator) == ("Error executing tool send_message", ": ")
     error = json.loads(payload)
     assert error == {
-        "code": "ambiguous_chat",
-        "message": "Multiple chats match; choose a chat_id",
-        "candidates": [CHAT.model_dump(mode="json")],
+        "mcp_error": {"version": 1, "code": "rate_limited"},
     }
-    assert fake_gateway.calls == [("send_message", "Saved Messages", "hello")]
+    assert "PRIVATE_GATEWAY_DETAIL" not in result.content[0].text
+    assert fake_gateway.calls == [("send_message", "7", "hello")]
 
 
-async def test_ambiguous_candidates_remain_in_response_but_never_in_logs(fake_gateway, caplog) -> None:
+@pytest.mark.parametrize("code", ["chat_not_found", "telegram_unauthorized"])
+async def test_expected_gateway_failures_keep_their_safe_codes(fake_gateway, code) -> None:
+    fake_gateway.failure = TelegramToolFailure(code, "PRIVATE_GATEWAY_DETAIL", [CHAT])
+
+    async with Client(build_server(fake_gateway)) as client:
+        result = await client.call_tool("read_chat", {"chat_id": "7", "limit": 1})
+
+    payload = json.loads(result.content[0].text.partition(": ")[2])
+    assert payload == {"mcp_error": {"version": 1, "code": code}}
+    assert "PRIVATE_GATEWAY_DETAIL" not in result.content[0].text
+
+
+async def test_gateway_details_never_cross_the_mcp_boundary_or_logs(fake_gateway, caplog) -> None:
     private_chat = ChatSummary(
         chat_id="-1009876543210123", title="PRIVATE_CANDIDATE_TITLE",
         username="PRIVATE_CANDIDATE_USERNAME", kind="group", is_self=False,
     )
     fake_gateway.failure = TelegramToolFailure(
-        "ambiguous_chat", "Multiple chats match; choose a chat_id", [private_chat]
+        "rate_limited", "PRIVATE_GATEWAY_DETAIL", [private_chat]
     )
     with caplog.at_level(logging.INFO):
         async with Client(build_server(fake_gateway)) as client:
             result = await client.call_tool("send_message", {
-                "chat": "PRIVATE_ARGUMENT_CHAT", "text": "PRIVATE_ARGUMENT_MESSAGE",
+                "chat_id": "7", "text": "PRIVATE_ARGUMENT_MESSAGE",
             })
 
     assert result.is_error is True
     payload = json.loads(result.content[0].text.partition(": ")[2])
-    assert payload["candidates"] == [private_chat.model_dump(mode="json")]
-    assert payload["code"] == "ambiguous_chat"
+    assert payload == {"mcp_error": {"version": 1, "code": "rate_limited"}}
     assert caplog.records, "the SDK diagnostic should retain safe metadata"
     for sentinel in [
         private_chat.chat_id, private_chat.title, private_chat.username,
-        "PRIVATE_ARGUMENT_CHAT", "PRIVATE_ARGUMENT_MESSAGE", "candidates",
+        "PRIVATE_ARGUMENT_MESSAGE", "PRIVATE_GATEWAY_DETAIL", "candidates",
     ]:
         assert sentinel not in caplog.text
     assert "send_message" in caplog.text
@@ -201,7 +217,7 @@ async def test_unexpected_exceptions_never_log_details_or_tracebacks(
 
     with caplog.at_level(logging.INFO):
         async with Client(server) as client:
-            result = await client.call_tool("read_chat", {"chat": "me"})
+            result = await client.call_tool("read_chat", {"chat_id": "7"})
 
     assert result.is_error is True
     assert sentinel not in result.content[0].text
@@ -217,20 +233,20 @@ async def test_delivery_unknown_uses_the_shared_safe_mcp_error_envelope(fake_gat
         "delivery_unknown", "private error details must not cross this boundary", [CHAT]
     )
     async with Client(build_server(fake_gateway)) as client:
-        result = await client.call_tool("send_message", {"chat": "me", "text": "synthetic"})
+        result = await client.call_tool("send_message", {"chat_id": "7", "text": "synthetic"})
 
     fixture = Path(__file__).resolve().parents[2] / "tests/fixtures/mcp_delivery_unknown.json"
     assert result.model_dump(mode="json", by_alias=True, exclude_none=True) == json.loads(
         fixture.read_text()
     )
-    assert fake_gateway.calls == [("send_message", "me", "synthetic")]
+    assert fake_gateway.calls == [("send_message", "7", "synthetic")]
 
 
 async def test_unexpected_gateway_failure_is_not_presented_as_known_error(fake_gateway) -> None:
     fake_gateway.failure = RuntimeError("private gateway secret")
 
     async with Client(build_server(fake_gateway)) as client:
-        result = await client.call_tool("read_chat", {"chat": "me"})
+        result = await client.call_tool("read_chat", {"chat_id": "7"})
 
     assert result.is_error is True
     assert "private gateway secret" not in result.content[0].text

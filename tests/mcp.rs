@@ -41,7 +41,7 @@ impl FakeMcpClient {
 
     fn one() -> Self {
         Self::new(
-            json!([{"name":"read_chat", "description":"Read a chat", "inputSchema":{"type":"object", "properties":{"chat":{"type":"string"}}}, "annotations":{"readOnlyHint":true}}]),
+            json!([{"name":"read_chat", "description":"Read a chat", "inputSchema":{"type":"object", "properties":{"chat_id":{"type":"string"}}}, "annotations":{"readOnlyHint":true}}]),
         )
     }
 }
@@ -121,14 +121,14 @@ async fn discovers_namespaced_definitions_and_defaults_missing_read_only_to_fals
 async fn dispatches_namespaced_name_as_original_name() {
     let fake = FakeMcpClient::one();
     let registry = registry(fake.clone()).await;
-    registry.call(&call(r#"{"chat":"me"}"#)).await.unwrap();
+    registry.call(&call(r#"{"chat_id":"7"}"#)).await.unwrap();
     registry.call(&call("{}")).await.unwrap();
     assert_eq!(
         *fake.calls.lock().unwrap(),
         vec![
             (
                 "read_chat".into(),
-                json!({"chat":"me"}).as_object().unwrap().clone()
+                json!({"chat_id":"7"}).as_object().unwrap().clone()
             ),
             ("read_chat".into(), Map::new()),
         ]
@@ -165,6 +165,50 @@ async fn unrecognized_structured_error_is_sanitized_before_content_conversion() 
     assert!(result.is_error);
     assert_eq!(result.error_code.as_deref(), Some("mcp_tool_error"));
     assert!(!result.delivery_uncertain);
+}
+
+#[tokio::test]
+async fn allowlisted_rate_limit_on_a_read_reaches_the_model_as_a_safe_code() {
+    let mut fake = FakeMcpClient::one();
+    fake.result = serde_json::from_value(json!({
+        "isError": true,
+        "content": [{
+            "type": "text",
+            "text": "Error executing tool read_chat: {\"mcp_error\":{\"version\":1,\"code\":\"rate_limited\"}}"
+        }]
+    }))
+    .unwrap();
+
+    let result = registry(fake).await.call(&call("{}")).await.unwrap();
+
+    assert!(result.is_error);
+    assert!(!result.delivery_uncertain);
+    assert_eq!(result.error_code.as_deref(), Some("rate_limited"));
+    assert_eq!(result.content, r#"{"error":"rate_limited"}"#);
+}
+
+#[tokio::test]
+async fn allowlisted_telegram_read_errors_reach_the_model_as_safe_codes() {
+    for code in ["chat_not_found", "telegram_unauthorized"] {
+        let mut fake = FakeMcpClient::one();
+        fake.result = serde_json::from_value(json!({
+            "isError": true,
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "Error executing tool read_chat: {{\"mcp_error\":{{\"version\":1,\"code\":\"{code}\"}}}}"
+                )
+            }]
+        }))
+        .unwrap();
+
+        let result = registry(fake).await.call(&call("{}")).await.unwrap();
+
+        assert!(result.is_error);
+        assert!(!result.delivery_uncertain);
+        assert_eq!(result.error_code.as_deref(), Some(code));
+        assert_eq!(result.content, json!({"error": code}).to_string());
+    }
 }
 
 #[tokio::test]
@@ -363,7 +407,7 @@ async fn http_adapter_discovers_all_pages_and_reuses_initialized_client() {
         vec!["telegram__read_chat", "telegram__second"]
     );
     for _ in 0..2 {
-        let result = registry.call(&call(r#"{"chat":"me"}"#)).await.unwrap();
+        let result = registry.call(&call(r#"{"chat_id":"7"}"#)).await.unwrap();
         assert_eq!(result.content, "adapter result");
     }
     let requests = server.received_requests().await.unwrap();
@@ -386,7 +430,7 @@ async fn http_adapter_discovers_all_pages_and_reuses_initialized_client() {
     assert_eq!(calls.len(), 2);
     for call in calls {
         assert_eq!(call["params"]["name"], "read_chat");
-        assert_eq!(call["params"]["arguments"], json!({"chat":"me"}));
+        assert_eq!(call["params"]["arguments"], json!({"chat_id":"7"}));
     }
 }
 

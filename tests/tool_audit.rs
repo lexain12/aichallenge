@@ -33,7 +33,7 @@ fn audit_stores_only_metadata_and_survives_reopen() {
         dialog,
         message,
         "call-1",
-        r#"{"text":"PRIVATE_PAYLOAD_MARKER_8943","chat":"me"}"#,
+        r#"{"text":"PRIVATE_PAYLOAD_MARKER_8943","chat_id":"7"}"#,
     );
     let row = store.tool_execution(id).unwrap().unwrap();
     assert_eq!(row.status, ToolExecutionStatus::Started);

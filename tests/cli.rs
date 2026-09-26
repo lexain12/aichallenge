@@ -425,7 +425,7 @@ async fn cli_tool_lifecycle_output(tool_result: Value) -> Output {
         "content":"PRIVATE_INTERMEDIATE_TEXT",
         "tool_calls":[{"index":0,"id":"call_1","type":"function","function":{
             "name":"telegram__send_message",
-            "arguments":json!({"chat":"PRIVATE_ARGUMENT_CHAT","text":"PRIVATE_ARGUMENT_MESSAGE"}).to_string()
+            "arguments":json!({"chat_id":"PRIVATE_ARGUMENT_CHAT","text":"PRIVATE_ARGUMENT_MESSAGE"}).to_string()
         }}]
     },"finish_reason":"tool_calls"}]});
     Mock::given(method("POST"))
