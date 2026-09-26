@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod memory;
 pub mod profile;
 pub mod protocol;
+pub mod provider;
 pub mod settings;
 pub mod store;
 pub mod system_context;
