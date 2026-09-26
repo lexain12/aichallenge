@@ -16,6 +16,7 @@ pub mod memory;
 pub mod profile;
 pub mod protocol;
 pub mod settings;
+pub mod store;
 pub mod system_context;
 pub mod terminal;
 pub mod tool_audit;
