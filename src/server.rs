@@ -669,19 +669,22 @@ impl StdioServer {
         events: mpsc::Sender<InternalEvent>,
         broker: Arc<SessionConfirmationBroker>,
     ) -> Result<JoinHandle<()>, ServerError> {
-        let scheduler: Arc<dyn ToolExecutor> = Arc::new(SchedulerToolExecutor::new_configured(
-            self.dependencies.store.clone(),
-            self.dependencies.synchronizer.clone(),
-            broker,
-            dialog_id,
-            request_id,
-            self.dependencies.settings.scheduler().timezone(),
-            self.dependencies.settings.max_message_bytes(),
-            self.dependencies
-                .settings
-                .scheduler()
-                .confirmation_timeout(),
-        ));
+        let scheduler: Arc<dyn ToolExecutor> = Arc::new(
+            SchedulerToolExecutor::new_configured(
+                self.dependencies.store.clone(),
+                self.dependencies.synchronizer.clone(),
+                broker,
+                dialog_id,
+                request_id,
+                self.dependencies.settings.scheduler().timezone(),
+                self.dependencies.settings.max_message_bytes(),
+                self.dependencies
+                    .settings
+                    .scheduler()
+                    .confirmation_timeout(),
+            )
+            .map_err(|_| ServerError::Protocol)?,
+        );
         let tools = CompositeToolExecutor::new(vec![self.dependencies.mcp.clone(), scheduler])
             .map_err(|_| ServerError::ToolCatalog)?;
         let runner = AgentRunner::new(

@@ -3,8 +3,8 @@
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
     mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
@@ -91,7 +91,57 @@ pub struct InspectionService {
     store: Store,
     page_size: usize,
     snapshot_timeout: Duration,
-    active_snapshots: Arc<AtomicUsize>,
+    snapshot_tracker: Arc<SnapshotTracker>,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotTracker {
+    state: Mutex<SnapshotTrackerState>,
+    changed: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SnapshotTrackerState {
+    active: usize,
+    started: u64,
+}
+
+impl SnapshotTracker {
+    fn start(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active += 1;
+            state.started = state.started.saturating_add(1);
+            self.changed.notify_all();
+        }
+    }
+
+    fn finish(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active = state.active.saturating_sub(1);
+            self.changed.notify_all();
+        }
+    }
+
+    fn snapshot(&self) -> SnapshotTrackerState {
+        self.state.lock().map(|state| *state).unwrap_or_default()
+    }
+
+    fn wait_for(
+        &self,
+        timeout: Duration,
+        condition: impl Fn(&SnapshotTrackerState) -> bool,
+    ) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        let Ok((state, _)) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !condition(state))
+        else {
+            return false;
+        };
+        condition(&state)
+    }
 }
 
 /// A bounded-lifetime read transaction used to stream every page from one
@@ -211,7 +261,7 @@ impl InspectionService {
             store,
             page_size: DEFAULT_PAGE_SIZE,
             snapshot_timeout: MAX_SNAPSHOT_DURATION,
-            active_snapshots: Arc::new(AtomicUsize::new(0)),
+            snapshot_tracker: Arc::new(SnapshotTracker::default()),
         }
     }
 
@@ -223,7 +273,7 @@ impl InspectionService {
             store,
             page_size,
             snapshot_timeout: MAX_SNAPSHOT_DURATION,
-            active_snapshots: Arc::new(AtomicUsize::new(0)),
+            snapshot_tracker: Arc::new(SnapshotTracker::default()),
         })
     }
 
@@ -243,7 +293,7 @@ impl InspectionService {
             store,
             page_size,
             snapshot_timeout,
-            active_snapshots: Arc::new(AtomicUsize::new(0)),
+            snapshot_tracker: Arc::new(SnapshotTracker::default()),
         })
     }
 
@@ -251,7 +301,25 @@ impl InspectionService {
     /// startup. This is operational metadata only; it exposes no database or
     /// query content.
     pub fn active_snapshots(&self) -> usize {
-        self.active_snapshots.load(Ordering::Acquire)
+        self.snapshot_tracker.snapshot().active
+    }
+
+    /// Monotonic worker-start sequence for bounded lifecycle coordination.
+    pub fn snapshot_start_sequence(&self) -> u64 {
+        self.snapshot_tracker.snapshot().started
+    }
+
+    /// Waits for a worker started after `sequence`. The timeout is only a
+    /// deadlock guard; the condition variable supplies the readiness signal.
+    pub fn wait_for_snapshot_start(&self, sequence: u64, timeout: Duration) -> bool {
+        self.snapshot_tracker
+            .wait_for(timeout, |state| state.started > sequence)
+    }
+
+    /// Waits until every owned snapshot worker has released its connection.
+    pub fn wait_for_snapshot_idle(&self, timeout: Duration) -> bool {
+        self.snapshot_tracker
+            .wait_for(timeout, |state| state.active == 0)
     }
 
     pub fn inspect(&self, query: InspectQuery) -> Result<InspectionResult, InspectionError> {
@@ -287,11 +355,11 @@ impl InspectionService {
         let (commands, command_rx) = mpsc::sync_channel(1);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let store = self.store.clone();
-        let active_snapshots = self.active_snapshots.clone();
+        let snapshot_tracker = self.snapshot_tracker.clone();
         let deadline = Instant::now() + self.snapshot_timeout;
         let worker_cancellation = cancellation.clone();
         cancellation.register(commands.clone());
-        active_snapshots.fetch_add(1, Ordering::AcqRel);
+        snapshot_tracker.start();
         let worker = match thread::Builder::new()
             .name("light-agent-inspection".into())
             .spawn(move || {
@@ -302,13 +370,13 @@ impl InspectionService {
                     deadline,
                     command_rx,
                     ready: ready_tx,
-                    active_snapshots,
+                    snapshot_tracker,
                     cancellation: worker_cancellation,
                 })
             }) {
             Ok(worker) => worker,
             Err(_) => {
-                self.active_snapshots.fetch_sub(1, Ordering::AcqRel);
+                self.snapshot_tracker.finish();
                 return Err(InspectionError::Store);
             }
         };
@@ -502,7 +570,7 @@ struct SnapshotWorker {
     deadline: Instant,
     command_rx: mpsc::Receiver<SnapshotCommand>,
     ready: SyncSender<Result<(), InspectionError>>,
-    active_snapshots: Arc<AtomicUsize>,
+    snapshot_tracker: Arc<SnapshotTracker>,
     cancellation: InspectionCancellation,
 }
 
@@ -514,10 +582,10 @@ fn run_snapshot_worker(worker: SnapshotWorker) {
         deadline,
         command_rx: commands,
         ready,
-        active_snapshots,
+        snapshot_tracker,
         cancellation,
     } = worker;
-    let _active_guard = ActiveSnapshotGuard(active_snapshots);
+    let _active_guard = ActiveSnapshotGuard(snapshot_tracker);
     let db = match open_snapshot_connection(&store, deadline, &cancellation) {
         Ok(db) => db,
         Err(error) => {
@@ -593,11 +661,11 @@ fn run_snapshot_worker(worker: SnapshotWorker) {
     }
 }
 
-struct ActiveSnapshotGuard(Arc<AtomicUsize>);
+struct ActiveSnapshotGuard(Arc<SnapshotTracker>);
 
 impl Drop for ActiveSnapshotGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.0.finish();
     }
 }
 
@@ -1670,5 +1738,38 @@ fn cell_value(value: ValueRef<'_>, max_bytes: usize) -> Result<Value, Inspection
                 "blob_base64": base64::engine::general_purpose::STANDARD.encode(value)
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_lifecycle_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn expired_next_page_joins_finished_worker_before_returning() {
+        let temporary_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let directory = tempfile::tempdir_in(temporary_root).unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(directory.path().join("agent.sqlite3")).unwrap();
+        for index in 0..3 {
+            store.create_dialog(&format!("dialog-{index}")).unwrap();
+        }
+        let service =
+            InspectionService::with_snapshot_timeout(store, 1, Duration::from_millis(20)).unwrap();
+        let mut snapshot = service.snapshot(InspectQuery::Dialogs).unwrap();
+        assert!(!snapshot.next_page().unwrap().unwrap().complete);
+
+        assert!(service.wait_for_snapshot_idle(Duration::from_secs(5)));
+        assert_eq!(
+            snapshot.next_page().unwrap_err(),
+            InspectionError::SnapshotExpired
+        );
+        assert!(
+            snapshot.worker.is_none(),
+            "expired next_page must join instead of retaining a detached handle"
+        );
+        assert_eq!(service.active_snapshots(), 0);
     }
 }

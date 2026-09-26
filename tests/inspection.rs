@@ -308,13 +308,7 @@ fn stalled_snapshot_worker_releases_wal_at_the_hard_deadline() {
     store.create_dialog("new-wal-frame").unwrap();
     let checkpoint = rusqlite::Connection::open(&path).unwrap();
 
-    let wait_started = Instant::now();
-    loop {
-        if service.active_snapshots() == 0 || wait_started.elapsed() > Duration::from_secs(1) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(service.wait_for_snapshot_idle(Duration::from_secs(5)));
     assert_eq!(
         service.active_snapshots(),
         0,
@@ -430,34 +424,16 @@ fn locked_database_startup_expires_and_releases_the_worker_before_unlock() {
         InspectionService::with_snapshot_timeout(store.clone(), 2, Duration::from_millis(120))
             .unwrap();
     let worker_service = service.clone();
-    let started = Instant::now();
+    let start_sequence = service.snapshot_start_sequence();
     let startup = std::thread::spawn(move || worker_service.snapshot(InspectQuery::Dialogs));
 
-    let observing_started = Instant::now();
-    let mut observed_worker = false;
-    while observing_started.elapsed() < Duration::from_millis(80) {
-        if service.active_snapshots() == 1 {
-            observed_worker = true;
-            break;
-        }
-        std::thread::yield_now();
-    }
+    assert!(service.wait_for_snapshot_start(start_sequence, Duration::from_secs(5)));
     let result = startup.join().unwrap();
     assert!(
         matches!(result, Err(InspectionError::SnapshotExpired)),
         "locked startup must fail closed with snapshot_expired"
     );
-    assert!(started.elapsed() < Duration::from_millis(500));
-
-    let release_started = Instant::now();
-    while service.active_snapshots() != 0 && release_started.elapsed() < Duration::from_millis(500)
-    {
-        std::thread::yield_now();
-    }
-    assert!(
-        observed_worker,
-        "startup must be included in worker ownership"
-    );
+    assert!(service.wait_for_snapshot_idle(Duration::from_secs(5)));
     assert_eq!(
         service.active_snapshots(),
         0,

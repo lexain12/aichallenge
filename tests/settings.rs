@@ -40,17 +40,29 @@ fn server_settings_default_to_exact_limits_and_moscow() {
 }
 
 #[test]
-fn server_settings_load_explicit_scheduler_runtime_defaults() {
-    let file = config(
-        "[provider]\napi_key = 'key'\n[scheduler]\ntimezone = 'UTC'\nconfirmation_timeout_minutes = 7\n",
-    );
-    let settings = ServerSettings::load(file.path(), None).unwrap();
-    assert_eq!(settings.scheduler().timezone().to_string(), "UTC");
-    assert_eq!(settings.scheduler().confirmation_timeout_minutes(), 7);
-    assert_eq!(
-        settings.scheduler().confirmation_timeout(),
-        std::time::Duration::from_secs(7 * 60)
-    );
+fn server_settings_bound_confirmation_timeout_to_one_through_five_minutes() {
+    for minutes in [1_u64, 5] {
+        let file = config(&format!(
+            "[provider]\napi_key = 'key'\n[scheduler]\ntimezone = 'UTC'\nconfirmation_timeout_minutes = {minutes}\n"
+        ));
+        let settings = ServerSettings::load(file.path(), None).unwrap();
+        assert_eq!(settings.scheduler().timezone().to_string(), "UTC");
+        assert_eq!(settings.scheduler().confirmation_timeout_minutes(), minutes);
+        assert_eq!(
+            settings.scheduler().confirmation_timeout(),
+            std::time::Duration::from_secs(minutes * 60)
+        );
+    }
+
+    for minutes in [0_u64, 6, u64::MAX] {
+        let file = config(&format!(
+            "[provider]\napi_key = 'key'\n[scheduler]\nconfirmation_timeout_minutes = {minutes}\n"
+        ));
+        assert!(
+            ServerSettings::load(file.path(), None).is_err(),
+            "accepted confirmation timeout {minutes}"
+        );
+    }
 }
 
 #[test]

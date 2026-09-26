@@ -187,7 +187,7 @@ pub struct SchedulerToolExecutor {
     clock: Arc<dyn ConfirmationClock>,
     default_timezone: Tz,
     max_prompt_bytes: usize,
-    confirmation_timeout: std::time::Duration,
+    confirmation_timeout: Duration,
     definitions: Vec<ModelToolDefinition>,
 }
 
@@ -199,16 +199,13 @@ impl SchedulerToolExecutor {
         source_dialog_id: DialogId,
         request_id: RequestId,
     ) -> Self {
-        Self::new_with_clock_and_config(
+        Self::new_with_clock(
             store,
             synchronizer,
             broker,
             source_dialog_id,
             request_id,
             Arc::new(SystemClock),
-            Moscow,
-            MAX_PROMPT_BYTES,
-            std::time::Duration::from_secs((CONFIRMATION_MINUTES * 60) as u64),
         )
     }
 
@@ -222,7 +219,7 @@ impl SchedulerToolExecutor {
         default_timezone: Tz,
         max_prompt_bytes: usize,
         confirmation_timeout: std::time::Duration,
-    ) -> Self {
+    ) -> Result<Self, ToolExecutionError> {
         Self::new_with_clock_and_config(
             store,
             synchronizer,
@@ -244,17 +241,18 @@ impl SchedulerToolExecutor {
         request_id: RequestId,
         clock: Arc<dyn ConfirmationClock>,
     ) -> Self {
-        Self::new_with_clock_and_config(
+        Self {
             store,
             synchronizer,
             broker,
             source_dialog_id,
             request_id,
             clock,
-            Moscow,
-            MAX_PROMPT_BYTES,
-            std::time::Duration::from_secs((CONFIRMATION_MINUTES * 60) as u64),
-        )
+            default_timezone: Moscow,
+            max_prompt_bytes: MAX_PROMPT_BYTES,
+            confirmation_timeout: Duration::minutes(CONFIRMATION_MINUTES),
+            definitions: definitions(MAX_PROMPT_BYTES, Moscow),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -268,8 +266,10 @@ impl SchedulerToolExecutor {
         default_timezone: Tz,
         max_prompt_bytes: usize,
         confirmation_timeout: std::time::Duration,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ToolExecutionError> {
+        let confirmation_timeout = Duration::from_std(confirmation_timeout)
+            .map_err(|_| ToolExecutionError::InvalidArguments)?;
+        Ok(Self {
             store,
             synchronizer,
             broker,
@@ -280,7 +280,7 @@ impl SchedulerToolExecutor {
             max_prompt_bytes,
             confirmation_timeout,
             definitions: definitions(max_prompt_bytes, default_timezone),
-        }
+        })
     }
 
     fn parse_create(&self, arguments: &str) -> Result<CanonicalAction, ToolExecutionError> {
@@ -350,8 +350,7 @@ impl SchedulerToolExecutor {
     ) -> Result<ToolExecutionResult, ToolExecutionError> {
         let preview = action.preview();
         let issued_at = self.clock.now();
-        let expires_at =
-            issued_at + Duration::from_std(self.confirmation_timeout).unwrap_or(Duration::MAX);
+        let expires_at = issued_at + self.confirmation_timeout;
         let request = ConfirmationRequest {
             id: ConfirmationId::new(),
             request_id: self.request_id,

@@ -362,10 +362,12 @@ impl ServerSettings {
             .unwrap_or("Europe/Moscow")
             .parse::<Tz>()
             .map_err(|_| SettingsError::Invalid("scheduler.timezone"))?;
-        let confirmation_minutes = positive(
-            raw.scheduler.confirmation_timeout_minutes.unwrap_or(5),
-            "scheduler.confirmation_timeout_minutes",
-        )?;
+        let confirmation_minutes = raw.scheduler.confirmation_timeout_minutes.unwrap_or(5);
+        if !(1..=5).contains(&confirmation_minutes) {
+            return Err(SettingsError::Invalid(
+                "scheduler.confirmation_timeout_minutes",
+            ));
+        }
         let database_path = raw
             .database
             .path
@@ -373,9 +375,7 @@ impl ServerSettings {
         let default_lock_path = scheduler_lock_path_for_database(&database_path)?;
         let scheduler = SchedulerSettings {
             timezone,
-            confirmation_timeout: Duration::from_secs(confirmation_minutes.checked_mul(60).ok_or(
-                SettingsError::Invalid("scheduler.confirmation_timeout_minutes"),
-            )?),
+            confirmation_timeout: Duration::from_secs(confirmation_minutes * 60),
             run_timeout: Duration::from_secs(positive(
                 raw.scheduler.run_timeout_seconds.unwrap_or(600),
                 "scheduler.run_timeout_seconds",

@@ -348,6 +348,14 @@ fn active_turn_blocks_dialog_deletion_and_preserves_pending_work() {
     store
         .finish_tool_run(audit_id, ToolRunFinish::uncertain(SafeErrorCode::TimedOut))
         .unwrap();
+    let finalized = store
+        .list_tool_runs()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == audit_id)
+        .expect("preserved audit remains queryable after finalization");
+    assert_eq!(finalized.status, ToolRunStatus::Uncertain);
+    assert_eq!(finalized.safe_error_code, Some(SafeErrorCode::TimedOut));
 }
 
 #[test]

@@ -296,7 +296,8 @@ async fn configured_defaults_bound_prompt_schema_and_confirmation_expiry() {
         UTC,
         1024,
         std::time::Duration::from_secs(120),
-    );
+    )
+    .unwrap();
 
     for tool in ["cron__create", "cron__update"] {
         let prompt_limit = executor
@@ -379,6 +380,27 @@ async fn configured_defaults_bound_prompt_schema_and_confirmation_expiry() {
     assert_eq!(
         fixture.backend.installed.lock().unwrap().len(),
         installs_before
+    );
+}
+
+#[test]
+fn configured_executor_rejects_unrepresentable_confirmation_duration() {
+    let fixture = Fixture::new(FakeBackend::success());
+    assert!(
+        SchedulerToolExecutor::new_with_clock_and_config(
+            fixture.store.clone(),
+            fixture.synchronizer.clone(),
+            ImmediateBroker::accepting(),
+            fixture.source_dialog_id,
+            request(REQUEST_A),
+            Arc::new(FixedClock(
+                Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap(),
+            )),
+            UTC,
+            1024,
+            std::time::Duration::MAX,
+        )
+        .is_err()
     );
 }
 
