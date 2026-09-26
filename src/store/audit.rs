@@ -2,7 +2,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use super::{SafeErrorCode, Store, StoreError, execute_one, now};
-use crate::domain::{ToolOwner, ToolRunStatus, TurnId};
+use crate::domain::{RunId, ToolOwner, ToolRunStatus, TurnId};
 
 /// Only route identifiers and classification enter this API, never arguments,
 /// hashes, result bodies, URLs, or error descriptions.
@@ -70,9 +70,7 @@ impl Store {
         }
         let mut db = self.connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Task 7 extends this transaction to validate cron_runs. Do not permit
-        // a cron owner before the referenced table and lifecycle exist.
-        let owner_id = match start.owner {
+        let (owner_kind, owner_id) = match start.owner {
             ToolOwner::InteractiveTurn(id) => {
                 let exists: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM turns WHERE id=?)",
@@ -82,14 +80,25 @@ impl Store {
                 if !exists {
                     return Err(StoreError::InvalidOwner);
                 }
-                id.get()
+                ("interactive_turn", id.get())
             }
-            ToolOwner::CronRun(_) => return Err(StoreError::InvalidOwner),
+            ToolOwner::CronRun(id) => {
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cron_runs WHERE id=?)",
+                    [id.get()],
+                    |r| r.get(0),
+                )?;
+                if !exists {
+                    return Err(StoreError::InvalidOwner);
+                }
+                ("cron_run", id.get())
+            }
         };
         execute_one(
             &tx,
-            "INSERT INTO tool_runs(owner_kind,owner_id,call_id,server_name,tool_name,read_only,status,started_at) VALUES('interactive_turn',?,?,?,?,?,'pending',?)",
+            "INSERT INTO tool_runs(owner_kind,owner_id,call_id,server_name,tool_name,read_only,status,started_at) VALUES(?,?,?,?,?,?,'pending',?)",
             params![
+                owner_kind,
                 owner_id,
                 start.call_id,
                 start.server_name,
@@ -153,6 +162,9 @@ impl Store {
                 let owner = match r.get::<_, String>(1)?.as_str() {
                     "interactive_turn" => ToolOwner::InteractiveTurn(
                         TurnId::new(r.get(2)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    ),
+                    "cron_run" => ToolOwner::CronRun(
+                        RunId::new(r.get(2)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
                     ),
                     _ => return Err(rusqlite::Error::InvalidQuery),
                 };

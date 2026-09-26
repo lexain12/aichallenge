@@ -3,9 +3,11 @@
 
 mod audit;
 mod dialogs;
+mod jobs;
 
 pub use audit::{ToolRun, ToolRunFinish, ToolRunStart};
 pub use dialogs::{Dialog, DialogSummary, MessageRole, StoredMessage, TurnStart};
+pub use jobs::{CronJob, CronRun, CronRunClaim, CronRunFinish, JobCreate, RunClaim, ServiceEvent};
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -123,8 +125,10 @@ impl Store {
             let versions = statement
                 .query_map([], |r| r.get::<_, i64>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            if versions != [1] {
-                return Err(StoreError::UnsupportedSchema);
+            match versions.as_slice() {
+                [1] => tx.execute_batch(SCHEMA_V2)?,
+                [2] => {}
+                _ => return Err(StoreError::UnsupportedSchema),
             }
         } else {
             let existing: bool = tx.query_row(
@@ -136,6 +140,7 @@ impl Store {
                 return Err(StoreError::UnsupportedSchema);
             }
             tx.execute_batch(SCHEMA_V1)?;
+            tx.execute_batch(SCHEMA_V2)?;
         }
         tx.commit()?;
         Ok(store)
@@ -227,4 +232,45 @@ CREATE TABLE tool_runs (
        OR (status='completed' AND finished_at IS NOT NULL AND safe_error_code IS NULL)
        OR (status IN ('failed','uncertain') AND finished_at IS NOT NULL AND safe_error_code IS NOT NULL))
 );
+";
+
+const SCHEMA_V2: &str = "
+CREATE TABLE cron_jobs (
+    id TEXT PRIMARY KEY CHECK(length(id)=36),
+    source_dialog_id INTEGER REFERENCES dialogs(id) ON DELETE SET NULL,
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 256),
+    schedule_kind TEXT NOT NULL CHECK(schedule_kind IN ('cron','once_at')),
+    schedule_value TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    prompt TEXT NOT NULL CHECK(length(prompt) BETWEEN 1 AND 262144),
+    desired_state TEXT NOT NULL CHECK(desired_state IN ('active','disabled','deleted')),
+    sync_state TEXT NOT NULL CHECK(sync_state IN ('pending','applied','failed')),
+    safe_sync_error_code TEXT CHECK(safe_sync_error_code IS NULL OR safe_sync_error_code IN
+        ('internal_error','provider_error','tool_error','interrupted','process_interrupted','timed_out','context_too_long','tool_round_limit')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(source_dialog_id IS NOT NULL OR desired_state='deleted'),
+    CHECK((sync_state='failed' AND safe_sync_error_code IS NOT NULL)
+       OR (sync_state!='failed' AND safe_sync_error_code IS NULL))
+);
+CREATE INDEX cron_jobs_by_source_dialog ON cron_jobs(source_dialog_id);
+CREATE TABLE cron_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(id > 0),
+    job_id TEXT NOT NULL REFERENCES cron_jobs(id),
+    scheduled_for TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','completed','failed','interrupted','timed_out','skipped','missed')),
+    result TEXT,
+    safe_error_code TEXT CHECK(safe_error_code IS NULL OR safe_error_code IN
+        ('internal_error','provider_error','tool_error','interrupted','process_interrupted','timed_out','context_too_long','tool_round_limit')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    CHECK((status='pending' AND result IS NULL AND safe_error_code IS NULL AND finished_at IS NULL)
+       OR (status='completed' AND result IS NOT NULL AND safe_error_code IS NULL AND finished_at IS NOT NULL)
+       OR (status IN ('failed','interrupted','timed_out') AND result IS NULL AND safe_error_code IS NOT NULL AND finished_at IS NOT NULL)
+       OR (status IN ('skipped','missed') AND result IS NULL AND safe_error_code IS NULL AND finished_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX one_pending_run_per_job ON cron_runs(job_id) WHERE status='pending';
+CREATE UNIQUE INDEX one_execution_per_job_minute ON cron_runs(job_id,scheduled_for) WHERE status!='skipped';
+CREATE INDEX cron_runs_by_job ON cron_runs(job_id,id);
+UPDATE schema_version SET version=2;
 ";

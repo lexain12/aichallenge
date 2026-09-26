@@ -17,6 +17,7 @@ pub mod memory;
 pub mod profile;
 pub mod protocol;
 pub mod provider;
+pub mod scheduler;
 pub mod settings;
 pub mod store;
 pub mod system_context;

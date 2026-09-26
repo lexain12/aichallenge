@@ -29,6 +29,28 @@ fn server_settings_default_to_exact_limits_and_moscow() {
     assert_eq!(settings.mcp().max_tool_rounds(), 8);
     assert_eq!(settings.scheduler().confirmation_timeout_minutes(), 5);
     assert_eq!(settings.scheduler().timezone().to_string(), "Europe/Moscow");
+    assert_eq!(
+        settings.scheduler().crontab_binary(),
+        std::path::Path::new("/usr/bin/crontab")
+    );
+}
+
+#[test]
+fn scheduler_paths_reject_crontab_command_injection() {
+    for (field, value) in [
+        ("binary_path", "/opt/light agent/bin/light-agent"),
+        ("binary_path", "/opt/light-agent/bin/light-agent;id"),
+        ("crontab_binary", "crontab"),
+        ("crontab_binary", "/usr/bin/crontab\n--help"),
+    ] {
+        let file = config(&format!(
+            "[provider]\napi_key = 'key'\n[scheduler]\n{field} = {value:?}\n"
+        ));
+        assert!(
+            ServerSettings::load(file.path(), None).is_err(),
+            "accepted {value:?}"
+        );
+    }
 }
 
 #[test]

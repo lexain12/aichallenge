@@ -78,6 +78,7 @@ struct RawSchedulerSettings {
     run_timeout_seconds: Option<u64>,
     lock_path: Option<PathBuf>,
     binary_path: Option<PathBuf>,
+    crontab_binary: Option<PathBuf>,
 }
 
 #[derive(Default, Deserialize)]
@@ -218,6 +219,7 @@ pub struct SchedulerSettings {
     run_timeout: Duration,
     lock_path: PathBuf,
     binary_path: PathBuf,
+    crontab_binary: PathBuf,
 }
 
 impl SchedulerSettings {
@@ -243,6 +245,10 @@ impl SchedulerSettings {
 
     pub fn binary_path(&self) -> &Path {
         &self.binary_path
+    }
+
+    pub fn crontab_binary(&self) -> &Path {
+        &self.crontab_binary
     }
 }
 
@@ -377,8 +383,15 @@ impl ServerSettings {
                 .scheduler
                 .binary_path
                 .unwrap_or_else(|| PathBuf::from("/opt/light-agent/bin/light-agent")),
+            crontab_binary: raw
+                .scheduler
+                .crontab_binary
+                .unwrap_or_else(|| PathBuf::from("/usr/bin/crontab")),
         };
-        if !scheduler.lock_path.is_absolute() || !scheduler.binary_path.is_absolute() {
+        if !scheduler_path_is_safe(&scheduler.lock_path, false)
+            || !scheduler_path_is_safe(&scheduler.binary_path, true)
+            || !scheduler_path_is_safe(&scheduler.crontab_binary, true)
+        {
             return Err(SettingsError::Invalid("scheduler paths"));
         }
 
@@ -530,4 +543,20 @@ fn bounded(value: usize, maximum: usize, field: &'static str) -> Result<usize, S
     } else {
         Ok(value)
     }
+}
+
+fn scheduler_path_is_safe(path: &Path, rendered_or_executed: bool) -> bool {
+    if !path.is_absolute() || path.as_os_str().is_empty() {
+        return false;
+    }
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    if text.contains(['\0', '\r', '\n']) {
+        return false;
+    }
+    !rendered_or_executed
+        || text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.'))
 }

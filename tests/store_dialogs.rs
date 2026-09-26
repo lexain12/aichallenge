@@ -13,13 +13,15 @@ fn setup() -> (TempDir, Store, Connection) {
 }
 
 #[test]
-fn migration_creates_exact_v1_schema() {
+fn migration_creates_exact_v2_schema() {
     let (dir, store, db) = setup();
     let tables: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
         .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
     assert_eq!(
         tables,
         [
+            "cron_jobs",
+            "cron_runs",
             "dialogs",
             "messages",
             "schema_version",
@@ -31,7 +33,7 @@ fn migration_creates_exact_v1_schema() {
         db.query_row("SELECT version FROM schema_version", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
@@ -329,7 +331,7 @@ fn incompatible_schemas_and_memory_databases_are_rejected() {
         Err(StoreError::InvalidPath)
     ));
     let (_new_dir, _store, db) = setup();
-    db.execute("UPDATE schema_version SET version=2", [])
+    db.execute("UPDATE schema_version SET version=3", [])
         .unwrap();
     // A future version must not be silently downgraded.
     assert!(matches!(

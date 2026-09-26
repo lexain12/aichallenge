@@ -94,6 +94,14 @@ impl Store {
         if pending {
             return Err(StoreError::Busy);
         }
+        let live_job: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cron_jobs WHERE source_dialog_id=? AND desired_state!='deleted')",
+            [id.get()],
+            |row| row.get(0),
+        )?;
+        if live_job {
+            return Err(StoreError::Busy);
+        }
         // Polymorphic audit owners cannot use a normal foreign key. Delete
         // interactive audit records before cascading turns/messages atomically.
         let expected_audits: i64 = tx.query_row("SELECT count(*) FROM tool_runs WHERE owner_kind='interactive_turn' AND owner_id IN (SELECT id FROM turns WHERE dialog_id=?)", [id.get()], |r| r.get(0))?;
