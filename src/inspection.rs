@@ -259,10 +259,21 @@ impl InspectionService {
         query: InspectQuery,
         cancellation: InspectionCancellation,
     ) -> Result<InspectionSnapshot, InspectionError> {
+        self.snapshot_with_page_size_and_cancellation(query, self.page_size, cancellation)
+    }
+
+    pub(crate) fn snapshot_with_page_size_and_cancellation(
+        &self,
+        query: InspectQuery,
+        page_size: usize,
+        cancellation: InspectionCancellation,
+    ) -> Result<InspectionSnapshot, InspectionError> {
+        if page_size == 0 || page_size > MAX_PAGE_SIZE {
+            return Err(InspectionError::InvalidPageSize);
+        }
         let (commands, command_rx) = mpsc::sync_channel(1);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let store = self.store.clone();
-        let page_size = self.page_size;
         let active_snapshots = self.active_snapshots.clone();
         let deadline = Instant::now() + self.snapshot_timeout;
         let worker_cancellation = cancellation.clone();

@@ -48,7 +48,6 @@ const FRAGMENT_BYTES: usize = 64 * 1024;
 const USED_CONFIRMATIONS: usize = 1024;
 const CONFIRMATION_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const TERMINAL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-const DIALOG_FETCH_LIMIT: usize = 2;
 
 #[derive(Clone)]
 pub struct ServerDependencies {
@@ -135,10 +134,7 @@ impl ConfirmationClock for UtcClock {
 }
 
 impl SessionConfirmationBroker {
-    fn pair() -> (Arc<Self>, mpsc::Receiver<ConfirmationPrompt>) {
-        Self::pair_with_clock(Arc::new(UtcClock))
-    }
-
+    #[cfg(test)]
     fn pair_with_clock(
         clock: Arc<dyn ConfirmationClock>,
     ) -> (Arc<Self>, mpsc::Receiver<ConfirmationPrompt>) {
@@ -320,11 +316,28 @@ impl ConfirmationBroker for SessionConfirmationBroker {
 
 pub struct StdioServer {
     dependencies: ServerDependencies,
+    confirmation_timeout: std::time::Duration,
 }
 
 impl StdioServer {
     pub fn new(dependencies: ServerDependencies) -> Self {
-        Self { dependencies }
+        Self {
+            dependencies,
+            confirmation_timeout: CONFIRMATION_TTL,
+        }
+    }
+
+    /// Tightens the maximum confirmation wait. Production defaults to five
+    /// minutes; shorter values are useful for fail-fast deployments and tests.
+    pub fn with_confirmation_timeout(
+        mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Self, ServerError> {
+        if timeout.is_zero() || timeout > CONFIRMATION_TTL {
+            return Err(ServerError::Protocol);
+        }
+        self.confirmation_timeout = timeout;
+        Ok(self)
     }
 
     /// Must be called exactly once by the process owner, before accepting sessions.
@@ -346,7 +359,10 @@ impl StdioServer {
         let (writer_failure_tx, mut writer_failure_rx) = mpsc::channel(1);
         let writer_task = tokio::spawn(write_events(writer, output_rx, writer_failure_tx));
         let (events_tx, mut events_rx) = mpsc::channel::<InternalEvent>(EVENT_QUEUE);
-        let (broker, mut prompts_rx) = SessionConfirmationBroker::pair();
+        let (broker, mut prompts_rx) = SessionConfirmationBroker::pair_with_clock_and_timeout(
+            Arc::new(UtcClock),
+            self.confirmation_timeout,
+        );
         let mut active: HashMap<DialogId, ActiveTurn> = HashMap::new();
         let mut background: Vec<BackgroundTask> = Vec::new();
 
@@ -598,7 +614,7 @@ impl StdioServer {
             return queue_error(output, request_id, ProtocolErrorCode::InternalError);
         }
         background.push(start_dialog_list(
-            self.dependencies.store.clone(),
+            self.dependencies.inspection.clone(),
             request_id,
             events.clone(),
         ));
@@ -985,29 +1001,37 @@ fn inspect_query(kind: &InspectKind) -> InspectQuery {
 }
 
 fn start_dialog_list(
-    store: Store,
+    service: InspectionService,
     request_id: RequestId,
     events: mpsc::Sender<InternalEvent>,
 ) -> BackgroundTask {
     let cancellation = InspectionCancellation::new();
     let task_cancellation = cancellation.clone();
     let task = tokio::task::spawn_blocking(move || {
-        let mut after = None;
+        let snapshot = match service.snapshot_with_page_size_and_cancellation(
+            InspectQuery::Dialogs,
+            1,
+            task_cancellation.clone(),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                send_protocol_error(&events, request_id, &task_cancellation);
+                return;
+            }
+        };
+        let mut snapshot = Some(snapshot);
         let mut sequence = 0_u64;
         loop {
             if task_cancellation.is_cancelled() {
+                if let Some(snapshot) = snapshot.take() {
+                    let _ = snapshot.close();
+                }
                 return;
             }
-            let page = match store.list_dialogs_page(after, DIALOG_FETCH_LIMIT) {
-                Ok(page) => page,
-                Err(_) => {
-                    send_protocol_error(&events, request_id, &task_cancellation);
-                    return;
-                }
-            };
-            let Some(dialog) = page.first() else {
-                if sequence == 0 {
-                    let _ = send_internal(
+            let page = match snapshot.as_mut().expect("snapshot present").next_page() {
+                Ok(Some(page)) => page,
+                Ok(None) => {
+                    let _ = send_internal_acknowledged(
                         &events,
                         request_id,
                         ServerEvent::DialogList {
@@ -1017,30 +1041,83 @@ fn start_dialog_list(
                         },
                         &task_cancellation,
                     );
+                    return;
                 }
-                return;
+                Err(_) => {
+                    send_protocol_error(&events, request_id, &task_cancellation);
+                    return;
+                }
             };
-            let complete = page.len() == 1;
-            after = Some(dialog.id);
-            if !send_internal(
-                &events,
-                request_id,
-                ServerEvent::DialogList {
-                    sequence,
-                    dialogs: vec![crate::protocol::DialogSummary {
-                        id: dialog.id,
-                        title: dialog.title.clone(),
-                    }],
-                    complete,
-                },
-                &task_cancellation,
-            ) {
+            let mut dialogs = Vec::with_capacity(page.items.len());
+            for item in page.items {
+                let Some(id) = item
+                    .get("id")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|id| DialogId::new(id).ok())
+                else {
+                    if let Some(snapshot) = snapshot.take() {
+                        let _ = snapshot.close();
+                    }
+                    send_protocol_error(&events, request_id, &task_cancellation);
+                    return;
+                };
+                let Some(title) = item.get("title").and_then(serde_json::Value::as_str) else {
+                    if let Some(snapshot) = snapshot.take() {
+                        let _ = snapshot.close();
+                    }
+                    send_protocol_error(&events, request_id, &task_cancellation);
+                    return;
+                };
+                dialogs.push(crate::protocol::DialogSummary {
+                    id,
+                    title: title.to_owned(),
+                });
+            }
+            if page.complete && snapshot.take().expect("snapshot present").close().is_err() {
+                send_protocol_error(&events, request_id, &task_cancellation);
                 return;
             }
-            if complete {
+            if dialogs.is_empty() {
+                if !send_internal_acknowledged(
+                    &events,
+                    request_id,
+                    ServerEvent::DialogList {
+                        sequence,
+                        dialogs,
+                        complete: page.complete,
+                    },
+                    &task_cancellation,
+                ) {
+                    if let Some(snapshot) = snapshot.take() {
+                        let _ = snapshot.close();
+                    }
+                    return;
+                }
+                sequence += 1;
+            } else {
+                let count = dialogs.len();
+                for (index, dialog) in dialogs.into_iter().enumerate() {
+                    if !send_internal_acknowledged(
+                        &events,
+                        request_id,
+                        ServerEvent::DialogList {
+                            sequence,
+                            dialogs: vec![dialog],
+                            complete: page.complete && index + 1 == count,
+                        },
+                        &task_cancellation,
+                    ) {
+                        if let Some(snapshot) = snapshot.take() {
+                            let _ = snapshot.close();
+                        }
+                        return;
+                    }
+                    sequence += 1;
+                }
+            }
+            if page.complete {
                 return;
             }
-            sequence += 1;
         }
     });
     BackgroundTask { cancellation, task }
@@ -1151,11 +1228,45 @@ fn send_internal(
     event: ServerEvent,
     cancellation: &InspectionCancellation,
 ) -> bool {
+    send_internal_event(events, request_id, event, None, cancellation)
+}
+
+fn send_internal_acknowledged(
+    events: &mpsc::Sender<InternalEvent>,
+    request_id: RequestId,
+    event: ServerEvent,
+    cancellation: &InspectionCancellation,
+) -> bool {
+    let (ack, mut delivered) = oneshot::channel();
+    if !send_internal_event(events, request_id, event, Some(ack), cancellation) {
+        return false;
+    }
+    loop {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        match delivered.try_recv() {
+            Ok(Ok(())) => return true,
+            Ok(Err(())) | Err(oneshot::error::TryRecvError::Closed) => return false,
+            Err(oneshot::error::TryRecvError::Empty) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn send_internal_event(
+    events: &mpsc::Sender<InternalEvent>,
+    request_id: RequestId,
+    event: ServerEvent,
+    ack: Option<oneshot::Sender<Result<(), ()>>>,
+    cancellation: &InspectionCancellation,
+) -> bool {
     let mut pending = InternalEvent {
         request_id,
         event,
         done: None,
-        ack: None,
+        ack,
     };
     loop {
         if cancellation.is_cancelled() {

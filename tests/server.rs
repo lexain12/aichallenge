@@ -504,6 +504,90 @@ async fn confirmation_routes_only_to_originating_request() {
 }
 
 #[tokio::test]
+async fn unanswered_confirmation_expires_and_finalizes_audited_turn() {
+    let call = ModelToolCall {
+        id: "schedule-expired".into(),
+        name: "cron__create".into(),
+        arguments: json!({
+            "name":"report",
+            "schedule":{"kind":"cron","expression":"0 9 * * *"},
+            "timezone":"Europe/Moscow",
+            "prompt":"prepare report"
+        })
+        .to_string(),
+    };
+    let fixture = Fixture::new(FakeProvider::new([
+        Reply::ToolCall(call),
+        Reply::Final("not scheduled".into()),
+    ]));
+    let dialog = fixture.store.create_dialog("chat").unwrap().id;
+    let store = fixture.store.clone();
+    let server = fixture
+        .server
+        .with_confirmation_timeout(Duration::from_millis(20))
+        .unwrap();
+    let mut session = Session::start(server).await;
+    session.event().await;
+    let origin = req();
+    session
+        .send(
+            origin,
+            ClientRequest::SendMessage {
+                dialog_id: dialog,
+                message: "schedule it".into(),
+            },
+        )
+        .await;
+    let mut confirmation_id = None;
+    let mut saw_failed_tool = false;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), session.event())
+            .await
+            .expect("confirmation timeout must finish the turn");
+        assert_eq!(event.request_id, origin);
+        match event.event {
+            ServerEvent::ConfirmationRequired {
+                confirmation_id: id,
+                ..
+            } => confirmation_id = Some(id),
+            ServerEvent::ToolFinished { .. } => saw_failed_tool = true,
+            ServerEvent::TurnCompleted { answer } => {
+                assert_eq!(answer, "not scheduled");
+                break;
+            }
+            ServerEvent::ResponseStarted { .. }
+            | ServerEvent::ToolStarted { .. }
+            | ServerEvent::TextDelta { .. }
+            | ServerEvent::TurnPrepared { .. } => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    let confirmation_id = confirmation_id.expect("confirmation prompt");
+    assert!(saw_failed_tool);
+    let runs = store.list_tool_runs().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, ToolRunStatus::Failed);
+    assert_eq!(runs[0].safe_error_code, Some(SafeErrorCode::ToolError));
+    assert!(store.list_jobs().unwrap().is_empty());
+    assert_eq!(
+        store
+            .completed_messages(dialog)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.content)
+            .collect::<Vec<_>>(),
+        ["schedule it", "not scheduled"]
+    );
+
+    session
+        .send(origin, ClientRequest::ConfirmAction { confirmation_id })
+        .await;
+    let replay = session.event().await;
+    assert_eq!(replay.request_id, origin);
+    assert!(matches!(replay.event, ServerEvent::ProtocolError { .. }));
+}
+
+#[tokio::test]
 async fn export_is_sequence_numbered_base64_with_final_sha256() {
     let fixture = Fixture::new(FakeProvider::new([]));
     fixture.store.create_dialog("chat").unwrap();
@@ -821,6 +905,168 @@ async fn dialog_list_pages_multiple_maximum_titles_below_wire_limit() {
     }
     assert_eq!(count, 5);
     assert!(sequence > 1);
+}
+
+#[tokio::test]
+async fn dialog_list_is_one_stable_snapshot_during_concurrent_crud() {
+    let fixture = Fixture::new(FakeProvider::new([]));
+    let mut original = Vec::new();
+    for index in 0..12 {
+        let title = format!("{index:03}-{}", "x".repeat(256 * 1024 - 4));
+        let dialog = fixture.store.create_dialog(&title).unwrap();
+        original.push((dialog.id, title));
+    }
+    let store = fixture.store.clone();
+    let inspection = fixture.inspection.clone();
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let blocked = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+    let waker = Arc::new(Mutex::new(None));
+    let writer = ReleasableGateWriter::new(
+        2,
+        capture.clone(),
+        blocked.clone(),
+        released.clone(),
+        waker.clone(),
+    );
+    let (client, remote) = duplex(MAX_LINE_BYTES);
+    let (_client_read, client_write) = split(client);
+    let (remote_read, _remote_write) = split(remote);
+    let server = fixture.server;
+    let task = tokio::spawn(async move { server.serve(remote_read, writer).await });
+    let mut requests = NdjsonWriter::new(client_write);
+    let request_id = req();
+    requests
+        .write_request(&RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            request: ClientRequest::ListDialogs,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !blocked.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        inspection.active_snapshots(),
+        1,
+        "DialogList must retain one read snapshot while streaming"
+    );
+
+    store.delete_dialog(original[8].0).unwrap();
+    store
+        .rename_dialog(original[9].0, "renamed-after-first-page")
+        .unwrap();
+    store.create_dialog("inserted-after-first-page").unwrap();
+    released.store(true, Ordering::Release);
+    if let Some(waker) = waker.lock().unwrap().take() {
+        waker.wake();
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let bytes = capture.lock().unwrap().clone();
+            let complete = bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| {
+                    serde_json::from_slice::<deepseek_cli::protocol::ServerEnvelope>(line).ok()
+                })
+                .any(|event| {
+                    event.request_id == request_id
+                        && matches!(event.event, ServerEvent::DialogList { complete: true, .. })
+                });
+            if complete {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dialog list must always terminate with complete=true");
+    requests.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(inspection.active_snapshots(), 0);
+
+    let bytes = capture.lock().unwrap().clone();
+    let mut actual = Vec::new();
+    let mut sequence = 0_u64;
+    let mut saw_complete = false;
+    for event in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<deepseek_cli::protocol::ServerEnvelope>(line).unwrap())
+        .filter(|event| event.request_id == request_id)
+    {
+        match event.event {
+            ServerEvent::DialogList {
+                sequence: actual_sequence,
+                dialogs,
+                complete,
+            } => {
+                assert_eq!(actual_sequence, sequence);
+                sequence += 1;
+                actual.extend(dialogs.into_iter().map(|dialog| (dialog.id, dialog.title)));
+                saw_complete |= complete;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert!(saw_complete);
+    assert_eq!(actual, original);
+}
+
+#[tokio::test]
+async fn eof_joins_a_blocked_dialog_list_snapshot() {
+    let fixture = Fixture::new(FakeProvider::new([]));
+    for index in 0..12 {
+        fixture
+            .store
+            .create_dialog(&format!("{index:03}-{}", "x".repeat(256 * 1024 - 4)))
+            .unwrap();
+    }
+    let inspection = fixture.inspection.clone();
+    let writer = GateWriter::new(
+        2,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (client, remote) = duplex(MAX_LINE_BYTES);
+    let (_client_read, client_write) = split(client);
+    let (remote_read, _remote_write) = split(remote);
+    let server = fixture.server;
+    let task = tokio::spawn(async move { server.serve(remote_read, writer).await });
+    let mut requests = NdjsonWriter::new(client_write);
+    requests
+        .write_request(&RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: req(),
+            request: ClientRequest::ListDialogs,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while inspection.active_snapshots() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    requests.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(inspection.active_snapshots(), 0);
 }
 
 #[tokio::test]
