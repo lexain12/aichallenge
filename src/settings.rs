@@ -485,6 +485,14 @@ impl ClientSettings {
 }
 
 fn checked_http_url(value: &str, field: &'static str) -> Result<Url, SettingsError> {
+    // Url::parse normalizes empty userinfo ("https://@host") away, so inspect
+    // the original authority before relying on the parsed username/password.
+    let authority = value
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#', '\\']).next().unwrap_or(""));
+    if authority.is_none_or(|authority| authority.contains('@')) {
+        return Err(SettingsError::Invalid(field));
+    }
     let url = Url::parse(value).map_err(|_| SettingsError::Invalid(field))?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()

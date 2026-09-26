@@ -100,3 +100,41 @@ fn server_settings_reject_urls_with_userinfo() {
     );
     assert!(ServerSettings::load(mcp.path(), None).is_err());
 }
+
+#[test]
+fn server_settings_reject_empty_url_userinfo() {
+    for url in [
+        "https://@example.com",
+        "https://:@example.com",
+        "https://:pass@example.com",
+        "http://@localhost:8080/api",
+    ] {
+        let provider = config(&format!(
+            "[provider]\napi_key = 'key'\nbase_url = '{url}'\n"
+        ));
+        assert!(
+            ServerSettings::load(provider.path(), None).is_err(),
+            "provider accepted {url}"
+        );
+    }
+
+    for url in [
+        "https://@example.com/mcp",
+        "https://:@example.com/mcp",
+        "https://:pass@example.com/mcp",
+        "http://@localhost:8080/mcp",
+    ] {
+        let mcp = config(&format!(
+            "[provider]\napi_key = 'key'\n[[mcp.servers]]\nname = 'x'\nurl = '{url}'\n"
+        ));
+        assert!(
+            ServerSettings::load(mcp.path(), None).is_err(),
+            "MCP accepted {url}"
+        );
+    }
+
+    let path_and_query = config(
+        "[provider]\napi_key = 'key'\nbase_url = 'https://example.com/path/@name'\n[[mcp.servers]]\nname = 'x'\nurl = 'https://example.com/mcp?contact=@name'\n",
+    );
+    assert!(ServerSettings::load(path_and_query.path(), None).is_ok());
+}
