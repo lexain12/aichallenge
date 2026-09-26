@@ -1,6 +1,7 @@
 //! Provider-neutral tool execution and immutable composite catalog.
 pub mod conversation;
 pub mod mcp;
+pub mod scheduler;
 pub use conversation::{
     ConversationStep, DEFAULT_MAX_TOOL_ROUNDS, ToolConversation, ToolLoopError, ToolResultMessage,
 };
