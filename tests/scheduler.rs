@@ -102,6 +102,9 @@ fn renderer_contains_only_timezone_fixed_binary_and_canonical_job_id() {
         .unwrap()
         .render(&[cron.clone(), once.clone()])
         .unwrap();
+    assert!(output.starts_with(
+        "# BEGIN LIGHT-AGENT MANAGED JOBS\nHOME=/var/lib/light-agent\nCRON_TZ=Europe/Moscow\n"
+    ));
     assert!(output.contains("CRON_TZ=Europe/Moscow\n"));
     assert!(output.contains(&format!(
         "0 9 * * 1-5 /opt/light-agent/bin/light-agent run-job {}\n",
@@ -159,7 +162,7 @@ fn managed_block_replacement_preserves_every_outside_byte() {
     let replaced = renderer.replace_managed_block(existing, &[]).unwrap();
     assert_eq!(
         replaced,
-        "MAILTO=me@example.com\r\n# user before\n# BEGIN LIGHT-AGENT MANAGED JOBS\n# END LIGHT-AGENT MANAGED JOBS\n# user after\r\n"
+        "MAILTO=me@example.com\r\n# user before\n# BEGIN LIGHT-AGENT MANAGED JOBS\nHOME=/var/lib/light-agent\n# END LIGHT-AGENT MANAGED JOBS\n# user after\r\n"
     );
 }
 

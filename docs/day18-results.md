@@ -12,7 +12,7 @@ All commands ran locally on 2026-09-26:
 
 - `cargo fmt --check`: passed;
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`: passed;
-- `cargo test --locked --all-targets --all-features`: 280 passed, 5 ignored,
+- `cargo test --locked --all-targets --all-features`: 282 passed, 5 ignored,
   0 failed;
 - `uv sync --frozen --project telegram_mcp --group dev`: audited 39 packages;
 - `uv run --project telegram_mcp --group dev pytest telegram_mcp/tests -q`:
@@ -23,6 +23,11 @@ The legacy-name scan reported only reviewed, non-legacy uses: export result
 summary variables, negative configuration tests that reject removed sections,
 and Unix sticky-directory security tests. The forced-command key example scan
 reported no credential field, Telegram credential field, or task text field.
+
+The local deployment contract was also verified: the dedicated account HOME,
+working directory, default configuration, database, and managed Cronie HOME all
+resolve under `/var/lib/light-agent`. This is documentation and deterministic
+rendering evidence only; it is not evidence from a real VM.
 
 ## Live acceptance
 

@@ -20,11 +20,10 @@ max_tool_rounds = 8
 timezone = "Europe/Moscow"
 confirmation_timeout_minutes = 5
 run_timeout_seconds = 600
-lock_path = "/run/lock/light-agent-cron.lock"
 binary_path = "/opt/light-agent/bin/light-agent"
 
 [database]
-path = "/var/lib/light-agent/light-agent.sqlite3"
+path = "/var/lib/light-agent/state.sqlite3"
 
 [prompts]
 interactive_system = "You are a helpful assistant."

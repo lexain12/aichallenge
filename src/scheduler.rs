@@ -25,6 +25,7 @@ use crate::store::{CronJob, Store, StoreError};
 
 pub const MANAGED_START: &str = "# BEGIN LIGHT-AGENT MANAGED JOBS";
 pub const MANAGED_END: &str = "# END LIGHT-AGENT MANAGED JOBS";
+pub const RUNTIME_HOME: &str = "/var/lib/light-agent";
 const MAX_CRON_EXPRESSION_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -275,6 +276,9 @@ impl CronRenderer {
     pub fn render(&self, jobs: &[CronJob]) -> Result<String, SchedulerError> {
         let mut output = String::new();
         output.push_str(MANAGED_START);
+        output.push('\n');
+        output.push_str("HOME=");
+        output.push_str(RUNTIME_HOME);
         output.push('\n');
         for job in jobs {
             if job.desired_state != crate::domain::JobDesiredState::Active {
