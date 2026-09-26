@@ -383,6 +383,15 @@ impl<W: AsyncWrite + Unpin> NdjsonWriter<W> {
             .await
             .map_err(|_| ProtocolError::IoError)
     }
+
+    /// Closes only this protocol direction while allowing the peer's remaining
+    /// events to be drained. This matters for split duplex/SSH streams.
+    pub async fn shutdown(&mut self) -> Result<(), ProtocolError> {
+        self.output
+            .shutdown()
+            .await
+            .map_err(|_| ProtocolError::IoError)
+    }
 }
 
 fn serialize_bounded<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
