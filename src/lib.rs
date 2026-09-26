@@ -14,6 +14,7 @@ pub mod invariants;
 pub mod mcp;
 pub mod memory;
 pub mod profile;
+pub mod protocol;
 pub mod settings;
 pub mod system_context;
 pub mod terminal;
