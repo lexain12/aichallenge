@@ -861,6 +861,282 @@ async fn late_confirmation_error_does_not_finish_the_originating_turn() {
     assert_eq!(client.await.unwrap(), Ok(()));
 }
 
+#[tokio::test]
+async fn next_same_turn_confirmation_survives_prior_tool_finished_reordering() {
+    let (client_wire, server_wire) = tokio::io::duplex(64 * 1024);
+    let (client_read, client_write) = tokio::io::split(client_wire);
+    let session = RemoteSession::from_streams(client_read, client_write);
+    let (mut user, client_input) = tokio::io::duplex(4096);
+    let output = SharedWriter::default();
+    let output_view = output.clone();
+    let client = tokio::spawn(TerminalClient::run(
+        session,
+        client_input,
+        output,
+        SharedWriter::default(),
+    ));
+    let (server_read, server_write) = tokio::io::split(server_wire);
+    let mut requests = NdjsonReader::new(server_read);
+    let mut events = NdjsonWriter::new(server_write);
+    events
+        .write_event(&envelope(RequestId::new(), ServerEvent::Hello))
+        .await
+        .unwrap();
+    user.write_all(b"/open 1\n").await.unwrap();
+    let opened = requests.read_request().await.unwrap().unwrap();
+    let dialog_id = DialogId::new(1).unwrap();
+    events
+        .write_event(&envelope(
+            opened.request_id,
+            ServerEvent::DialogOpened {
+                dialog_id,
+                title: "dialog".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    user.write_all(b"two mutations\n").await.unwrap();
+    let turn = requests.read_request().await.unwrap().unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::ResponseStarted { dialog_id },
+        ))
+        .await
+        .unwrap();
+
+    let first_id = ConfirmationId::new();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::ConfirmationRequired {
+                confirmation_id: first_id,
+                preview: confirmation_preview(
+                    ConfirmationAction::Create,
+                    None,
+                    "first mutation",
+                    ConfirmationScheduleKind::Cron,
+                    "0 9 * * *",
+                    "first task",
+                ),
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_text(&output_view, "name: \"first mutation\"").await;
+    user.write_all(b"y\n").await.unwrap();
+    let first_response = requests.read_request().await.unwrap().unwrap();
+    events
+        .write_event(&envelope(
+            first_response.request_id,
+            ServerEvent::ConfirmationResolved {
+                confirmation_id: first_id,
+                accepted: true,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let second_id = ConfirmationId::new();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::ConfirmationRequired {
+                confirmation_id: second_id,
+                preview: confirmation_preview(
+                    ConfirmationAction::Disable,
+                    Some("34479b6c-1a81-43b0-a514-c11743d09afa".parse().unwrap()),
+                    "second mutation",
+                    ConfirmationScheduleKind::Cron,
+                    "0 10 * * *",
+                    "second task",
+                ),
+            },
+        ))
+        .await
+        .unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::ToolFinished {
+                name: "cron__create".into(),
+                code: deepseek_cli::protocol::ProtocolErrorCode::Ok,
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_text(&output_view, "name: \"second mutation\"").await;
+    user.write_all(b"y\n").await.unwrap();
+    let second_response = requests.read_request().await.unwrap().unwrap();
+    assert!(matches!(
+        second_response.request,
+        ClientRequest::ConfirmAction { confirmation_id, originating_request_id }
+            if confirmation_id == second_id && originating_request_id == turn.request_id
+    ));
+    events
+        .write_event(&envelope(
+            second_response.request_id,
+            ServerEvent::ConfirmationResolved {
+                confirmation_id: second_id,
+                accepted: true,
+            },
+        ))
+        .await
+        .unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::ToolFinished {
+                name: "cron__disable".into(),
+                code: deepseek_cli::protocol::ProtocolErrorCode::Ok,
+            },
+        ))
+        .await
+        .unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::TurnPrepared {
+                answer: "done".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::TurnCompleted {
+                answer: "done".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_text(&output_view, "turn completed").await;
+    user.write_all(b"/exit\n").await.unwrap();
+    user.shutdown().await.unwrap();
+    drop(events);
+    assert_eq!(client.await.unwrap(), Ok(()));
+}
+
+#[tokio::test]
+async fn duplicate_confirmation_id_after_fifo_pop_is_not_redisplayed_or_replayed() {
+    let (client_wire, server_wire) = tokio::io::duplex(64 * 1024);
+    let (client_read, client_write) = tokio::io::split(client_wire);
+    let session = RemoteSession::from_streams(client_read, client_write);
+    let (mut user, client_input) = tokio::io::duplex(4096);
+    let output = SharedWriter::default();
+    let output_view = output.clone();
+    let client = tokio::spawn(TerminalClient::run(
+        session,
+        client_input,
+        output,
+        SharedWriter::default(),
+    ));
+    let (server_read, server_write) = tokio::io::split(server_wire);
+    let mut requests = NdjsonReader::new(server_read);
+    let mut events = NdjsonWriter::new(server_write);
+    events
+        .write_event(&envelope(RequestId::new(), ServerEvent::Hello))
+        .await
+        .unwrap();
+    user.write_all(b"/open 1\n").await.unwrap();
+    let opened = requests.read_request().await.unwrap().unwrap();
+    let dialog_id = DialogId::new(1).unwrap();
+    events
+        .write_event(&envelope(
+            opened.request_id,
+            ServerEvent::DialogOpened {
+                dialog_id,
+                title: "dialog".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    user.write_all(b"one mutation\n").await.unwrap();
+    let turn = requests.read_request().await.unwrap().unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::ResponseStarted { dialog_id },
+        ))
+        .await
+        .unwrap();
+    let confirmation_id = ConfirmationId::new();
+    let preview = confirmation_preview(
+        ConfirmationAction::Create,
+        None,
+        "unique mutation",
+        ConfirmationScheduleKind::Cron,
+        "0 9 * * *",
+        "unique task",
+    );
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::ConfirmationRequired {
+                confirmation_id,
+                preview: preview.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_text(&output_view, "name: \"unique mutation\"").await;
+    user.write_all(b"y\n").await.unwrap();
+    let response = requests.read_request().await.unwrap().unwrap();
+
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::ConfirmationRequired {
+                confirmation_id,
+                preview,
+            },
+        ))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        output_view
+            .text()
+            .matches("name: \"unique mutation\"")
+            .count(),
+        1
+    );
+    events
+        .write_event(&envelope(
+            response.request_id,
+            ServerEvent::ConfirmationResolved {
+                confirmation_id,
+                accepted: true,
+            },
+        ))
+        .await
+        .unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::TurnPrepared {
+                answer: "done".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    events
+        .write_event(&envelope(
+            turn.request_id,
+            ServerEvent::TurnCompleted {
+                answer: "done".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_text(&output_view, "turn completed").await;
+    user.write_all(b"/exit\n").await.unwrap();
+    user.shutdown().await.unwrap();
+    drop(events);
+    assert_eq!(client.await.unwrap(), Ok(()));
+}
+
 #[test]
 fn relative_export_uses_a_retained_parent_directory_handle() {
     let dir = tempfile::tempdir().unwrap();

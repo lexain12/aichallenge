@@ -27,6 +27,7 @@ pub use crate::remote_client::ClientError;
 const INPUT_QUEUE: usize = 1;
 const MAX_LABEL_BYTES: usize = 512;
 const MAX_INSPECTION_RECORD_BYTES: usize = MAX_CONTENT_BYTES * 6 + 65_536;
+const MAX_ACTIVE_CONFIRMATIONS: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientAction {
@@ -505,11 +506,17 @@ struct ClientState {
     active_dialog: Option<DialogId>,
     pending: HashMap<RequestId, PendingRequest>,
     confirmations: VecDeque<PendingConfirmation>,
+    seen_confirmations: HashMap<ConfirmationId, SeenConfirmation>,
 }
 
 struct PendingConfirmation {
     originating_request_id: RequestId,
     confirmation_id: ConfirmationId,
+    preview: ScheduleConfirmationPreview,
+}
+
+struct SeenConfirmation {
+    originating_request_id: RequestId,
     preview: ScheduleConfirmationPreview,
 }
 
@@ -642,6 +649,7 @@ where
         .ok_or(ClientError::Protocol)?;
     let mut finished = false;
     let mut drop_confirmations = false;
+    let mut resolved_confirmation = None;
     match (&mut *pending, envelope.event) {
         (
             PendingRequest::Dialogs { sequence, deleted },
@@ -724,7 +732,6 @@ where
                 .write_all(line.as_bytes())
                 .await
                 .map_err(|_| ClientError::Output)?;
-            drop_confirmations = true;
         }
         (
             PendingRequest::Turn { .. },
@@ -733,14 +740,23 @@ where
                 preview,
             },
         ) => {
-            if state
-                .confirmations
-                .iter()
-                .any(|pending| pending.confirmation_id == confirmation_id)
-            {
+            if let Some(seen) = state.seen_confirmations.get(&confirmation_id) {
+                if seen.originating_request_id == request_id && seen.preview == preview {
+                    return Ok(());
+                }
+                return Err(ClientError::Protocol);
+            }
+            if state.seen_confirmations.len() >= MAX_ACTIVE_CONFIRMATIONS {
                 return Err(ClientError::Protocol);
             }
             let display_now = state.confirmations.is_empty();
+            state.seen_confirmations.insert(
+                confirmation_id,
+                SeenConfirmation {
+                    originating_request_id: request_id,
+                    preview: preview.clone(),
+                },
+            );
             state.confirmations.push_back(PendingConfirmation {
                 originating_request_id: request_id,
                 confirmation_id,
@@ -791,6 +807,7 @@ where
             },
         ) if confirmation_id == *expected && accepted == *expected_accepted => {
             finished = true;
+            resolved_confirmation = Some(confirmation_id);
         }
         (
             PendingRequest::Inspection(assembler),
@@ -848,13 +865,22 @@ where
                 .write_all(line.as_bytes())
                 .await
                 .map_err(|_| ClientError::Output)?;
-            drop_confirmations = matches!(pending, PendingRequest::Turn { .. });
+            match pending {
+                PendingRequest::Turn { .. } => drop_confirmations = true,
+                PendingRequest::ConfirmationResponse {
+                    confirmation_id, ..
+                } => resolved_confirmation = Some(*confirmation_id),
+                _ => {}
+            }
             finished = true;
         }
         _ => return Err(ClientError::Protocol),
     }
     if drop_confirmations {
         remove_confirmations_for_request(state, request_id, output).await?;
+    }
+    if let Some(confirmation_id) = resolved_confirmation {
+        state.seen_confirmations.remove(&confirmation_id);
     }
     if finished {
         state.pending.remove(&request_id);
@@ -889,6 +915,9 @@ async fn remove_confirmations_for_request<O: AsyncWrite + Unpin>(
     state
         .confirmations
         .retain(|confirmation| confirmation.originating_request_id != request_id);
+    state
+        .seen_confirmations
+        .retain(|_, confirmation| confirmation.originating_request_id != request_id);
     if removed_front {
         render_next_confirmation(state, output).await?;
     }
