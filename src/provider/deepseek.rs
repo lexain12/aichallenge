@@ -10,7 +10,7 @@ use crate::settings::ProviderSettings;
 
 use super::{
     AssistantTurn, ModelToolCall, ModelToolDefinition, Provider, ProviderError, ProviderFuture,
-    ProviderMessage, TokenUsage,
+    ProviderMessage, TokenUsage, serialized_len,
 };
 
 const MAX_ERROR_BODY_BYTES: usize = 4096;
@@ -177,6 +177,24 @@ impl Provider for DeepSeekProvider {
         text_sink: &'a mut (dyn FnMut(&str) -> io::Result<()> + Send),
     ) -> ProviderFuture<'a> {
         Box::pin(self.stream(messages, tools, text_sink))
+    }
+
+    fn serialized_request_len(
+        &self,
+        messages: &[ProviderMessage],
+        tools: &[ModelToolDefinition],
+    ) -> Result<usize, ProviderError> {
+        let tools: Vec<_> = tools.iter().map(ProviderToolDefinition::from).collect();
+        serialized_len(&ChatRequest {
+            model: &self.model,
+            messages,
+            max_tokens: self.max_tokens,
+            stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
+            tools: &tools,
+        })
     }
 }
 

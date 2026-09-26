@@ -4,7 +4,7 @@ mod deepseek;
 
 use std::fmt;
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
@@ -152,6 +152,39 @@ pub trait Provider: Send + Sync {
         tools: &'a [ModelToolDefinition],
         text_sink: &'a mut (dyn FnMut(&str) -> io::Result<()> + Send),
     ) -> ProviderFuture<'a>;
+
+    /// Returns the exact serialized wire-request size. Providers that do not
+    /// implement this boundary fail closed before any network dispatch.
+    fn serialized_request_len(
+        &self,
+        _messages: &[ProviderMessage],
+        _tools: &[ModelToolDefinition],
+    ) -> Result<usize, ProviderError> {
+        Err(ProviderError::new("request_size_unavailable"))
+    }
+}
+
+pub(crate) fn serialized_len(value: &impl Serialize) -> Result<usize, ProviderError> {
+    #[derive(Default)]
+    struct Counter(usize);
+
+    impl Write for Counter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(buffer.len())
+                .ok_or_else(|| io::Error::other("serialized request length overflow"))?;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter::default();
+    serde_json::to_writer(&mut counter, value).map_err(|_| ProviderError::new("serialization"))?;
+    Ok(counter.0)
 }
 
 /// Safe error for protocol callers. The HTTP body is kept only for explicit
@@ -173,6 +206,13 @@ pub struct ProviderError {
 }
 
 impl ProviderError {
+    /// Construct a provider-neutral, diagnostic-free machine error. Public
+    /// provider implementations can fail without gaining access to raw HTTP
+    /// diagnostics, and callers still map this code to a closed local set.
+    pub fn safe(code: &'static str) -> Self {
+        Self::new(code)
+    }
+
     pub(crate) fn new(code: &'static str) -> Self {
         Self {
             code,
