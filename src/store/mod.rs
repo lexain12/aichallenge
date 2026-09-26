@@ -12,11 +12,19 @@ pub use jobs::{CronJob, CronRun, CronRunClaim, CronRunFinish, JobCreate, RunClai
 pub(crate) use runtime::RuntimeOwnerRecord;
 
 use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::future::Future;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -115,12 +123,159 @@ struct TrustedDirectory {
     path: PathBuf,
     file: std::fs::File,
     identity: DatabaseIdentity,
+    ancestors: Vec<TrustedAncestor>,
+}
+
+#[derive(Debug)]
+struct TrustedAncestor {
+    path: PathBuf,
+    file: std::fs::File,
+    identity: DatabaseIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DatabaseIdentity {
     pub device: u64,
     pub inode: u64,
+}
+
+const COMMIT_FENCE_OPEN: u8 = 0;
+const COMMIT_FENCE_CANCELLED: u8 = 1;
+const COMMIT_FENCE_PROVISIONAL: u8 = 2;
+const COMMIT_FENCE_PERMITTED: u8 = 3;
+
+struct LogicalCommitFence(Arc<AtomicU8>);
+
+struct CommitFenceCancellation(Arc<AtomicU8>);
+
+impl CommitFenceCancellation {
+    fn cancel(&self) {
+        loop {
+            let state = self.0.load(Ordering::SeqCst);
+            if !matches!(state, COMMIT_FENCE_OPEN | COMMIT_FENCE_PROVISIONAL) {
+                return;
+            }
+            if self
+                .0
+                .compare_exchange(
+                    state,
+                    COMMIT_FENCE_CANCELLED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+}
+
+impl Wake for CommitFenceCancellation {
+    fn wake(self: Arc<Self>) {
+        self.cancel();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.cancel();
+    }
+}
+
+struct DeadlineFenceWatcher {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DeadlineFenceWatcher {
+    fn start(
+        deadline: Instant,
+        cancellation: Arc<CommitFenceCancellation>,
+    ) -> Result<Self, StoreError> {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::Builder::new()
+            .name("commit-deadline".into())
+            .spawn(move || {
+                let (lock, wake) = &*worker_stop;
+                let mut stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !*stopped && Instant::now() < deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let waited = wake
+                        .wait_timeout(stopped, remaining)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    stopped = waited.0;
+                }
+                if !*stopped && Instant::now() >= deadline {
+                    cancellation.cancel();
+                }
+            })
+            .map_err(|_| StoreError::Busy)?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for DeadlineFenceWatcher {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.stop;
+        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        wake.notify_one();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl LogicalCommitFence {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(COMMIT_FENCE_OPEN)))
+    }
+
+    fn acquire(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        before_permit: impl FnOnce(),
+    ) -> Result<(), StoreError> {
+        let fence_cancellation = Arc::new(CommitFenceCancellation(Arc::clone(&self.0)));
+        let waker = Waker::from(Arc::clone(&fence_cancellation));
+        let mut context = Context::from_waker(&waker);
+        let mut cancelled = std::pin::pin!(cancellation.cancelled());
+        if matches!(cancelled.as_mut().poll(&mut context), Poll::Ready(())) {
+            fence_cancellation.cancel();
+        }
+        let _deadline_watcher =
+            DeadlineFenceWatcher::start(deadline, Arc::clone(&fence_cancellation))?;
+        // Tests can stop precisely after both cancellation contenders are
+        // registered but before the permit CAS. Production passes a no-op.
+        before_permit();
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            fence_cancellation.cancel();
+            return Err(StoreError::Busy);
+        }
+        self.0
+            .compare_exchange(
+                COMMIT_FENCE_OPEN,
+                COMMIT_FENCE_PROVISIONAL,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map_err(|_| StoreError::Busy)?;
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            fence_cancellation.cancel();
+        }
+        self.0
+            .compare_exchange(
+                COMMIT_FENCE_PROVISIONAL,
+                COMMIT_FENCE_PERMITTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map(|_| ())
+            .map_err(|_| StoreError::Busy)
+    }
 }
 
 impl Store {
@@ -149,6 +304,7 @@ impl Store {
             trusted_directory: std::sync::Arc::new(trusted_directory),
             runtime_owner: None,
         };
+        store.enable_wal_until(deadline, cancellation)?;
         store.with_immediate_transaction(deadline, cancellation, |tx| {
             let version_table: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version')",
@@ -192,6 +348,36 @@ impl Store {
         Ok(store)
     }
 
+    fn enable_wal_until(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), StoreError> {
+        const RETRY: Duration = Duration::from_millis(1);
+        loop {
+            check_deadline(deadline, cancellation)?;
+            let connection = self.connection_with_busy_timeout(Duration::ZERO)?;
+            match connection.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if matches!(
+                        error.sqlite_error_code(),
+                        Some(
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        )
+                    ) =>
+                {
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(RETRY),
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     pub(crate) fn connection(&self) -> Result<Connection, StoreError> {
         self.connection_with_busy_timeout(Duration::from_secs(5))
     }
@@ -206,9 +392,8 @@ impl Store {
         // Recheck before any writable pragma. Opening without CREATE prevents
         // a rename race from manufacturing a replacement database here.
         self.validate_storage_boundary()?;
-        connection.busy_timeout(busy_timeout.max(Duration::from_millis(1)))?;
+        connection.busy_timeout(busy_timeout)?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
         self.validate_storage_boundary()?;
         Ok(connection)
     }
@@ -219,16 +404,35 @@ impl Store {
         cancellation: &CancellationToken,
         operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        const BUSY_SLICE: Duration = Duration::from_millis(10);
+        self.with_immediate_transaction_inner(deadline, cancellation, operation, || {}, || {})
+    }
+
+    fn with_immediate_transaction_inner<T>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StoreError>,
+        before_commit_permit: impl FnOnce(),
+        after_commit_permit: impl FnOnce(),
+    ) -> Result<T, StoreError> {
+        const BUSY_RETRY: Duration = Duration::from_millis(1);
         let mut operation = Some(operation);
+        let mut before_commit_permit = Some(before_commit_permit);
+        let mut after_commit_permit = Some(after_commit_permit);
         loop {
             if cancellation.is_cancelled() || Instant::now() >= deadline {
                 return Err(StoreError::Busy);
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let mut db = match self.connection_with_busy_timeout(remaining.min(BUSY_SLICE)) {
+            let mut db = match self.connection_with_busy_timeout(Duration::ZERO) {
                 Ok(db) => db,
-                Err(StoreError::Busy) => continue,
+                Err(StoreError::Busy) => {
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(BUSY_RETRY),
+                    );
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             let progress_cancellation = cancellation.clone();
@@ -246,6 +450,11 @@ impl Store {
                         )
                     ) =>
                 {
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(BUSY_RETRY),
+                    );
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -254,12 +463,41 @@ impl Store {
                 return Err(StoreError::Busy);
             }
             let result = operation.take().expect("operation runs once")(&tx)?;
-            if cancellation.is_cancelled() || Instant::now() >= deadline {
-                return Err(StoreError::Busy);
-            }
+            let fence = LogicalCommitFence::new();
+            fence.acquire(
+                deadline,
+                cancellation,
+                before_commit_permit.take().expect("commit hook runs once"),
+            )?;
+            after_commit_permit.take().expect("commit hook runs once")();
+            // The permit is the logical linearization point. Cancellation or
+            // deadline after it cannot safely revoke an atomic commit. Disable
+            // the operation handler and all SQLite busy waiting so COMMIT is
+            // either immediate or returns Busy; physical WAL/fsync completion
+            // may still finish after the logical deadline.
+            tx.progress_handler(0, None::<fn() -> bool>)?;
+            tx.busy_timeout(Duration::ZERO)?;
             tx.commit()?;
             return Ok(result);
         }
+    }
+
+    #[cfg(test)]
+    fn with_immediate_transaction_with_commit_hooks<T>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StoreError>,
+        before_commit_permit: impl FnOnce(),
+        after_commit_permit: impl FnOnce(),
+    ) -> Result<T, StoreError> {
+        self.with_immediate_transaction_inner(
+            deadline,
+            cancellation,
+            operation,
+            before_commit_permit,
+            after_commit_permit,
+        )
     }
 
     pub(crate) fn with_runtime_capability_until(
@@ -382,17 +620,10 @@ fn prepare_database_path(
     if path.as_os_str().is_empty() || path == Path::new(":memory:") {
         return Err(StoreError::InvalidPath);
     }
-    let absolute = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        std::env::current_dir()
-            .map_err(|_| StoreError::InvalidPath)?
-            .join(path)
-    };
+    let absolute = normalize_database_path(path)?;
     let file_name = absolute.file_name().ok_or(StoreError::InvalidPath)?;
     let parent = absolute.parent().ok_or(StoreError::InvalidPath)?;
-    let parent = fs::canonicalize(parent).map_err(|_| StoreError::InvalidPath)?;
-    let trusted_directory = open_trusted_directory(&parent)?;
+    let trusted_directory = open_trusted_directory(parent)?;
     let canonical_candidate = parent.join(file_name);
 
     match fs::symlink_metadata(&canonical_candidate) {
@@ -410,13 +641,37 @@ fn prepare_database_path(
         Err(_) => return Err(StoreError::InvalidPath),
     }
     check_deadline(deadline, cancellation)?;
-    let path = fs::canonicalize(&canonical_candidate).map_err(|_| StoreError::InvalidPath)?;
-    if path.parent() != Some(parent.as_path()) {
-        return Err(StoreError::InvalidPath);
-    }
+    let path = canonical_candidate;
     let metadata = fs::symlink_metadata(&path).map_err(|_| StoreError::InvalidPath)?;
     validate_database_metadata(&metadata)?;
     Ok((path, metadata_identity(&metadata), trusted_directory))
+}
+
+fn normalize_database_path(path: &Path) -> Result<PathBuf, StoreError> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| StoreError::InvalidPath)?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            // Resolving `..` safely would require retaining the complete
+            // traversed descriptor stack, including the discarded component.
+            // Configuration paths fail closed instead.
+            Component::ParentDir | Component::Prefix(_) => return Err(StoreError::InvalidPath),
+        }
+    }
+    if normalized.is_absolute() {
+        Ok(normalized)
+    } else {
+        Err(StoreError::InvalidPath)
+    }
 }
 
 fn validate_database_identity(path: &Path, expected: DatabaseIdentity) -> Result<(), StoreError> {
@@ -430,27 +685,100 @@ fn validate_database_identity(path: &Path, expected: DatabaseIdentity) -> Result
 
 #[cfg(unix)]
 fn open_trusted_directory(path: &Path) -> Result<TrustedDirectory, StoreError> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let file = options.open(path).map_err(|_| StoreError::InvalidPath)?;
-    let metadata = file.metadata().map_err(|_| StoreError::InvalidPath)?;
+    let mut chain = open_directory_chain(path)?;
+    let parent = chain.pop().ok_or(StoreError::InvalidPath)?;
+    let metadata = parent
+        .file
+        .metadata()
+        .map_err(|_| StoreError::InvalidPath)?;
     if !metadata.is_dir()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o7777 != 0o700
     {
         return Err(StoreError::InvalidPath);
     }
-    let path_metadata = fs::symlink_metadata(path).map_err(|_| StoreError::InvalidPath)?;
-    if metadata_identity(&path_metadata) != metadata_identity(&metadata) {
+    Ok(TrustedDirectory {
+        path: parent.path,
+        identity: parent.identity,
+        file: parent.file,
+        ancestors: chain,
+    })
+}
+
+#[cfg(unix)]
+fn open_directory_chain(path: &Path) -> Result<Vec<TrustedAncestor>, StoreError> {
+    if !path.is_absolute() {
         return Err(StoreError::InvalidPath);
     }
-    Ok(TrustedDirectory {
-        path: path.to_owned(),
-        identity: metadata_identity(&metadata),
-        file,
-    })
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let root_file = options
+        .open(Path::new("/"))
+        .map_err(|_| StoreError::InvalidPath)?;
+    let root_metadata = root_file.metadata().map_err(|_| StoreError::InvalidPath)?;
+    validate_ancestor_metadata(&root_metadata)?;
+    let mut chain = vec![TrustedAncestor {
+        path: PathBuf::from("/"),
+        identity: metadata_identity(&root_metadata),
+        file: root_file,
+    }];
+    let mut current_path = PathBuf::from("/");
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(StoreError::InvalidPath);
+        };
+        let name_c =
+            std::ffi::CString::new(name.as_bytes()).map_err(|_| StoreError::InvalidPath)?;
+        let parent_fd = chain
+            .last()
+            .ok_or(StoreError::InvalidPath)?
+            .file
+            .as_raw_fd();
+        let fd = unsafe {
+            libc::openat(
+                parent_fd,
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(StoreError::InvalidPath);
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = file.metadata().map_err(|_| StoreError::InvalidPath)?;
+        validate_ancestor_metadata(&metadata)?;
+        current_path.push(name);
+        let path_metadata =
+            fs::symlink_metadata(&current_path).map_err(|_| StoreError::InvalidPath)?;
+        let identity = metadata_identity(&metadata);
+        if !path_metadata.is_dir() || metadata_identity(&path_metadata) != identity {
+            return Err(StoreError::InvalidPath);
+        }
+        chain.push(TrustedAncestor {
+            path: current_path.clone(),
+            file,
+            identity,
+        });
+    }
+    Ok(chain)
+}
+
+#[cfg(unix)]
+fn validate_ancestor_metadata(metadata: &fs::Metadata) -> Result<(), StoreError> {
+    let uid = metadata.uid();
+    let mode = metadata.mode() & 0o7777;
+    let owner_is_trusted = uid == 0 || uid == unsafe { libc::geteuid() };
+    let writable_by_others = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if !metadata.is_dir() || !owner_is_trusted || (writable_by_others && !sticky) {
+        return Err(StoreError::InvalidPath);
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -460,6 +788,9 @@ fn open_trusted_directory(_path: &Path) -> Result<TrustedDirectory, StoreError> 
 
 #[cfg(unix)]
 fn validate_trusted_directory_identity(directory: &TrustedDirectory) -> Result<(), StoreError> {
+    for ancestor in &directory.ancestors {
+        validate_trusted_ancestor_identity(ancestor)?;
+    }
     let fd_metadata = directory
         .file
         .metadata()
@@ -474,6 +805,25 @@ fn validate_trusted_directory_identity(directory: &TrustedDirectory) -> Result<(
     let path_metadata =
         fs::symlink_metadata(&directory.path).map_err(|_| StoreError::InvalidPath)?;
     if metadata_identity(&path_metadata) != directory.identity {
+        return Err(StoreError::InvalidPath);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_trusted_ancestor_identity(ancestor: &TrustedAncestor) -> Result<(), StoreError> {
+    let fd_metadata = ancestor
+        .file
+        .metadata()
+        .map_err(|_| StoreError::InvalidPath)?;
+    validate_ancestor_metadata(&fd_metadata)?;
+    if metadata_identity(&fd_metadata) != ancestor.identity {
+        return Err(StoreError::InvalidPath);
+    }
+    let path_metadata =
+        fs::symlink_metadata(&ancestor.path).map_err(|_| StoreError::InvalidPath)?;
+    validate_ancestor_metadata(&path_metadata)?;
+    if metadata_identity(&path_metadata) != ancestor.identity {
         return Err(StoreError::InvalidPath);
     }
     Ok(())
@@ -664,9 +1014,135 @@ UPDATE schema_version SET version=3;
 const SCHEMA_V4: &str = "
 ALTER TABLE tool_runs ADD COLUMN runtime_owner_id TEXT REFERENCES runtime_owners(owner_id);
 UPDATE tool_runs SET runtime_owner_id=CASE owner_kind
-    WHEN 'interactive_turn' THEN (SELECT runtime_owner_id FROM turns WHERE id=tool_runs.owner_id)
-    WHEN 'cron_run' THEN (SELECT runtime_owner_id FROM cron_runs WHERE id=tool_runs.owner_id)
+    WHEN 'interactive_turn' THEN (SELECT runtime_owner_id FROM turns WHERE id=tool_runs.owner_id AND status='pending')
+    WHEN 'cron_run' THEN (SELECT runtime_owner_id FROM cron_runs WHERE id=tool_runs.owner_id AND status='pending')
 END WHERE status='pending';
+UPDATE tool_runs
+SET status=CASE WHEN read_only=1 THEN 'failed' ELSE 'uncertain' END,
+    safe_error_code='process_interrupted',
+    finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+WHERE status='pending' AND runtime_owner_id IS NULL;
 CREATE INDEX pending_tools_by_runtime_owner ON tool_runs(runtime_owner_id) WHERE status='pending';
 UPDATE schema_version SET version=4;
 ";
+
+#[cfg(all(test, unix))]
+mod commit_fence_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::{Store, StoreError};
+
+    fn store() -> (tempfile::TempDir, Store) {
+        let temporary_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let directory = tempfile::tempdir_in(temporary_root).unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(directory.path().join("agent.sqlite")).unwrap();
+        (directory, store)
+    }
+
+    #[test]
+    fn cancellation_wins_before_commit_permit_and_rolls_back() {
+        let (_directory, store) = store();
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store.with_immediate_transaction_with_commit_hooks(
+                Instant::now() + Duration::from_secs(5),
+                &worker_cancellation,
+                |tx| {
+                    tx.execute(
+                        "INSERT INTO dialogs(title,created_at,updated_at) VALUES('cancel-wins','now','now')",
+                        [],
+                    )?;
+                    Ok(())
+                },
+                || {
+                    reached_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+                || {},
+            )
+        });
+        reached_rx.recv().unwrap();
+        cancellation.cancel();
+        release_tx.send(()).unwrap();
+
+        assert_eq!(worker.join().unwrap(), Err(StoreError::Busy));
+        assert!(store.list_dialogs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deadline_wins_before_commit_permit_and_rolls_back() {
+        let (_directory, store) = store();
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_millis(40);
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store.with_immediate_transaction_with_commit_hooks(
+                deadline,
+                &cancellation,
+                |tx| {
+                    tx.execute(
+                        "INSERT INTO dialogs(title,created_at,updated_at) VALUES('deadline-wins','now','now')",
+                        [],
+                    )?;
+                    Ok(())
+                },
+                || {
+                    reached_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+                || {},
+            )
+        });
+        reached_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        release_tx.send(()).unwrap();
+
+        assert_eq!(worker.join().unwrap(), Err(StoreError::Busy));
+        assert!(store.list_dialogs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn commit_permit_wins_then_cancellation_cannot_undo_durable_mutation() {
+        let (_directory, store) = store();
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let (permitted_tx, permitted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store.with_immediate_transaction_with_commit_hooks(
+                Instant::now() + Duration::from_secs(5),
+                &worker_cancellation,
+                |tx| {
+                    tx.execute(
+                        "INSERT INTO dialogs(title,created_at,updated_at) VALUES('commit-wins','now','now')",
+                        [],
+                    )?;
+                    Ok(())
+                },
+                || {},
+                || {
+                    permitted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        permitted_rx.recv().unwrap();
+        cancellation.cancel();
+        release_tx.send(()).unwrap();
+
+        assert_eq!(worker.join().unwrap(), Ok(()));
+        assert_eq!(store.list_dialogs().unwrap().len(), 1);
+    }
+}

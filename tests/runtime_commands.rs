@@ -310,6 +310,38 @@ fn turn_status(directory: &tempfile::TempDir, turn_id: deepseek_cli::domain::Tur
         .unwrap()
 }
 
+fn insert_v3_style_pending_tool(
+    database: &std::path::Path,
+    owner_id: i64,
+    call_id: &str,
+    read_only: bool,
+) {
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .execute(
+            "INSERT INTO tool_runs(owner_kind,owner_id,call_id,server_name,tool_name,read_only,status,runtime_owner_id)
+             VALUES('interactive_turn',?1,?2,'v3_fixture','call',?3,'pending',NULL)",
+            rusqlite::params![owner_id, call_id, read_only],
+        )
+        .unwrap();
+}
+
+fn insert_v3_style_pending_cron_tool(
+    database: &std::path::Path,
+    owner_id: i64,
+    call_id: &str,
+    read_only: bool,
+) {
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .execute(
+            "INSERT INTO tool_runs(owner_kind,owner_id,call_id,server_name,tool_name,read_only,status,runtime_owner_id)
+             VALUES('cron_run',?1,?2,'v3_fixture','call',?3,'pending',NULL)",
+            rusqlite::params![owner_id, call_id, read_only],
+        )
+        .unwrap();
+}
+
 #[test]
 fn second_live_server_never_recovers_the_first_process_work() {
     use std::net::TcpListener;
@@ -374,6 +406,158 @@ fn initialized_owner_registry_rejects_new_unowned_work() {
     let second = ProcessLease::acquire(&store).unwrap();
 
     assert_eq!(second.recovery_report().turns, 0);
+}
+
+#[test]
+fn existing_coordination_marker_recovers_missing_terminal_and_unowned_null_tools() {
+    let directory = common::private_tempdir();
+    let database = directory.path().join("agent.sqlite3");
+    let store = Store::open(&database).unwrap();
+    let terminal_dialog = store.create_dialog("terminal parent").unwrap();
+    let terminal_turn = store.begin_turn(terminal_dialog.id, "finished").unwrap();
+    store.complete_turn(terminal_turn.turn_id, "done").unwrap();
+    let initial = ProcessLease::acquire(&store).unwrap();
+    drop(initial);
+
+    insert_v3_style_pending_tool(&database, 999_999, "missing_parent", false);
+    insert_v3_style_pending_tool(
+        &database,
+        terminal_turn.turn_id.get(),
+        "terminal_parent",
+        true,
+    );
+    let unowned_dialog = store.create_dialog("unowned parent").unwrap();
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.execute(
+        "INSERT INTO turns(dialog_id,status,started_at,runtime_owner_id) VALUES(?,'pending',?,NULL)",
+        rusqlite::params![unowned_dialog.id.get(), Utc::now().to_rfc3339()],
+    )
+    .unwrap();
+    let unowned_turn = db.last_insert_rowid();
+    drop(db);
+    insert_v3_style_pending_tool(&database, unowned_turn, "unowned_parent", false);
+
+    let recovered = ProcessLease::acquire(&store).unwrap();
+    assert_eq!(recovered.recovery_report().tool_runs, 3);
+    let tools = store.list_tool_runs().unwrap();
+    assert_eq!(tools[0].status, ToolRunStatus::Uncertain);
+    assert_eq!(tools[1].status, ToolRunStatus::Failed);
+    assert_eq!(tools[2].status, ToolRunStatus::Uncertain);
+    assert_eq!(
+        turn_status(
+            &directory,
+            deepseek_cli::domain::TurnId::new(unowned_turn).unwrap()
+        ),
+        "interrupted"
+    );
+}
+
+#[test]
+fn v3_style_null_tool_follows_live_then_dead_parent_owner() {
+    let directory = common::private_tempdir();
+    let database = directory.path().join("agent.sqlite3");
+    let store = Store::open(&database).unwrap();
+    let owner = ProcessLease::acquire(&store).unwrap();
+    let owned = owner.owned_store(&store).unwrap();
+    let dialog = store.create_dialog("rolling v3 writer").unwrap();
+    let turn = owned.begin_turn(dialog.id, "question").unwrap();
+    insert_v3_style_pending_tool(&database, turn.turn_id.get(), "v3_live", false);
+
+    let concurrent = ProcessLease::acquire(&store).unwrap();
+    assert_eq!(concurrent.recovery_report().tool_runs, 0);
+    assert_eq!(
+        store.list_tool_runs().unwrap()[0].status,
+        ToolRunStatus::Pending
+    );
+    drop(concurrent);
+    drop(owned);
+    drop(owner);
+
+    let recovered = ProcessLease::acquire(&store).unwrap();
+    assert_eq!(recovered.recovery_report().tool_runs, 1);
+    assert_eq!(recovered.recovery_report().turns, 1);
+    assert_eq!(
+        store.list_tool_runs().unwrap()[0].status,
+        ToolRunStatus::Uncertain
+    );
+    assert_eq!(turn_status(&directory, turn.turn_id), "interrupted");
+}
+
+#[test]
+fn v3_style_null_cron_tool_follows_live_then_dead_parent_owner() {
+    let directory = common::private_tempdir();
+    let database = directory.path().join("agent.sqlite3");
+    let store = Store::open(&database).unwrap();
+    let owner = ProcessLease::acquire(&store).unwrap();
+    let owned = owner.owned_store(&store).unwrap();
+    let dialog = store.create_dialog("rolling v3 cron writer").unwrap();
+    let job = store
+        .create_job(JobCreate {
+            source_dialog_id: dialog.id,
+            name: "v3 cron".into(),
+            schedule: ScheduleSpec::parse_cron("* * * * *", Moscow).unwrap(),
+            prompt: "work".into(),
+        })
+        .unwrap();
+    store.mark_job_sync_applied(job.id).unwrap();
+    let RunClaim::Claimed(claim) = owned.claim_run(job.id, Utc::now()).unwrap() else {
+        panic!("claim")
+    };
+    insert_v3_style_pending_cron_tool(&database, claim.run.id.get(), "v3_cron_live", true);
+
+    let concurrent = ProcessLease::acquire(&store).unwrap();
+    assert_eq!(concurrent.recovery_report().tool_runs, 0);
+    assert_eq!(
+        store.list_tool_runs().unwrap()[0].status,
+        ToolRunStatus::Pending
+    );
+    drop(concurrent);
+    drop(owned);
+    drop(owner);
+
+    let recovered = ProcessLease::acquire(&store).unwrap();
+    assert_eq!(recovered.recovery_report().tool_runs, 1);
+    assert_eq!(recovered.recovery_report().cron_runs, 1);
+    assert_eq!(
+        store.list_tool_runs().unwrap()[0].status,
+        ToolRunStatus::Failed
+    );
+    assert_eq!(
+        store.list_runs(job.id).unwrap()[0].status,
+        CronRunStatus::Interrupted
+    );
+}
+
+#[test]
+fn null_tool_with_unverifiable_nonnull_parent_owner_is_not_recovered() {
+    let directory = common::private_tempdir();
+    let database = directory.path().join("agent.sqlite3");
+    let store = Store::open(&database).unwrap();
+    let initial = ProcessLease::acquire(&store).unwrap();
+    let dialog = store.create_dialog("unverifiable owner").unwrap();
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.pragma_update(None, "foreign_keys", false).unwrap();
+    db.execute(
+        "INSERT INTO turns(dialog_id,status,started_at,runtime_owner_id) VALUES(?,'pending',?,?)",
+        rusqlite::params![
+            dialog.id.get(),
+            Utc::now().to_rfc3339(),
+            "123e4567-e89b-42d3-a456-426614174000"
+        ],
+    )
+    .unwrap();
+    let turn_id = db.last_insert_rowid();
+    drop(db);
+    insert_v3_style_pending_tool(&database, turn_id, "unverifiable_owner", true);
+
+    let concurrent = ProcessLease::acquire(&store).unwrap();
+    assert_eq!(concurrent.recovery_report().tool_runs, 0);
+    assert_eq!(
+        store.list_tool_runs().unwrap()[0].status,
+        ToolRunStatus::Pending
+    );
+    drop(concurrent);
+    drop(initial);
 }
 
 #[test]

@@ -1,5 +1,7 @@
 pub fn private_tempdir() -> tempfile::TempDir {
-    let directory = tempfile::tempdir().expect("create temporary directory");
+    let temporary_root = std::fs::canonicalize(std::env::temp_dir())
+        .expect("resolve the platform temporary directory for nofollow tests");
+    let directory = tempfile::tempdir_in(temporary_root).expect("create temporary directory");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

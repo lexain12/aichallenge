@@ -50,7 +50,7 @@ impl Store {
                         && current_device == device
                         && current_inode == inode =>
                 {
-                    Ok(OwnerRecovery::default())
+                    recover_unowned_runtime_work(tx)
                 }
                 Some(_) => Err(StoreError::Conflict),
                 None => {
@@ -130,7 +130,22 @@ impl Store {
                 "UPDATE tool_runs
                  SET status=CASE WHEN read_only=1 THEN 'failed' ELSE 'uncertain' END,
                      safe_error_code='process_interrupted',finished_at=?1,runtime_owner_id=NULL
-                 WHERE status='pending' AND runtime_owner_id=?2",
+                 WHERE status='pending' AND (
+                    runtime_owner_id=?2 OR (
+                        runtime_owner_id IS NULL AND (
+                            (owner_kind='interactive_turn' AND EXISTS(
+                                SELECT 1 FROM turns
+                                WHERE id=tool_runs.owner_id AND status='pending'
+                                  AND runtime_owner_id=?2
+                            )) OR
+                            (owner_kind='cron_run' AND EXISTS(
+                                SELECT 1 FROM cron_runs
+                                WHERE id=tool_runs.owner_id AND status='pending'
+                                  AND runtime_owner_id=?2
+                            ))
+                        )
+                    )
+                 )",
                 params![timestamp, owner_id],
             )?;
             tx.execute(
@@ -176,7 +191,21 @@ fn recover_unowned_runtime_work(tx: &Transaction<'_>) -> Result<OwnerRecovery, S
         "UPDATE tool_runs
          SET status=CASE WHEN read_only=1 THEN 'failed' ELSE 'uncertain' END,
              safe_error_code='process_interrupted',finished_at=?1,runtime_owner_id=NULL
-         WHERE status='pending' AND runtime_owner_id IS NULL",
+         WHERE status='pending' AND runtime_owner_id IS NULL
+           AND NOT (
+                owner_kind='interactive_turn' AND EXISTS(
+                    SELECT 1 FROM turns
+                    WHERE turns.id=tool_runs.owner_id AND turns.status='pending'
+                      AND turns.runtime_owner_id IS NOT NULL
+                )
+           )
+           AND NOT (
+                owner_kind='cron_run' AND EXISTS(
+                    SELECT 1 FROM cron_runs
+                    WHERE cron_runs.id=tool_runs.owner_id AND cron_runs.status='pending'
+                      AND cron_runs.runtime_owner_id IS NOT NULL
+                )
+           )",
         [&timestamp],
     )?;
     tx.execute(

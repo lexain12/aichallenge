@@ -254,8 +254,11 @@ pub enum SchedulerError {
 }
 
 impl From<StoreError> for SchedulerError {
-    fn from(_: StoreError) -> Self {
-        Self::Store
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::Busy => Self::Busy,
+            _ => Self::Store,
+        }
     }
 }
 
@@ -565,6 +568,20 @@ impl CronSynchronizer {
         let lock_parent =
             std::fs::canonicalize(lock_parent).map_err(|_| SchedulerError::InvalidPath)?;
         if lock_parent != store.database_directory_path() {
+            return Err(SchedulerError::InvalidPath);
+        }
+        let database_name = store
+            .database_path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(SchedulerError::InvalidPath)?;
+        let lock_name_text = lock_name.to_str().ok_or(SchedulerError::InvalidPath)?;
+        let coordinator_name = format!("{database_name}.runtime.lock");
+        let owner_prefix = format!("{database_name}.runtime.owner.");
+        if lock_name_text == database_name
+            || lock_name_text == coordinator_name
+            || lock_name_text.starts_with(&owner_prefix)
+        {
             return Err(SchedulerError::InvalidPath);
         }
         // Never retain a caller-provided alias. Every later open resolves from

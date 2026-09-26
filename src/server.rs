@@ -1488,7 +1488,8 @@ mod tests {
     use std::{path::PathBuf, sync::Mutex};
 
     fn private_tempdir() -> tempfile::TempDir {
-        let directory = tempfile::tempdir().unwrap();
+        let temporary_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let directory = tempfile::tempdir_in(temporary_root).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -50,6 +50,84 @@ fn migration_creates_exact_v4_schema() {
     assert_eq!(reopened.list_dialogs().unwrap()[0].id, d.id);
 }
 
+#[cfg(unix)]
+#[test]
+fn store_rejects_group_or_world_writable_nonsticky_ancestor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = common::private_tempdir();
+    let unsafe_ancestor = root.path().join("unsafe");
+    let database_directory = unsafe_ancestor.join("database");
+    std::fs::create_dir_all(&database_directory).unwrap();
+    std::fs::set_permissions(&unsafe_ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::set_permissions(&database_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(matches!(
+        Store::open(database_directory.join("agent.sqlite")),
+        Err(StoreError::InvalidPath)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn store_rejects_a_symlink_in_the_configured_ancestor_chain() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = common::private_tempdir();
+    let real_ancestor = root.path().join("real");
+    let database_directory = real_ancestor.join("database");
+    std::fs::create_dir_all(&database_directory).unwrap();
+    std::fs::set_permissions(&real_ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&database_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let alias = root.path().join("alias");
+    symlink(&real_ancestor, &alias).unwrap();
+
+    assert!(matches!(
+        Store::open(alias.join("database/agent.sqlite")),
+        Err(StoreError::InvalidPath)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn store_accepts_a_root_owned_or_current_uid_sticky_writable_ancestor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = common::private_tempdir();
+    let sticky_ancestor = root.path().join("sticky");
+    let database_directory = sticky_ancestor.join("database");
+    std::fs::create_dir_all(&database_directory).unwrap();
+    std::fs::set_permissions(&sticky_ancestor, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    std::fs::set_permissions(&database_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    Store::open(database_directory.join("agent.sqlite")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn store_detects_replaced_ancestor_when_parent_and_database_inodes_are_preserved() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = common::private_tempdir();
+    let ancestor = root.path().join("ancestor");
+    let database_directory = ancestor.join("database");
+    std::fs::create_dir_all(&database_directory).unwrap();
+    std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&database_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = Store::open(database_directory.join("agent.sqlite")).unwrap();
+
+    let displaced = root.path().join("displaced");
+    std::fs::rename(&ancestor, &displaced).unwrap();
+    std::fs::create_dir(&ancestor).unwrap();
+    std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::rename(displaced.join("database"), &database_directory).unwrap();
+
+    assert_eq!(
+        store.create_dialog("must fail closed"),
+        Err(StoreError::InvalidPath)
+    );
+}
+
 #[test]
 fn dialog_pages_are_keyset_bounded_and_cover_each_dialog_once() {
     let (_dir, store, _) = setup();

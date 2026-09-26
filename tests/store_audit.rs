@@ -198,6 +198,56 @@ fn v3_migration_backfills_pending_tool_runtime_owner_from_parent() {
 }
 
 #[test]
+fn v3_migration_terminalizes_pending_tool_without_a_live_owned_parent() {
+    let directory = common::private_tempdir();
+    let path = directory.path().join("agent.sqlite");
+    let store = Store::open(&path).unwrap();
+    let dialog = store.create_dialog("orphan migration").unwrap();
+    let turn = store.begin_turn(dialog.id, "question").unwrap();
+    store.complete_turn(turn.turn_id, "answer").unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "DROP INDEX pending_tools_by_runtime_owner;
+         ALTER TABLE tool_runs DROP COLUMN runtime_owner_id;
+         UPDATE schema_version SET version=3;",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO tool_runs(owner_kind,owner_id,call_id,server_name,tool_name,read_only,status)
+         VALUES('interactive_turn',?,'v3_orphan','fixture','write',0,'pending')",
+        [turn.turn_id.get()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO tool_runs(owner_kind,owner_id,call_id,server_name,tool_name,read_only,status)
+         VALUES('interactive_turn',999999,'v3_missing_read','fixture','read',1,'pending')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    Store::open(&path).unwrap();
+    let rows = store.list_tool_runs().unwrap();
+    let write = rows.iter().find(|row| row.call_id == "v3_orphan").unwrap();
+    assert_eq!(write.status, ToolRunStatus::Uncertain);
+    assert_eq!(
+        write.safe_error_code,
+        Some(SafeErrorCode::ProcessInterrupted)
+    );
+    assert!(write.finished_at.is_some());
+    let read = rows
+        .iter()
+        .find(|row| row.call_id == "v3_missing_read")
+        .unwrap();
+    assert_eq!(read.status, ToolRunStatus::Failed);
+    assert_eq!(
+        read.safe_error_code,
+        Some(SafeErrorCode::ProcessInterrupted)
+    );
+    assert!(read.finished_at.is_some());
+}
+
+#[test]
 fn dialog_delete_is_transactional() {
     let (_dir, store, db, owner) = setup();
     let audit_id = store.start_tool_run(start(owner, true)).unwrap();

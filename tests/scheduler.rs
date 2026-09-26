@@ -261,6 +261,28 @@ fn synchronizer_rejects_lock_outside_the_store_trusted_directory() {
     drop(store_dir);
 }
 
+#[test]
+fn synchronizer_rejects_database_and_runtime_lock_namespace_collisions() {
+    let (dir, store, _) = sync_fixture();
+    for name in [
+        "agent.sqlite",
+        "agent.sqlite.runtime.lock",
+        "agent.sqlite.runtime.owner.123e4567-e89b-42d3-a456-426614174000.lock",
+        "agent.sqlite.runtime.owner.reserved-future-name",
+    ] {
+        let result = CronSynchronizer::new(
+            store.clone(),
+            Arc::new(FakeBackend::success("")),
+            dir.path().join(name),
+            PathBuf::from("/opt/light-agent/bin/light-agent"),
+        );
+        assert!(
+            matches!(result, Err(SchedulerError::InvalidPath)),
+            "accepted colliding lock name {name}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn synchronizer_rejects_replaced_trusted_directory_before_opening_lock() {
