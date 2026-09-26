@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
 use chrono_tz::Europe::Moscow;
@@ -282,5 +283,45 @@ fn inspection_snapshot_is_consistent_across_pages_during_concurrent_mutation() {
             "original-4",
             "inserted-after-snapshot"
         ]
+    );
+}
+
+#[test]
+fn stalled_snapshot_worker_releases_wal_at_the_hard_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.sqlite");
+    let store = Store::open(&path).unwrap();
+    for index in 0..5 {
+        store.create_dialog(&format!("before-{index}")).unwrap();
+    }
+    let service =
+        InspectionService::with_snapshot_timeout(store.clone(), 2, Duration::from_millis(75))
+            .unwrap();
+    let mut snapshot = service.snapshot(InspectQuery::Dialogs).unwrap();
+    assert_eq!(snapshot.next_page().unwrap().unwrap().items.len(), 2);
+    assert_eq!(service.active_snapshots(), 1);
+
+    store.create_dialog("new-wal-frame").unwrap();
+    let checkpoint = rusqlite::Connection::open(&path).unwrap();
+
+    let wait_started = Instant::now();
+    loop {
+        if service.active_snapshots() == 0 || wait_started.elapsed() > Duration::from_secs(1) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        service.active_snapshots(),
+        0,
+        "worker must roll back even when the caller never requests another page"
+    );
+    let busy_after: i64 = checkpoint
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(busy_after, 0, "expired worker must no longer pin the WAL");
+    assert_eq!(
+        snapshot.next_page().unwrap_err(),
+        deepseek_cli::inspection::InspectionError::SnapshotExpired
     );
 }

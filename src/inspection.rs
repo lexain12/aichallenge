@@ -4,8 +4,10 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
 };
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -87,18 +89,23 @@ pub struct InspectionResult {
 pub struct InspectionService {
     store: Store,
     page_size: usize,
+    snapshot_timeout: Duration,
+    active_snapshots: Arc<AtomicUsize>,
 }
 
 /// A bounded-lifetime read transaction used to stream every page from one
 /// consistent SQLite snapshot. Call [`Self::close`] as soon as the response
 /// stream is complete; dropping it also rolls the read transaction back.
 pub struct InspectionSnapshot {
-    db: Option<Connection>,
-    query: InspectQuery,
-    page_size: usize,
-    offset: u64,
+    commands: Option<SyncSender<SnapshotCommand>>,
+    worker: Option<JoinHandle<()>>,
     complete: bool,
     deadline: Instant,
+}
+
+enum SnapshotCommand {
+    Next(SyncSender<Result<InspectionResult, InspectionError>>),
+    Close(SyncSender<Result<(), InspectionError>>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,6 +174,8 @@ impl InspectionService {
         Self {
             store,
             page_size: DEFAULT_PAGE_SIZE,
+            snapshot_timeout: MAX_SNAPSHOT_DURATION,
+            active_snapshots: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -174,7 +183,38 @@ impl InspectionService {
         if page_size == 0 || page_size > MAX_PAGE_SIZE {
             return Err(InspectionError::InvalidPageSize);
         }
-        Ok(Self { store, page_size })
+        Ok(Self {
+            store,
+            page_size,
+            snapshot_timeout: MAX_SNAPSHOT_DURATION,
+            active_snapshots: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    pub fn with_snapshot_timeout(
+        store: Store,
+        page_size: usize,
+        snapshot_timeout: Duration,
+    ) -> Result<Self, InspectionError> {
+        if page_size == 0
+            || page_size > MAX_PAGE_SIZE
+            || snapshot_timeout.is_zero()
+            || snapshot_timeout > MAX_SNAPSHOT_DURATION
+        {
+            return Err(InspectionError::ResourceLimit);
+        }
+        Ok(Self {
+            store,
+            page_size,
+            snapshot_timeout,
+            active_snapshots: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// Number of currently owned inspection worker transactions. This is
+    /// operational metadata only; it exposes no database or query content.
+    pub fn active_snapshots(&self) -> usize {
+        self.active_snapshots.load(Ordering::Acquire)
     }
 
     pub fn inspect(&self, query: InspectQuery) -> Result<InspectionResult, InspectionError> {
@@ -187,15 +227,43 @@ impl InspectionService {
     }
 
     pub fn snapshot(&self, query: InspectQuery) -> Result<InspectionSnapshot, InspectionError> {
-        let db = self.store.connection()?;
-        map_db(db.execute_batch("BEGIN DEFERRED TRANSACTION"))?;
+        let (commands, command_rx) = mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let store = self.store.clone();
+        let page_size = self.page_size;
+        let active_snapshots = self.active_snapshots.clone();
+        let deadline = Instant::now() + self.snapshot_timeout;
+        let worker = thread::Builder::new()
+            .name("light-agent-inspection".into())
+            .spawn(move || {
+                run_snapshot_worker(
+                    store,
+                    query,
+                    page_size,
+                    deadline,
+                    command_rx,
+                    ready_tx,
+                    active_snapshots,
+                )
+            })
+            .map_err(|_| InspectionError::Store)?;
+        match ready_rx.recv_timeout(self.snapshot_timeout) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                return Err(error);
+            }
+            Err(_) => {
+                drop(commands);
+                drop(worker);
+                return Err(InspectionError::SnapshotExpired);
+            }
+        }
         Ok(InspectionSnapshot {
-            db: Some(db),
-            query,
-            page_size: self.page_size,
-            offset: 0,
+            commands: Some(commands),
+            worker: Some(worker),
             complete: false,
-            deadline: Instant::now() + MAX_SNAPSHOT_DURATION,
+            deadline,
         })
     }
 
@@ -234,72 +302,202 @@ impl InspectionSnapshot {
         if self.complete {
             return Ok(None);
         }
-        if Instant::now() >= self.deadline {
-            self.finish_transaction()?;
-            self.complete = true;
-            return Err(InspectionError::SnapshotExpired);
-        }
-        let db = self.db.as_ref().ok_or(InspectionError::InvalidCursor)?;
-        let scope = CursorScope::from(&self.query);
-        let mut items = match self.query.clone() {
-            InspectQuery::Dialogs => query_dialogs(db, self.offset, self.page_size + 1)?,
-            InspectQuery::History(dialog_id) => {
-                query_history(db, dialog_id, self.offset, self.page_size + 1)?
+        let remaining = self.remaining()?;
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.commands
+            .as_ref()
+            .ok_or(InspectionError::SnapshotExpired)?
+            .try_send(SnapshotCommand::Next(reply_tx))
+            .map_err(|_| InspectionError::SnapshotExpired)?;
+        let result = match reply_rx.recv_timeout(remaining) {
+            Ok(result) => result?,
+            Err(_) => {
+                self.complete = true;
+                self.commands.take();
+                return Err(InspectionError::SnapshotExpired);
             }
-            InspectQuery::Jobs => query_jobs(db, self.offset, self.page_size + 1)?,
-            InspectQuery::Job(job_id) => {
-                let rows = query_one_job(db, job_id, self.offset)?;
-                if self.offset == 0 && rows.is_empty() {
-                    return Err(StoreError::NotFound.into());
-                }
-                rows
-            }
-            InspectQuery::Runs(job_id) => query_runs(db, job_id, self.offset, self.page_size + 1)?,
-            InspectQuery::Audit => query_audit(db, self.offset, self.page_size + 1)?,
-            InspectQuery::Dump => query_dump(db, self.offset, self.page_size + 1)?,
         };
-        let has_more = items.len() > self.page_size;
-        if has_more {
-            items.truncate(self.page_size);
-        }
-        self.offset = self
-            .offset
-            .checked_add(items.len() as u64)
-            .ok_or(InspectionError::InvalidCursor)?;
-        self.complete = !has_more;
-        let next_cursor = has_more.then_some(InspectionCursor {
-            offset: self.offset,
-            scope,
-        });
-        let result = InspectionResult {
-            items,
-            next_cursor,
-            complete: !has_more,
-        };
+        self.complete = result.complete;
         if self.complete {
-            self.finish_transaction()?;
+            self.commands.take();
+            self.join_worker()?;
         }
         Ok(Some(result))
     }
 
     pub fn close(mut self) -> Result<(), InspectionError> {
-        self.finish_transaction()
+        if !self.complete {
+            if let Some(commands) = self.commands.take() {
+                let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+                match commands.try_send(SnapshotCommand::Close(reply_tx)) {
+                    Ok(()) => {
+                        let remaining = self.deadline.saturating_duration_since(Instant::now());
+                        match reply_rx.recv_timeout(remaining) {
+                            Ok(result) => result?,
+                            Err(_) => return Err(InspectionError::SnapshotExpired),
+                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => {}
+                    Err(TrySendError::Full(_)) => return Err(InspectionError::Store),
+                }
+            }
+            self.complete = true;
+        }
+        self.join_worker()
     }
 
-    fn finish_transaction(&mut self) -> Result<(), InspectionError> {
-        self.db
+    fn remaining(&self) -> Result<Duration, InspectionError> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Err(InspectionError::SnapshotExpired)
+        } else {
+            Ok(remaining)
+        }
+    }
+
+    fn join_worker(&mut self) -> Result<(), InspectionError> {
+        self.worker
             .take()
-            .map(|db| map_db(db.execute_batch("ROLLBACK")))
+            .map(|worker| worker.join().map_err(|_| InspectionError::Store))
             .unwrap_or(Ok(()))
     }
 }
 
 impl Drop for InspectionSnapshot {
     fn drop(&mut self) {
-        if let Some(db) = self.db.take() {
+        if let Some(commands) = self.commands.take() {
+            let (reply_tx, _reply_rx) = mpsc::sync_channel(1);
+            let _ = commands.try_send(SnapshotCommand::Close(reply_tx));
+        }
+        // Dropping JoinHandle detaches the worker. It still owns the only
+        // receiver and must either observe Close/disconnect or hit its hard
+        // recv_timeout deadline, so SQLite ownership cannot escape forever.
+        self.worker.take();
+    }
+}
+
+fn run_snapshot_worker(
+    store: Store,
+    query: InspectQuery,
+    page_size: usize,
+    deadline: Instant,
+    commands: mpsc::Receiver<SnapshotCommand>,
+    ready: SyncSender<Result<(), InspectionError>>,
+    active_snapshots: Arc<AtomicUsize>,
+) {
+    let db = match store.connection() {
+        Ok(db) => db,
+        Err(_) => {
+            let _ = ready.send(Err(InspectionError::Store));
+            return;
+        }
+    };
+    if db.execute_batch("BEGIN DEFERRED TRANSACTION").is_err() {
+        let _ = ready.send(Err(InspectionError::Store));
+        return;
+    }
+    active_snapshots.fetch_add(1, Ordering::AcqRel);
+    let _active_guard = ActiveSnapshotGuard(active_snapshots);
+    if db
+        .progress_handler(1_000, Some(move || Instant::now() >= deadline))
+        .is_err()
+    {
+        let _ = db.execute_batch("ROLLBACK");
+        let _ = ready.send(Err(InspectionError::Store));
+        return;
+    }
+    if ready.send(Ok(())).is_err() {
+        let _ = db.execute_batch("ROLLBACK");
+        return;
+    }
+
+    let mut offset = 0_u64;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             let _ = db.execute_batch("ROLLBACK");
+            return;
+        }
+        match commands.recv_timeout(remaining) {
+            Ok(SnapshotCommand::Next(reply)) => {
+                let result = read_snapshot_page(&db, &query, page_size, &mut offset, deadline);
+                let terminal = match &result {
+                    Ok(page) => page.complete,
+                    Err(_) => true,
+                };
+                if terminal {
+                    let _ = db.execute_batch("ROLLBACK");
+                }
+                let _ = reply.send(result);
+                if terminal {
+                    return;
+                }
+            }
+            Ok(SnapshotCommand::Close(reply)) => {
+                let result = map_db(db.execute_batch("ROLLBACK"));
+                let _ = reply.send(result);
+                return;
+            }
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                let _ = db.execute_batch("ROLLBACK");
+                return;
+            }
         }
     }
+}
+
+struct ActiveSnapshotGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveSnapshotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn read_snapshot_page(
+    db: &Connection,
+    query: &InspectQuery,
+    page_size: usize,
+    offset: &mut u64,
+    deadline: Instant,
+) -> Result<InspectionResult, InspectionError> {
+    if Instant::now() >= deadline {
+        return Err(InspectionError::SnapshotExpired);
+    }
+    let scope = CursorScope::from(query);
+    let mut items = match query.clone() {
+        InspectQuery::Dialogs => query_dialogs(db, *offset, page_size + 1)?,
+        InspectQuery::History(dialog_id) => query_history(db, dialog_id, *offset, page_size + 1)?,
+        InspectQuery::Jobs => query_jobs(db, *offset, page_size + 1)?,
+        InspectQuery::Job(job_id) => {
+            let rows = query_one_job(db, job_id, *offset)?;
+            if *offset == 0 && rows.is_empty() {
+                return Err(StoreError::NotFound.into());
+            }
+            rows
+        }
+        InspectQuery::Runs(job_id) => query_runs(db, job_id, *offset, page_size + 1)?,
+        InspectQuery::Audit => query_audit(db, *offset, page_size + 1)?,
+        InspectQuery::Dump => query_dump(db, *offset, page_size + 1)?,
+    };
+    if Instant::now() >= deadline {
+        return Err(InspectionError::SnapshotExpired);
+    }
+    let has_more = items.len() > page_size;
+    if has_more {
+        items.truncate(page_size);
+    }
+    *offset = offset
+        .checked_add(items.len() as u64)
+        .ok_or(InspectionError::InvalidCursor)?;
+    Ok(InspectionResult {
+        items,
+        next_cursor: has_more.then_some(InspectionCursor {
+            offset: *offset,
+            scope,
+        }),
+        complete: !has_more,
+    })
 }
 
 fn write_json_line<W: Write, T: Serialize>(
