@@ -80,6 +80,7 @@ impl DeepSeekProvider {
         let mut answer = String::new();
         let mut usage = None;
         let mut partial_calls = BTreeMap::<u32, PartialToolCall>::new();
+        let mut finish_reason = None;
         let mut saw_done = false;
         while let Some(event) = events.next().await {
             let event = event.map_err(|_| ProviderError::new("stream").with_usage(usage))?;
@@ -93,15 +94,15 @@ impl DeepSeekProvider {
                 usage = Some(value);
             }
             for choice in chunk.choices {
+                if finish_reason.is_some() {
+                    return Err(ProviderError::new("invalid_stream").with_usage(usage));
+                }
                 if let Some(content) = choice.delta.content
                     && !content.is_empty()
                 {
                     text_sink(&content)
                         .map_err(|_| ProviderError::new("output").with_usage(usage))?;
                     answer.push_str(&content);
-                }
-                if choice.finish_reason.as_deref() == Some("length") {
-                    return Err(ProviderError::new("truncated").with_usage(usage));
                 }
                 for delta in choice.delta.tool_calls.unwrap_or_default() {
                     partial_calls
@@ -110,11 +111,31 @@ impl DeepSeekProvider {
                         .merge(delta)
                         .map_err(|error| error.with_usage(usage))?;
                 }
+                finish_reason = match choice.finish_reason.as_deref() {
+                    None => None,
+                    Some("stop") => Some(FinishReason::Stop),
+                    Some("tool_calls") => Some(FinishReason::ToolCalls),
+                    Some("length") => {
+                        return Err(ProviderError::new("truncated").with_usage(usage));
+                    }
+                    Some(_) => {
+                        return Err(ProviderError::new("invalid_stream").with_usage(usage));
+                    }
+                };
             }
         }
 
         if !saw_done {
             return Err(ProviderError::new("incomplete_stream").with_usage(usage));
+        }
+        match (finish_reason, partial_calls.is_empty()) {
+            (None, _) => {
+                return Err(ProviderError::new("incomplete_stream").with_usage(usage));
+            }
+            (Some(FinishReason::Stop), false) | (Some(FinishReason::ToolCalls), true) => {
+                return Err(ProviderError::new("invalid_stream").with_usage(usage));
+            }
+            _ => {}
         }
         if partial_calls.is_empty() {
             if answer.trim().is_empty() {
@@ -140,6 +161,12 @@ impl DeepSeekProvider {
             usage,
         })
     }
+}
+
+#[derive(Clone, Copy)]
+enum FinishReason {
+    Stop,
+    ToolCalls,
 }
 
 impl Provider for DeepSeekProvider {
@@ -263,7 +290,8 @@ impl PartialToolCall {
     fn finish(self) -> Result<ModelToolCall, ProviderError> {
         if self.id.trim().is_empty()
             || self.name.trim().is_empty()
-            || serde_json::from_str::<serde_json::Value>(&self.arguments).is_err()
+            || !serde_json::from_str::<serde_json::Value>(&self.arguments)
+                .is_ok_and(|arguments| arguments.is_object())
         {
             return Err(ProviderError::new("invalid_tool_call"));
         }
@@ -310,4 +338,33 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn error_body_is_bounded_and_key_crossing_limit_is_redacted() {
+        let server = MockServer::start().await;
+        let key = "secret-api-key";
+        let body = format!("{}{}after-key", "x".repeat(4090), key);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(body))
+            .mount(&server)
+            .await;
+        let response = reqwest::Client::new()
+            .post(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let body = read_error_body(response, key).await.unwrap();
+        let diagnostic = ProviderError::http(401, body).raw_diagnostic();
+        assert!(diagnostic.contains(REDACTED));
+        assert!(!diagnostic.contains(key));
+        assert!(!diagnostic.contains("after-key"));
+        assert!(diagnostic.len() < 4300);
+    }
 }

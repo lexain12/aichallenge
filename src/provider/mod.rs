@@ -156,6 +156,15 @@ pub trait Provider: Send + Sync {
 
 /// Safe error for protocol callers. The HTTP body is kept only for explicit
 /// operator diagnostics; even Debug does not show it.
+///
+/// Protocol callers cannot access the HTTP body:
+///
+/// ```compile_fail
+/// use deepseek_cli::provider::ProviderError;
+/// fn leak(error: &ProviderError) {
+///     let _ = error.raw_diagnostic();
+/// }
+/// ```
 pub struct ProviderError {
     code: &'static str,
     status: Option<u16>,
@@ -202,7 +211,8 @@ impl ProviderError {
         }
     }
 
-    pub fn raw_diagnostic(&self) -> String {
+    #[allow(dead_code)] // Reserved for operator logging inside the VM crate.
+    pub(crate) fn raw_diagnostic(&self) -> String {
         match (&self.status, &self.diagnostic) {
             (Some(status), Some(body)) => format!("DeepSeek API returned HTTP {status}: {body}"),
             _ => self.to_string(),

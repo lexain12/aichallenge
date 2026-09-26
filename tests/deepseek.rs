@@ -21,7 +21,7 @@ fn provider(server: &MockServer, key: &str) -> DeepSeekProvider {
     DeepSeekProvider::new(settings.provider()).unwrap()
 }
 
-fn sse(deltas: Vec<serde_json::Value>, done: bool) -> String {
+fn sse(deltas: Vec<serde_json::Value>, finish_reason: Option<&str>, done: bool) -> String {
     let mut body = deltas
         .into_iter()
         .map(|delta| {
@@ -31,6 +31,12 @@ fn sse(deltas: Vec<serde_json::Value>, done: bool) -> String {
             )
         })
         .collect::<String>();
+    if let Some(reason) = finish_reason {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}]})
+        ));
+    }
     body.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n");
     body.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n");
     if done {
@@ -74,6 +80,7 @@ async fn streams_fragmented_text() {
                 json!({"role":"assistant","reasoning_content":"private","content":"Hel"}),
                 json!({"content":"lo"}),
             ],
+            Some("stop"),
             true,
         ),
     )
@@ -108,6 +115,7 @@ async fn assembles_fragmented_tool_calls_by_index() {
                 json!({"tool_calls":[{"index":2,"id":"call_","type":"function","function":{"name":"telegram__","arguments":"{\"chat_id\":\""}},{"index":9,"id":"send","function":{"name":"message","arguments":"\"hi\"}"}}]}),
                 json!({"tool_calls":[{"index":2,"id":"read","function":{"name":"read_chat","arguments":"7\"}"}}]}),
             ],
+            Some("tool_calls"),
             true,
         ),
     )
@@ -184,7 +192,7 @@ async fn rejects_duplicate_or_malformed_call_ids() {
             .into_iter()
             .map(|call| json!({"tool_calls":[call]}))
             .collect();
-        mock_stream(&server, sse(deltas, true)).await;
+        mock_stream(&server, sse(deltas, Some("tool_calls"), true)).await;
         let error = provider(&server, "test-key")
             .stream_turn(&[], &[], &mut |_| Ok(()))
             .await
@@ -198,7 +206,11 @@ async fn rejects_duplicate_or_malformed_call_ids() {
 #[tokio::test]
 async fn rejects_truncated_and_incomplete_streams() {
     let server = MockServer::start().await;
-    mock_stream(&server, sse(vec![json!({"content":"partial"})], false)).await;
+    mock_stream(
+        &server,
+        sse(vec![json!({"content":"partial"})], Some("stop"), false),
+    )
+    .await;
     let error = provider(&server, "test-key")
         .stream_turn(&[], &[], &mut |_| Ok(()))
         .await
@@ -218,7 +230,7 @@ async fn rejects_truncated_and_incomplete_streams() {
     assert_eq!(error.safe_code(), "truncated");
 }
 
-// Catches secret leakage at the body limit and unbounded operator diagnostics.
+// Catches HTTP body leakage through any protocol-visible error channel.
 #[tokio::test]
 async fn bounds_and_redacts_error_body() {
     let server = MockServer::start().await;
@@ -237,12 +249,12 @@ async fn bounds_and_redacts_error_body() {
     for public in [error.to_string(), format!("{error:?}")] {
         assert!(!public.contains(key));
         assert!(!public.contains("after-key"));
+        assert!(!public.contains("xxxxxxxx"));
     }
-    let diagnostic = error.raw_diagnostic();
-    assert!(diagnostic.contains("[REDACTED]"));
-    assert!(!diagnostic.contains(key));
-    assert!(!diagnostic.contains("after-key"));
-    assert!(diagnostic.len() < 4300);
+    let metadata = format!("{:?}", error.operator_metadata());
+    assert!(!metadata.contains(key));
+    assert!(!metadata.contains("after-key"));
+    assert!(!metadata.contains("xxxxxxxx"));
 }
 
 // Catches accidentally sending an empty tools array or local tool metadata.
@@ -259,7 +271,7 @@ async fn never_sends_tools_when_catalog_is_empty() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(sse(vec![json!({"content":"ok"})], true)),
+                .set_body_string(sse(vec![json!({"content":"ok"})], Some("stop"), true)),
         )
         .expect(1)
         .mount(&server)
@@ -277,7 +289,11 @@ async fn never_sends_tools_when_catalog_is_empty() {
 #[tokio::test]
 async fn collects_provider_usage() {
     let server = MockServer::start().await;
-    mock_stream(&server, sse(vec![json!({"content":"ok"})], true)).await;
+    mock_stream(
+        &server,
+        sse(vec![json!({"content":"ok"})], Some("stop"), true),
+    )
+    .await;
     let turn = provider(&server, "test-key")
         .stream_turn(&[], &[], &mut |_| Ok(()))
         .await
@@ -287,11 +303,123 @@ async fn collects_provider_usage() {
     );
 }
 
+// Catches dispatching a valid JSON scalar or array as function arguments.
+#[tokio::test]
+async fn rejects_non_object_tool_arguments() {
+    for arguments in ["[]", "42", "null", "\"text\""] {
+        let server = MockServer::start().await;
+        mock_stream(
+            &server,
+            sse(
+                vec![json!({"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":arguments}}]})],
+                Some("tool_calls"),
+                true,
+            ),
+        )
+        .await;
+        let error = provider(&server, "test-key")
+            .stream_turn(&[], &[], &mut |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.safe_code(), "invalid_tool_call", "{arguments}");
+    }
+}
+
+// Catches treating [DONE] alone as proof of a complete assistant turn.
+#[tokio::test]
+async fn rejects_done_without_terminal_finish_reason() {
+    let server = MockServer::start().await;
+    mock_stream(&server, sse(vec![json!({"content":"partial"})], None, true)).await;
+    let error = provider(&server, "test-key")
+        .stream_turn(&[], &[], &mut |_| Ok(()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.safe_code(), "incomplete_stream");
+    assert_eq!(error.usage().unwrap().total_tokens, 5);
+}
+
+// Catches accepting safety-filtered, resource-limited, or unknown finishes.
+#[tokio::test]
+async fn rejects_unsupported_finish_reasons() {
+    for reason in ["content_filter", "resource_exhausted", "unknown"] {
+        let server = MockServer::start().await;
+        mock_stream(
+            &server,
+            sse(vec![json!({"content":"partial"})], Some(reason), true),
+        )
+        .await;
+        let error = provider(&server, "test-key")
+            .stream_turn(&[], &[], &mut |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.safe_code(), "invalid_stream", "{reason}");
+    }
+}
+
+// Catches a terminal reason that contradicts the actual response mode.
+#[tokio::test]
+async fn rejects_finish_reason_content_mode_mismatch() {
+    let cases = [
+        (
+            json!({"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}}]}),
+            "stop",
+        ),
+        (json!({"content":"answer"}), "tool_calls"),
+    ];
+    for (delta, reason) in cases {
+        let server = MockServer::start().await;
+        mock_stream(&server, sse(vec![delta], Some(reason), true)).await;
+        let error = provider(&server, "test-key")
+            .stream_turn(&[], &[], &mut |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.safe_code(), "invalid_stream", "{reason}");
+    }
+}
+
+// Catches inadvertently rejecting legitimate terminal stop and tool_calls.
+#[tokio::test]
+async fn accepts_valid_stop_and_tool_calls_finish_reasons() {
+    let server = MockServer::start().await;
+    mock_stream(
+        &server,
+        sse(vec![json!({"content":"answer"})], Some("stop"), true),
+    )
+    .await;
+    let turn = provider(&server, "test-key")
+        .stream_turn(&[], &[], &mut |_| Ok(()))
+        .await
+        .unwrap();
+    assert!(matches!(turn, AssistantTurn::FinalText { content, .. } if content == "answer"));
+
+    let server = MockServer::start().await;
+    mock_stream(
+        &server,
+        sse(
+            vec![json!({"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}}]})],
+            Some("tool_calls"),
+            true,
+        ),
+    )
+    .await;
+    let turn = provider(&server, "test-key")
+        .stream_turn(&[], &[], &mut |_| Ok(()))
+        .await
+        .unwrap();
+    assert!(
+        matches!(turn, AssistantTurn::ToolCalls { calls, .. } if calls.len() == 1 && calls[0].id == "call_1")
+    );
+}
+
 // Catches treating a failed text sink as a successful model turn.
 #[tokio::test]
 async fn propagates_text_sink_failure() {
     let server = MockServer::start().await;
-    mock_stream(&server, sse(vec![json!({"content":"ok"})], true)).await;
+    mock_stream(
+        &server,
+        sse(vec![json!({"content":"ok"})], Some("stop"), true),
+    )
+    .await;
     let error = provider(&server, "test-key")
         .stream_turn(&[], &[], &mut |_| {
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "secret output"))
