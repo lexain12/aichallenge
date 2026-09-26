@@ -12,6 +12,7 @@ use deepseek_cli::provider::{
     AssistantTurn, ModelToolCall, ModelToolDefinition, Provider, ProviderError, ProviderFuture,
     ProviderMessage, TokenUsage,
 };
+use deepseek_cli::runtime::ProcessLease;
 use deepseek_cli::scheduler::{
     CronClock, CronReconcileFuture, CronRunReconciler, CronSynchronizer, ScheduleSpec,
     SystemCrontabBackend,
@@ -35,6 +36,7 @@ struct FakeProvider {
     replies: Mutex<VecDeque<Reply>>,
     requests: Mutex<Vec<(Vec<Value>, Vec<String>)>>,
     entered: Option<Arc<Notify>>,
+    release: Option<Arc<Notify>>,
 }
 
 impl FakeProvider {
@@ -43,6 +45,7 @@ impl FakeProvider {
             replies: Mutex::new(replies.into_iter().collect()),
             requests: Mutex::new(Vec::new()),
             entered: None,
+            release: None,
         })
     }
 
@@ -51,6 +54,16 @@ impl FakeProvider {
             replies: Mutex::new(VecDeque::from([Reply::Pending])),
             requests: Mutex::new(Vec::new()),
             entered: Some(entered),
+            release: None,
+        })
+    }
+
+    fn gated(reply: Reply, entered: Arc<Notify>, release: Arc<Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            replies: Mutex::new(VecDeque::from([reply])),
+            requests: Mutex::new(Vec::new()),
+            entered: Some(entered),
+            release: Some(release),
         })
     }
 
@@ -75,9 +88,13 @@ impl Provider for FakeProvider {
         ));
         let reply = self.replies.lock().unwrap().pop_front().unwrap();
         let entered = self.entered.clone();
+        let release = self.release.clone();
         Box::pin(async move {
             if let Some(entered) = entered {
                 entered.notify_one();
+            }
+            if let Some(release) = release {
+                release.notified().await;
             }
             match reply {
                 Reply::Turn(turn) => {
@@ -160,6 +177,15 @@ struct FixedClock(DateTime<Utc>);
 impl CronClock for FixedClock {
     fn now(&self) -> DateTime<Utc> {
         self.0
+    }
+}
+
+#[derive(Clone)]
+struct AdjustableClock(Arc<Mutex<DateTime<Utc>>>);
+
+impl CronClock for AdjustableClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.0.lock().unwrap()
     }
 }
 
@@ -335,6 +361,104 @@ async fn run_timeout_is_durable() {
     assert_eq!(error, CronRunError::TimedOut);
     let runs = fixture.store.list_runs(job.id).unwrap();
     assert_eq!(runs[0].status, CronRunStatus::TimedOut);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locked_database_cannot_push_claim_past_the_whole_run_deadline() {
+    let fixture = fixture();
+    let job = recurring(&fixture, Moscow);
+    let blocker =
+        rusqlite::Connection::open(fixture._directory.path().join("agent.sqlite3")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let provider = FakeProvider::new([final_text("must not dispatch")]);
+    let now = Utc.with_ymd_and_hms(2026, 9, 26, 6, 30, 0).unwrap();
+    let started = std::time::Instant::now();
+    let result = service(&fixture, provider.clone(), now, Duration::from_millis(80))
+        .run_job(job.id, CancellationToken::new())
+        .await;
+    assert_eq!(result.unwrap_err(), CronRunError::TimedOut);
+    assert!(started.elapsed() < Duration::from_millis(500));
+    drop(blocker);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(fixture.store.list_runs(job.id).unwrap().is_empty());
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_finalization_is_bounded_and_next_exclusive_startup_recovers() {
+    let fixture = fixture();
+    let lease = ProcessLease::acquire(&fixture.store).unwrap();
+    let job = recurring(&fixture, Moscow);
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let provider = FakeProvider::gated(final_text("done"), entered.clone(), release.clone());
+    let now = Utc.with_ymd_and_hms(2026, 9, 26, 6, 30, 0).unwrap();
+    let runner = service(&fixture, provider, now, Duration::from_millis(160));
+    let started = std::time::Instant::now();
+    let task = tokio::spawn(async move { runner.run_job(job.id, CancellationToken::new()).await });
+    entered.notified().await;
+    let blocker =
+        rusqlite::Connection::open(fixture._directory.path().join("agent.sqlite3")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    release.notify_one();
+    assert_eq!(task.await.unwrap().unwrap_err(), CronRunError::Store);
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(
+        fixture.store.list_runs(job.id).unwrap()[0].status,
+        CronRunStatus::Pending
+    );
+    drop(blocker);
+    drop(lease);
+
+    let recovered = ProcessLease::acquire(&fixture.store).unwrap();
+    assert_eq!(recovered.recovery_report().cron_runs, 1);
+    assert_eq!(
+        fixture.store.list_runs(job.id).unwrap()[0].status,
+        CronRunStatus::Interrupted
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn once_at_time_is_sampled_after_the_write_lock_is_acquired() {
+    let fixture = fixture();
+    let at = Utc.with_ymd_and_hms(2026, 9, 26, 7, 30, 0).unwrap();
+    let job = fixture
+        .store
+        .create_job(JobCreate {
+            source_dialog_id: fixture.dialog_id,
+            name: "once".into(),
+            schedule: ScheduleSpec::parse_once_at("2026-09-26T10:30", Moscow).unwrap(),
+            prompt: "once prompt".into(),
+        })
+        .unwrap();
+    fixture.store.mark_job_sync_applied(job.id).unwrap();
+    let blocker =
+        rusqlite::Connection::open(fixture._directory.path().join("agent.sqlite3")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let provider = FakeProvider::new([final_text("done")]);
+    let value = Arc::new(Mutex::new(at - chrono::Duration::minutes(1)));
+    let clock = AdjustableClock(value.clone());
+    let runner = CronAgentService::new(
+        fixture.store.clone(),
+        provider.clone(),
+        FakeTools::mcp(),
+        "CRON SYSTEM",
+        8,
+        REQUEST_LIMIT,
+        MESSAGE_LIMIT,
+        Duration::from_secs(2),
+        Some(Arc::new(FailedReconciler)),
+    )
+    .with_clock(Arc::new(clock));
+    let task = tokio::spawn(async move { runner.run_job(job.id, CancellationToken::new()).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    *value.lock().unwrap() = at;
+    drop(blocker);
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        CronRunOutcome::Completed(_)
+    ));
+    assert_eq!(provider.requests().len(), 1);
 }
 
 #[tokio::test]

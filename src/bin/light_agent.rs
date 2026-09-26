@@ -9,6 +9,7 @@ use deepseek_cli::agent_runner::{CronAgentService, CronRunOutcome};
 use deepseek_cli::domain::JobId;
 use deepseek_cli::inspection::{InspectionService, ReadonlyDbShell};
 use deepseek_cli::provider::{DeepSeekProvider, Provider};
+use deepseek_cli::runtime::ProcessLease;
 use deepseek_cli::scheduler::{
     CronRunReconciler, CronSynchronizer, SyncReport, SystemCrontabBackend,
 };
@@ -117,6 +118,14 @@ fn open_store(settings: &ServerSettings) -> Result<Store, AppError> {
     Store::open(settings.database_path()).map_err(|_| AppError::Store)
 }
 
+async fn acquire_process_lease(store: &Store) -> Result<ProcessLease, AppError> {
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || ProcessLease::acquire(&store))
+        .await
+        .map_err(|_| AppError::Store)?
+        .map_err(|_| AppError::Store)
+}
+
 fn synchronizer(
     settings: &ServerSettings,
     store: Store,
@@ -150,7 +159,7 @@ async fn runtime_catalog(
 
 async fn serve_stdio(settings: Arc<ServerSettings>) -> Result<(), AppError> {
     let store = open_store(&settings)?;
-    StdioServer::recover_startup(&store).map_err(|_| AppError::Store)?;
+    let _lease = acquire_process_lease(&store).await?;
     let (provider, mcp) = runtime_catalog(&settings).await?;
     let synchronizer = synchronizer(&settings, store.clone())?;
     let server = StdioServer::new(ServerDependencies {
@@ -161,14 +170,47 @@ async fn serve_stdio(settings: Arc<ServerSettings>) -> Result<(), AppError> {
         synchronizer,
         inspection: InspectionService::new(store),
     });
+    let (cancellation, signal) = signal_cancellation();
+    let result = serve_transport(&server, cancellation).await;
+    signal.abort();
+    let _ = signal.await;
+    result
+}
+
+#[cfg(unix)]
+async fn serve_transport(
+    server: &StdioServer,
+    cancellation: CancellationToken,
+) -> Result<(), AppError> {
+    use tokio::net::unix::pipe::{Receiver, Sender};
+
+    let input = std::fs::File::open("/dev/stdin").map_err(|_| AppError::Protocol)?;
+    let output = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/stdout")
+        .map_err(|_| AppError::Protocol)?;
+    let input = Receiver::from_file(input).map_err(|_| AppError::Protocol)?;
+    let output = Sender::from_file(output).map_err(|_| AppError::Protocol)?;
     server
-        .serve(tokio::io::stdin(), tokio::io::stdout())
+        .serve_with_cancellation(input, output, cancellation)
+        .await
+        .map_err(|_| AppError::Protocol)
+}
+
+#[cfg(not(unix))]
+async fn serve_transport(
+    server: &StdioServer,
+    cancellation: CancellationToken,
+) -> Result<(), AppError> {
+    server
+        .serve_with_cancellation(tokio::io::stdin(), tokio::io::stdout(), cancellation)
         .await
         .map_err(|_| AppError::Protocol)
 }
 
 async fn run_job(settings: Arc<ServerSettings>, job_id: JobId) -> Result<(), AppError> {
     let store = open_store(&settings)?;
+    let _lease = acquire_process_lease(&store).await?;
     let (provider, mcp) = runtime_catalog(&settings).await?;
     let synchronizer = synchronizer(&settings, store.clone())?;
     let reconciler: Arc<dyn CronRunReconciler> = synchronizer;
@@ -183,13 +225,7 @@ async fn run_job(settings: Arc<ServerSettings>, job_id: JobId) -> Result<(), App
         settings.scheduler().run_timeout(),
         Some(reconciler),
     );
-    let cancellation = CancellationToken::new();
-    let signal_cancellation = cancellation.clone();
-    let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_cancellation.cancel();
-        }
-    });
+    let (cancellation, signal) = signal_cancellation();
     let result = service.run_job(job_id, cancellation).await;
     signal.abort();
     let _ = signal.await;
@@ -202,12 +238,53 @@ async fn run_job(settings: Arc<ServerSettings>, job_id: JobId) -> Result<(), App
 
 async fn cron_sync(settings: Arc<ServerSettings>) -> Result<(), AppError> {
     let store = open_store(&settings)?;
+    let _lease = acquire_process_lease(&store).await?;
     let synchronizer = synchronizer(&settings, store)?;
-    match synchronizer.sync().await.map_err(|_| AppError::Scheduler)? {
+    let (cancellation, signal) = signal_cancellation();
+    let report = tokio::select! {
+        result = synchronizer.sync() => result.map_err(|_| AppError::Scheduler)?,
+        _ = cancellation.cancelled() => {
+            signal.abort();
+            let _ = signal.await;
+            return Err(AppError::Scheduler);
+        }
+    };
+    signal.abort();
+    let _ = signal.await;
+    match report {
         SyncReport::Installed { jobs } => println!("installed {jobs}"),
         SyncReport::SavedNotInstalled { jobs } => println!("saved_not_installed {jobs}"),
     }
     Ok(())
+}
+
+fn signal_cancellation() -> (CancellationToken, tokio::task::JoinHandle<()>) {
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        signal_cancellation.cancel();
+    });
+    (cancellation, task)
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn db_shell(path: &Path) -> Result<(), AppError> {

@@ -1,6 +1,10 @@
 //! Bounded full-history turns shared by interactive and scheduled execution.
 
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -106,14 +110,57 @@ impl CronAgentService {
         job_id: JobId,
         cancellation: CancellationToken,
     ) -> Result<CronRunOutcome, CronRunError> {
+        let deadline = Instant::now() + self.timeout;
+        // Keep a meaningful part of even very short budgets for the durable
+        // terminal write. Production timeouts cap this reservation at 100ms.
+        let reserve = std::cmp::min(Duration::from_millis(100), self.timeout / 2);
+        let execution_deadline = deadline.checked_sub(reserve).unwrap_or(deadline);
         if cancellation.is_cancelled() {
             return Err(CronRunError::Interrupted);
         }
-        let now = self.clock.now();
-        let claim = self
-            .store
-            .claim_run(job_id, now)
-            .map_err(|_| CronRunError::Store)?;
+        let claim_cancellation = CancellationToken::new();
+        let claim_store = self.store.clone();
+        let claim_clock = self.clock.clone();
+        let blocking_cancellation = claim_cancellation.clone();
+        let claim_task = tokio::task::spawn_blocking(move || {
+            claim_store.claim_run_with_deadline(
+                job_id,
+                execution_deadline,
+                &blocking_cancellation,
+                || claim_clock.now(),
+            )
+        });
+        tokio::pin!(claim_task);
+        let claim = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                claim_cancellation.cancel();
+                self.finish_late_claim(
+                    claim_task.await,
+                    CronRunFinish::interrupted(SafeErrorCode::Interrupted),
+                    deadline,
+                ).await?;
+                return Err(CronRunError::Interrupted);
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(execution_deadline)) => {
+                claim_cancellation.cancel();
+                self.finish_late_claim(
+                    claim_task.await,
+                    CronRunFinish::timed_out(),
+                    deadline,
+                ).await?;
+                return Err(CronRunError::TimedOut);
+            }
+            result = &mut claim_task => result
+                .map_err(|_| CronRunError::Store)?
+                .map_err(|_| {
+                    if Instant::now() >= execution_deadline {
+                        CronRunError::TimedOut
+                    } else {
+                        CronRunError::Store
+                    }
+                })?,
+        };
         let claim = match claim {
             RunClaim::Inactive => return Ok(CronRunOutcome::Inactive),
             RunClaim::Skipped(run) => return Ok(CronRunOutcome::Skipped(run.id)),
@@ -121,7 +168,6 @@ impl CronAgentService {
         };
 
         let run_id = claim.run.id;
-        let deadline = tokio::time::Instant::now() + self.timeout;
 
         // The claim transaction has already disabled a once-at job and made
         // its desired state pending. Removing the stale line is best effort;
@@ -129,21 +175,22 @@ impl CronAgentService {
         if matches!(claim.job.schedule, ScheduleSpec::OnceAt { .. })
             && let Some(reconciler) = &self.reconciler
         {
+            let reconcile_time = self.clock.now();
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
-                    self.store.finish_run(
+                    self.finish_run_bounded(
                         run_id,
                         CronRunFinish::interrupted(SafeErrorCode::Interrupted),
-                    ).map_err(|_| CronRunError::Store)?;
+                        deadline,
+                    ).await?;
                     return Err(CronRunError::Interrupted);
                 }
-                _ = tokio::time::sleep_until(deadline) => {
-                    self.store.finish_run(run_id, CronRunFinish::timed_out())
-                        .map_err(|_| CronRunError::Store)?;
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(execution_deadline)) => {
+                    self.finish_run_bounded(run_id, CronRunFinish::timed_out(), deadline).await?;
                     return Err(CronRunError::TimedOut);
                 }
-                _ = reconciler.reconcile(now) => {}
+                _ = reconciler.reconcile(reconcile_time) => {}
             }
         }
 
@@ -160,7 +207,8 @@ impl CronAgentService {
             &mut sink,
         );
         tokio::pin!(execution);
-        let deadline_sleep = tokio::time::sleep_until(deadline);
+        let deadline_sleep =
+            tokio::time::sleep_until(tokio::time::Instant::from_std(execution_deadline));
         tokio::pin!(deadline_sleep);
 
         let result = tokio::select! {
@@ -168,17 +216,17 @@ impl CronAgentService {
             _ = cancellation.cancelled() => {
                 run_cancellation.cancel();
                 let _ = execution.await;
-                self.store.finish_run(
+                self.finish_run_bounded(
                     run_id,
                     CronRunFinish::interrupted(SafeErrorCode::Interrupted),
-                ).map_err(|_| CronRunError::Store)?;
+                    deadline,
+                ).await?;
                 return Err(CronRunError::Interrupted);
             }
             _ = &mut deadline_sleep => {
                 run_cancellation.cancel();
                 let _ = execution.await;
-                self.store.finish_run(run_id, CronRunFinish::timed_out())
-                    .map_err(|_| CronRunError::Store)?;
+                self.finish_run_bounded(run_id, CronRunFinish::timed_out(), deadline).await?;
                 return Err(CronRunError::TimedOut);
             }
             result = &mut execution => result,
@@ -186,28 +234,54 @@ impl CronAgentService {
 
         match result {
             Ok(outcome) => {
-                self.store
-                    .finish_run(run_id, CronRunFinish::completed(outcome.answer))
-                    .map_err(|_| CronRunError::Store)?;
+                self.finish_run_bounded(run_id, CronRunFinish::completed(outcome.answer), deadline)
+                    .await?;
                 Ok(CronRunOutcome::Completed(run_id))
             }
             Err(AgentError::Interrupted) => {
-                self.store
-                    .finish_run(
-                        run_id,
-                        CronRunFinish::interrupted(SafeErrorCode::Interrupted),
-                    )
-                    .map_err(|_| CronRunError::Store)?;
+                self.finish_run_bounded(
+                    run_id,
+                    CronRunFinish::interrupted(SafeErrorCode::Interrupted),
+                    deadline,
+                )
+                .await?;
                 Err(CronRunError::Interrupted)
             }
             Err(error) => {
                 let (run_error, code) = cron_error(error);
-                self.store
-                    .finish_run(run_id, CronRunFinish::failed(code))
-                    .map_err(|_| CronRunError::Store)?;
+                self.finish_run_bounded(run_id, CronRunFinish::failed(code), deadline)
+                    .await?;
                 Err(run_error)
             }
         }
+    }
+
+    async fn finish_run_bounded(
+        &self,
+        run_id: RunId,
+        finish: CronRunFinish,
+        deadline: Instant,
+    ) -> Result<(), CronRunError> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            store.finish_run_with_deadline(run_id, finish, deadline)
+        })
+        .await
+        .map_err(|_| CronRunError::Store)?
+        .map_err(|_| CronRunError::Store)
+    }
+
+    async fn finish_late_claim(
+        &self,
+        result: Result<Result<RunClaim, StoreError>, tokio::task::JoinError>,
+        finish: CronRunFinish,
+        deadline: Instant,
+    ) -> Result<(), CronRunError> {
+        if let Ok(Ok(RunClaim::Claimed(claim))) = result {
+            self.finish_run_bounded(claim.run.id, finish, deadline)
+                .await?;
+        }
+        Ok(())
     }
 }
 

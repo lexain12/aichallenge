@@ -448,6 +448,7 @@ impl CrontabBackend for SystemCrontabBackend {
                 .env("LC_ALL", "C")
                 .env("LANG", "C")
                 .stdin(Stdio::null())
+                .kill_on_drop(true)
                 .output()
                 .await
                 .map_err(|_| SchedulerError::Backend)?;
@@ -494,6 +495,7 @@ impl CrontabBackend for SystemCrontabBackend {
                 .env("LC_ALL", "C")
                 .env("LANG", "C")
                 .stdin(Stdio::null())
+                .kill_on_drop(true)
                 .output()
                 .await
                 .map_err(|_| SchedulerError::UnsupportedCron)?;

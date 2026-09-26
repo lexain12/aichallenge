@@ -1,8 +1,10 @@
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Timelike, Utc};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use super::{SafeErrorCode, Store, StoreError, dialog_exists, execute_one, now};
 use crate::domain::{CronRunStatus, DialogId, JobDesiredState, JobId, JobSyncState, RunId};
@@ -323,8 +325,43 @@ impl Store {
         job_id: JobId,
         current_time: DateTime<Utc>,
     ) -> Result<RunClaim, StoreError> {
-        let mut db = self.connection()?;
+        self.claim_run_inner(
+            job_id,
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+            || current_time,
+        )
+    }
+
+    pub(crate) fn claim_run_with_deadline(
+        &self,
+        job_id: JobId,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        now: impl FnOnce() -> DateTime<Utc>,
+    ) -> Result<RunClaim, StoreError> {
+        self.claim_run_inner(job_id, deadline, cancellation, now)
+    }
+
+    fn claim_run_inner(
+        &self,
+        job_id: JobId,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        now: impl FnOnce() -> DateTime<Utc>,
+    ) -> Result<RunClaim, StoreError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || cancellation.is_cancelled() {
+            return Err(StoreError::Busy);
+        }
+        let mut db = self.connection_with_busy_timeout(remaining)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Instant::now() >= deadline || cancellation.is_cancelled() {
+            return Err(StoreError::Busy);
+        }
+        // Sample only while holding the write transaction. A once-at job must
+        // be classified against the instant at which it can actually commit.
+        let current_time = now();
         let job = tx
             .query_row(
                 "SELECT id,source_dialog_id,name,schedule_kind,schedule_value,timezone,prompt,desired_state,sync_state,safe_sync_error_code,created_at,updated_at FROM cron_jobs WHERE id=?",
@@ -342,8 +379,14 @@ impl Store {
                 return Ok(RunClaim::Inactive);
             }
             if at < current_minute {
+                if Instant::now() >= deadline || cancellation.is_cancelled() {
+                    return Err(StoreError::Busy);
+                }
                 insert_terminal_run(&tx, job_id, at, CronRunStatus::Missed)?;
                 disable_once(&tx, job_id)?;
+                if Instant::now() >= deadline || cancellation.is_cancelled() {
+                    return Err(StoreError::Busy);
+                }
                 tx.commit()?;
                 return Ok(RunClaim::Inactive);
             }
@@ -352,12 +395,18 @@ impl Store {
             ScheduleSpec::OnceAt { at, .. } => at,
             ScheduleSpec::Cron { .. } => minute_start(current_time),
         };
+        if Instant::now() >= deadline || cancellation.is_cancelled() {
+            return Err(StoreError::Busy);
+        }
         let timestamp = current_time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO cron_runs(job_id,scheduled_for,status,started_at) VALUES(?,?,'pending',?)",
             params![job_id.to_string(), scheduled_for.to_rfc3339_opts(chrono::SecondsFormat::Secs, true), timestamp],
         )?;
         if inserted == 0 {
+            if Instant::now() >= deadline || cancellation.is_cancelled() {
+                return Err(StoreError::Busy);
+            }
             tx.execute(
                 "INSERT INTO cron_runs(job_id,scheduled_for,status,started_at,finished_at) VALUES(?,?,'skipped',?,?)",
                 params![
@@ -368,6 +417,9 @@ impl Store {
                 ],
             )?;
             let run = load_run(&tx, tx.last_insert_rowid())?;
+            if Instant::now() >= deadline || cancellation.is_cancelled() {
+                return Err(StoreError::Busy);
+            }
             tx.commit()?;
             return Ok(RunClaim::Skipped(run));
         }
@@ -375,12 +427,33 @@ impl Store {
         if matches!(job.schedule, ScheduleSpec::OnceAt { .. }) {
             disable_once(&tx, job_id)?;
         }
+        if Instant::now() >= deadline || cancellation.is_cancelled() {
+            return Err(StoreError::Busy);
+        }
         let run = load_run(&tx, run_id)?;
         tx.commit()?;
         Ok(RunClaim::Claimed(CronRunClaim { run, job }))
     }
 
     pub fn finish_run(&self, id: RunId, finish: CronRunFinish) -> Result<(), StoreError> {
+        self.finish_run_inner(id, finish, Instant::now() + Duration::from_secs(5))
+    }
+
+    pub(crate) fn finish_run_with_deadline(
+        &self,
+        id: RunId,
+        finish: CronRunFinish,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
+        self.finish_run_inner(id, finish, deadline)
+    }
+
+    fn finish_run_inner(
+        &self,
+        id: RunId,
+        finish: CronRunFinish,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
         if finish
             .result
             .as_ref()
@@ -388,8 +461,15 @@ impl Store {
         {
             return Err(StoreError::InvalidMetadata);
         }
-        let mut db = self.connection()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(StoreError::Busy);
+        }
+        let mut db = self.connection_with_busy_timeout(remaining)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Instant::now() >= deadline {
+            return Err(StoreError::Busy);
+        }
         let (old_status, old_result, old_code) = tx
             .query_row(
                 "SELECT status,result,safe_error_code FROM cron_runs WHERE id=?",
@@ -421,8 +501,22 @@ impl Store {
             "UPDATE cron_runs SET status=?,result=?,safe_error_code=?,finished_at=? WHERE id=?",
             params![status, finish.result, code, now(), id.get()],
         )?;
+        if Instant::now() >= deadline {
+            return Err(StoreError::Busy);
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Recovers only runs abandoned after every mutating process has released
+    /// its lifetime lease. Tool rows must be recovered first so write delivery
+    /// uncertainty is preserved independently of the run terminal state.
+    pub fn recover_pending_cron_runs(&self) -> Result<usize, StoreError> {
+        let db = self.connection()?;
+        Ok(db.execute(
+            "UPDATE cron_runs SET status='interrupted',safe_error_code='process_interrupted',finished_at=? WHERE status='pending'",
+            [now()],
+        )?)
     }
 
     pub fn mark_missed_once_jobs(&self, current_time: DateTime<Utc>) -> Result<usize, StoreError> {

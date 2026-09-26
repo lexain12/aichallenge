@@ -147,8 +147,15 @@ impl Store {
     }
 
     pub(crate) fn connection(&self) -> Result<Connection, StoreError> {
+        self.connection_with_busy_timeout(Duration::from_secs(5))
+    }
+
+    pub(crate) fn connection_with_busy_timeout(
+        &self,
+        busy_timeout: Duration,
+    ) -> Result<Connection, StoreError> {
         let connection = Connection::open(&self.path)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.busy_timeout(busy_timeout.max(Duration::from_millis(1)))?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         Ok(connection)

@@ -88,12 +88,6 @@ impl From<InspectionError> for ServerError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RecoveryReport {
-    pub tool_runs: usize,
-    pub turns: usize,
-}
-
 struct PendingConfirmation {
     request_id: RequestId,
     action_hash: [u8; 32],
@@ -341,15 +335,21 @@ impl StdioServer {
         Ok(self)
     }
 
-    /// Must be called exactly once by the process owner, before accepting sessions.
-    pub fn recover_startup(store: &Store) -> Result<RecoveryReport, ServerError> {
-        Ok(RecoveryReport {
-            tool_runs: store.recover_pending_tool_runs()?,
-            turns: store.recover_pending_turns()?,
-        })
+    pub async fn serve<R, W>(&self, reader: R, writer: W) -> Result<(), ServerError>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_with_cancellation(reader, writer, CancellationToken::new())
+            .await
     }
 
-    pub async fn serve<R, W>(&self, reader: R, writer: W) -> Result<(), ServerError>
+    pub async fn serve_with_cancellation<R, W>(
+        &self,
+        reader: R,
+        writer: W,
+        cancellation: CancellationToken,
+    ) -> Result<(), ServerError>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -409,6 +409,7 @@ impl StdioServer {
                     }
                 }
                 Some(()) = writer_failure_rx.recv() => break Err(ServerError::Protocol),
+                _ = cancellation.cancelled() => break Ok(()),
             }
         };
 

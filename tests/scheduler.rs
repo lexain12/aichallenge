@@ -387,3 +387,81 @@ async fn system_preflight_requires_cronie_and_t_validation_without_a_shell() {
         "-V\n-T -\n-l\n-T -\n-\n"
     );
 }
+
+#[cfg(unix)]
+fn hanging_crontab(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = dir.join("hanging-crontab");
+    let version_pid = dir.join("version.pid");
+    let list_pid = dir.join("list.pid");
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  -V) printf '%s' \"$$\" > '{}'; exec sleep 30 ;;\n  -l) printf '%s' \"$$\" > '{}'; exec sleep 30 ;;\n  *) exit 0 ;;\nesac\n",
+        version_pid.display(),
+        list_pid.display()
+    );
+    std::fs::write(&executable, script).unwrap();
+    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&executable, permissions).unwrap();
+    (executable, version_pid, list_pid)
+}
+
+#[cfg(unix)]
+async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && let Ok(pid) = contents.parse()
+        {
+            return pid;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "child never wrote its pid"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(unix)]
+async fn assert_process_exits(pid: u32) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !alive {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "crontab child {pid} survived cancellation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_preflight_and_list_kills_and_reaps_hanging_crontab_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let (executable, version_pid_path, list_pid_path) = hanging_crontab(dir.path());
+
+    let backend = SystemCrontabBackend::new(executable.clone()).unwrap();
+    let preflight = tokio::spawn(async move { backend.preflight().await });
+    let version_pid = wait_for_pid_file(&version_pid_path).await;
+    preflight.abort();
+    let _ = preflight.await;
+    assert_process_exits(version_pid).await;
+
+    let backend = SystemCrontabBackend::new(executable).unwrap();
+    let list = tokio::spawn(async move { backend.list().await });
+    let list_pid = wait_for_pid_file(&list_pid_path).await;
+    list.abort();
+    let _ = list.await;
+    assert_process_exits(list_pid).await;
+}

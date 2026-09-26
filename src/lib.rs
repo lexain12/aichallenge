@@ -19,6 +19,7 @@ pub mod profile;
 pub mod protocol;
 pub mod provider;
 pub mod remote_client;
+pub mod runtime;
 pub mod scheduler;
 pub mod server;
 pub mod settings;

@@ -11,6 +11,7 @@ use deepseek_cli::{
         AssistantTurn, ModelToolCall, ModelToolDefinition, Provider, ProviderError, ProviderFuture,
         ProviderMessage, TokenUsage,
     },
+    runtime::ProcessLease,
     scheduler::{CronSynchronizer, CrontabBackend, CrontabFuture, ScheduleSpec},
     server::{ServerDependencies, StdioServer},
     settings::ServerSettings,
@@ -841,7 +842,8 @@ fn restart_recovers_pending_turn_and_tools() {
             read_only: true,
         })
         .unwrap();
-    StdioServer::recover_startup(&fixture.store).unwrap();
+    let lease = ProcessLease::acquire(&fixture.store).unwrap();
+    assert!(lease.recovery_report().performed);
     let runs = fixture.store.list_tool_runs().unwrap();
     let tool = &runs[0];
     assert_eq!(tool.status, ToolRunStatus::Failed);
