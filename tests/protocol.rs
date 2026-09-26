@@ -99,6 +99,9 @@ fn round_trips_every_request_and_event() {
             description: "Run daily".into(),
             prompt: "Summarize".into(),
         },
+        ServerEvent::TurnPrepared {
+            answer: "Hello".into(),
+        },
         ServerEvent::TurnCompleted {
             answer: "Hello".into(),
         },
@@ -181,7 +184,7 @@ async fn dialog_list_pages_cover_more_than_one_mib_and_open_is_metadata_only() {
         .collect();
     assert_eq!(lines.len(), 6);
     for (sequence, line) in lines[..5].iter().enumerate() {
-        assert!(line.len() + 1 <= MAX_LINE_BYTES);
+        assert!(line.len() < MAX_LINE_BYTES);
         let page: ServerEnvelope = serde_json::from_slice(line).unwrap();
         match page.event {
             ServerEvent::DialogList {
@@ -241,7 +244,7 @@ async fn inspection_pages_cover_more_than_one_mib() {
         .collect();
     assert_eq!(lines.len(), items.len());
     for (sequence, line) in lines.iter().enumerate() {
-        assert!(line.len() + 1 <= MAX_LINE_BYTES);
+        assert!(line.len() < MAX_LINE_BYTES);
         let page: ServerEnvelope = serde_json::from_slice(line).unwrap();
         match page.event {
             ServerEvent::InspectionResult {

@@ -9,6 +9,7 @@ use std::{
 use base64::Engine as _;
 use chrono::Utc;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -20,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     agent_runner::{AgentError, AgentEvent, AgentInput, AgentRunner, ToolEventCode},
     domain::{ConfirmationId, DialogId, RequestId, ToolOwner},
-    inspection::{InspectQuery, InspectionError, InspectionService},
+    inspection::{InspectQuery, InspectionError, InspectionService, LogicalExportV1},
     protocol::{
         EXPORT_CHUNK_BYTES, InspectKind, NdjsonReader, NdjsonWriter, PROTOCOL_VERSION,
         ProtocolError, ProtocolErrorCode, RequestEnvelope, ServerEnvelope, ServerEvent,
@@ -290,95 +291,106 @@ impl StdioServer {
 
     pub async fn serve<R, W>(&self, reader: R, writer: W) -> Result<(), ServerError>
     where
-        R: AsyncRead + Unpin,
-        W: AsyncWrite + Unpin,
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
     {
-        let mut input = NdjsonReader::new(reader);
-        let mut output = NdjsonWriter::new(writer);
+        let (input_tx, mut input_rx) = mpsc::channel::<InputEvent>(EVENT_QUEUE);
+        let reader_task = tokio::spawn(read_requests(reader, input_tx));
+        let (output_tx, output_rx) = mpsc::channel::<OutputCommand>(EVENT_QUEUE);
+        let (writer_failure_tx, mut writer_failure_rx) = mpsc::channel(1);
+        let writer_task = tokio::spawn(write_events(writer, output_rx, writer_failure_tx));
         let (events_tx, mut events_rx) = mpsc::channel::<InternalEvent>(EVENT_QUEUE);
         let (broker, mut prompts_rx) = SessionConfirmationBroker::pair();
         let mut active: HashMap<DialogId, ActiveTurn> = HashMap::new();
-        let mut background: Vec<JoinHandle<()>> = Vec::new();
+        let mut background: Vec<BackgroundTask> = Vec::new();
 
-        write(&mut output, RequestId::new(), ServerEvent::Hello).await?;
-        let result: Result<(), ServerError> = async {
-        loop {
+        queue_event(&output_tx, RequestId::new(), ServerEvent::Hello, None)?;
+        let result = loop {
             tokio::select! {
-                request = input.read_request() => match request {
-                    Ok(Some(request)) => self.handle_request(request, &mut output, &events_tx, &broker, &mut active, &mut background).await?,
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = write(&mut output, RequestId::new(), ServerEvent::ProtocolError { code: error.code() }).await;
-                        break;
+                input = input_rx.recv() => match input {
+                    Some(InputEvent::Request(request)) => {
+                        if let Err(error) = self.handle_request(request, &output_tx, &events_tx, &broker, &mut active, &mut background).await {
+                            break Err(error);
+                        }
                     }
+                    Some(InputEvent::ProtocolError(code)) => {
+                        let _ = queue_event(&output_tx, RequestId::new(), ServerEvent::ProtocolError { code }, None);
+                        break Ok(());
+                    }
+                    Some(InputEvent::Eof) | None => break Ok(()),
                 },
                 Some(event) = events_rx.recv() => {
                     if let Some(dialog_id) = event.done { active.remove(&dialog_id); }
-                    let result = write(&mut output, event.request_id, event.event).await;
-                    let acknowledged = if result.is_ok() { Ok(()) } else { Err(()) };
-                    if let Some(ack) = event.ack { let _ = ack.send(acknowledged); }
-                    result?;
+                    if let Err(error) = queue_event(&output_tx, event.request_id, event.event, event.ack) {
+                        break Err(error);
+                    }
                 }
                 Some(prompt) = prompts_rx.recv() => {
                     let description = action_description(prompt.request.preview.action).to_owned();
-                    write(&mut output, prompt.request_id, ServerEvent::ConfirmationRequired {
+                    if let Err(error) = queue_event(&output_tx, prompt.request_id, ServerEvent::ConfirmationRequired {
                         confirmation_id: prompt.request.id,
                         description,
                         prompt: prompt.request.preview.prompt,
-                    }).await?;
+                    }, None) {
+                        break Err(error);
+                    }
                 }
+                Some(()) = writer_failure_rx.recv() => break Err(ServerError::Protocol),
             }
-        }
-        Ok(())
-        }.await;
+        };
 
         for turn in active.values() {
             turn.cancellation.cancel();
         }
         broker.clear();
-        for task in background {
-            task.abort();
+        for task in &background {
+            task.cancellation.cancel();
         }
         drop(events_rx);
+        drop(output_tx);
+        reader_task.abort();
+        writer_task.abort();
+        let _ = reader_task.await;
+        let _ = writer_task.await;
         for (_, turn) in active {
             let _ = turn.task.await;
+        }
+        for task in background {
+            let _ = task.task.await;
         }
         result
     }
 
-    async fn handle_request<W: AsyncWrite + Unpin>(
+    async fn handle_request(
         &self,
         envelope: RequestEnvelope,
-        output: &mut NdjsonWriter<W>,
+        output: &mpsc::Sender<OutputCommand>,
         events: &mpsc::Sender<InternalEvent>,
         broker: &Arc<SessionConfirmationBroker>,
         active: &mut HashMap<DialogId, ActiveTurn>,
-        background: &mut Vec<JoinHandle<()>>,
+        background: &mut Vec<BackgroundTask>,
     ) -> Result<(), ServerError> {
         use crate::protocol::ClientRequest::*;
-        background.retain(|task| !task.is_finished());
+        reap_background(background).await;
         let request_id = envelope.request_id;
         match envelope.request {
-            ListDialogs => self.write_dialogs(output, request_id).await?,
+            ListDialogs => self.start_dialog_list(request_id, events, background, output)?,
             CreateDialog { title } => {
                 if !valid_title(&title, self.dependencies.settings.max_message_bytes()) {
-                    write_error(output, request_id, ProtocolErrorCode::ContentTooLong).await?;
+                    queue_error(output, request_id, ProtocolErrorCode::ContentTooLong)?;
                 } else {
                     match self.dependencies.store.create_dialog(&title) {
-                        Ok(dialog) => {
-                            write(
-                                output,
-                                request_id,
-                                ServerEvent::DialogOpened {
-                                    dialog_id: dialog.id,
-                                    title: dialog.title,
-                                },
-                            )
-                            .await?
-                        }
+                        Ok(dialog) => queue_event(
+                            output,
+                            request_id,
+                            ServerEvent::DialogOpened {
+                                dialog_id: dialog.id,
+                                title: dialog.title,
+                            },
+                            None,
+                        )?,
                         Err(_) => {
-                            write_error(output, request_id, ProtocolErrorCode::InternalError)
-                                .await?
+                            queue_error(output, request_id, ProtocolErrorCode::InternalError)?
                         }
                     }
                 }
@@ -391,79 +403,75 @@ impl StdioServer {
                     .into_iter()
                     .find(|d| d.id == dialog_id)
                 {
-                    Some(dialog) => {
-                        write(
-                            output,
-                            request_id,
-                            ServerEvent::DialogOpened {
-                                dialog_id,
-                                title: dialog.title,
-                            },
-                        )
-                        .await?
-                    }
-                    None => {
-                        write_error(output, request_id, ProtocolErrorCode::InvalidRequest).await?
-                    }
+                    Some(dialog) => queue_event(
+                        output,
+                        request_id,
+                        ServerEvent::DialogOpened {
+                            dialog_id,
+                            title: dialog.title,
+                        },
+                        None,
+                    )?,
+                    None => queue_error(output, request_id, ProtocolErrorCode::InvalidRequest)?,
                 }
             }
             RenameDialog { dialog_id, title } => {
                 if !valid_title(&title, self.dependencies.settings.max_message_bytes()) {
-                    write_error(output, request_id, ProtocolErrorCode::ContentTooLong).await?;
+                    queue_error(output, request_id, ProtocolErrorCode::ContentTooLong)?;
                 } else if self
                     .dependencies
                     .store
                     .rename_dialog(dialog_id, &title)
                     .is_err()
                 {
-                    write_error(output, request_id, ProtocolErrorCode::InternalError).await?;
+                    queue_error(output, request_id, ProtocolErrorCode::InternalError)?;
                 } else {
-                    write(
+                    queue_event(
                         output,
                         request_id,
                         ServerEvent::DialogOpened { dialog_id, title },
-                    )
-                    .await?;
+                        None,
+                    )?;
                 }
             }
             DeleteDialog { dialog_id } => {
                 if self.dependencies.store.delete_dialog(dialog_id).is_err() {
-                    write_error(output, request_id, ProtocolErrorCode::InternalError).await?;
+                    queue_error(output, request_id, ProtocolErrorCode::InternalError)?;
                 } else {
-                    self.write_dialogs(output, request_id).await?;
+                    self.start_dialog_list(request_id, events, background, output)?;
                 }
             }
             SendMessage { dialog_id, message } => {
                 let at_capacity = active.len() >= MAX_ACTIVE_TURNS;
                 match active.entry(dialog_id) {
                     std::collections::hash_map::Entry::Occupied(_) => {
-                        write(
+                        queue_event(
                             output,
                             request_id,
                             ServerEvent::TurnFailed {
                                 code: ProtocolErrorCode::InternalError,
                             },
-                        )
-                        .await?;
+                            None,
+                        )?;
                     }
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         if at_capacity {
-                            write(
+                            queue_event(
                                 output,
                                 request_id,
                                 ServerEvent::TurnFailed {
                                     code: ProtocolErrorCode::InternalError,
                                 },
-                            )
-                            .await?;
+                                None,
+                            )?;
                             return Ok(());
                         }
-                        write(
+                        queue_event(
                             output,
                             request_id,
                             ServerEvent::ResponseStarted { dialog_id },
-                        )
-                        .await?;
+                            None,
+                        )?;
                         let cancellation = CancellationToken::new();
                         match self.spawn_turn(
                             dialog_id,
@@ -477,14 +485,14 @@ impl StdioServer {
                                 entry.insert(ActiveTurn { cancellation, task });
                             }
                             Err(_) => {
-                                write(
+                                queue_event(
                                     output,
                                     request_id,
                                     ServerEvent::TurnFailed {
                                         code: ProtocolErrorCode::InternalError,
                                     },
-                                )
-                                .await?;
+                                    None,
+                                )?;
                             }
                         }
                     }
@@ -492,19 +500,19 @@ impl StdioServer {
             }
             ConfirmAction { confirmation_id } => {
                 if broker.resolve(request_id, confirmation_id, true).is_err() {
-                    write_error(output, request_id, ProtocolErrorCode::InvalidRequest).await?;
+                    queue_error(output, request_id, ProtocolErrorCode::InvalidRequest)?;
                 }
             }
             CancelAction { confirmation_id } => {
                 if broker.resolve(request_id, confirmation_id, false).is_err() {
-                    write_error(output, request_id, ProtocolErrorCode::InvalidRequest).await?;
+                    queue_error(output, request_id, ProtocolErrorCode::InvalidRequest)?;
                 }
             }
             Inspect { kind } => {
-                if background.len() >= MAX_BACKGROUND_REQUESTS {
-                    write_error(output, request_id, ProtocolErrorCode::InternalError).await?;
+                if active_background(background) >= MAX_BACKGROUND_REQUESTS {
+                    queue_error(output, request_id, ProtocolErrorCode::InternalError)?;
                 } else {
-                    background.push(spawn_inspection(
+                    background.push(start_inspection(
                         self.dependencies.inspection.clone(),
                         request_id,
                         kind,
@@ -513,10 +521,10 @@ impl StdioServer {
                 }
             }
             Export => {
-                if background.len() >= MAX_BACKGROUND_REQUESTS {
-                    write_error(output, request_id, ProtocolErrorCode::InternalError).await?;
+                if active_background(background) >= MAX_BACKGROUND_REQUESTS {
+                    queue_error(output, request_id, ProtocolErrorCode::InternalError)?;
                 } else {
-                    background.push(spawn_export(
+                    background.push(start_export(
                         self.dependencies.inspection.clone(),
                         request_id,
                         events.clone(),
@@ -527,31 +535,22 @@ impl StdioServer {
         Ok(())
     }
 
-    async fn write_dialogs<W: AsyncWrite + Unpin>(
+    fn start_dialog_list(
         &self,
-        output: &mut NdjsonWriter<W>,
         request_id: RequestId,
+        events: &mpsc::Sender<InternalEvent>,
+        background: &mut Vec<BackgroundTask>,
+        output: &mpsc::Sender<OutputCommand>,
     ) -> Result<(), ServerError> {
-        let dialogs = self
-            .dependencies
-            .store
-            .list_dialogs()?
-            .into_iter()
-            .map(|d| crate::protocol::DialogSummary {
-                id: d.id,
-                title: d.title,
-            })
-            .collect();
-        write(
-            output,
+        if active_background(background) >= MAX_BACKGROUND_REQUESTS {
+            return queue_error(output, request_id, ProtocolErrorCode::InternalError);
+        }
+        background.push(start_dialog_list(
+            self.dependencies.store.clone(),
             request_id,
-            ServerEvent::DialogList {
-                sequence: 0,
-                dialogs,
-                complete: true,
-            },
-        )
-        .await
+            events.clone(),
+        ));
+        Ok(())
     }
 
     fn spawn_turn(
@@ -624,17 +623,43 @@ impl StdioServer {
                     .push(response);
                 Ok(())
             };
-            let final_event = match execution
+            let outcome = execution
                 .run(
                     dialog_id,
                     &message,
-                    cancellation,
+                    cancellation.clone(),
                     &mut sink,
                     acknowledgements,
                 )
-                .await
-            {
-                Ok(answer) => ServerEvent::TurnCompleted { answer },
+                .await;
+            let final_event = match outcome {
+                Ok(prepared) => {
+                    let (ack, delivered) = oneshot::channel();
+                    if events
+                        .send(InternalEvent {
+                            request_id,
+                            event: ServerEvent::TurnPrepared {
+                                answer: prepared.answer.clone(),
+                            },
+                            done: None,
+                            ack: Some(ack),
+                        })
+                        .await
+                        .is_err()
+                        || delivered.await.ok() != Some(Ok(()))
+                    {
+                        let _ = execution.abandon(prepared.turn_id, cancellation.is_cancelled());
+                        return;
+                    }
+                    match execution.commit(prepared.turn_id, &prepared.answer) {
+                        Ok(()) => ServerEvent::TurnCompleted {
+                            answer: prepared.answer,
+                        },
+                        Err(_) => ServerEvent::TurnFailed {
+                            code: ProtocolErrorCode::InternalError,
+                        },
+                    }
+                }
                 Err(_) => ServerEvent::TurnFailed {
                     code: ProtocolErrorCode::InternalError,
                 },
@@ -655,11 +680,122 @@ struct ActiveTurn {
     cancellation: CancellationToken,
     task: JoinHandle<()>,
 }
+
+struct BackgroundTask {
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+enum InputEvent {
+    Request(RequestEnvelope),
+    ProtocolError(ProtocolErrorCode),
+    Eof,
+}
+
+struct OutputCommand {
+    envelope: ServerEnvelope,
+    ack: Option<oneshot::Sender<Result<(), ()>>>,
+}
+
 struct InternalEvent {
     request_id: RequestId,
     event: ServerEvent,
     done: Option<DialogId>,
     ack: Option<oneshot::Sender<Result<(), ()>>>,
+}
+
+async fn read_requests<R>(reader: R, input: mpsc::Sender<InputEvent>)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = NdjsonReader::new(reader);
+    loop {
+        let event = match reader.read_request().await {
+            Ok(Some(request)) => InputEvent::Request(request),
+            Ok(None) => InputEvent::Eof,
+            Err(error) => InputEvent::ProtocolError(error.code()),
+        };
+        let terminal = !matches!(event, InputEvent::Request(_));
+        if input.send(event).await.is_err() || terminal {
+            return;
+        }
+    }
+}
+
+async fn write_events<W>(
+    writer: W,
+    mut output: mpsc::Receiver<OutputCommand>,
+    failure: mpsc::Sender<()>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    let mut writer = NdjsonWriter::new(writer);
+    while let Some(command) = output.recv().await {
+        let result = writer.write_event(&command.envelope).await;
+        let acknowledged = if result.is_ok() { Ok(()) } else { Err(()) };
+        if let Some(ack) = command.ack {
+            let _ = ack.send(acknowledged);
+        }
+        if result.is_err() {
+            let _ = failure.try_send(());
+            return;
+        }
+    }
+}
+
+fn queue_event(
+    output: &mpsc::Sender<OutputCommand>,
+    request_id: RequestId,
+    event: ServerEvent,
+    ack: Option<oneshot::Sender<Result<(), ()>>>,
+) -> Result<(), ServerError> {
+    let command = OutputCommand {
+        envelope: ServerEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            event,
+        },
+        ack,
+    };
+    output.try_send(command).map_err(|error| {
+        let command = match error {
+            mpsc::error::TrySendError::Full(command)
+            | mpsc::error::TrySendError::Closed(command) => command,
+        };
+        if let Some(ack) = command.ack {
+            let _ = ack.send(Err(()));
+        }
+        ServerError::Protocol
+    })
+}
+
+fn queue_error(
+    output: &mpsc::Sender<OutputCommand>,
+    request_id: RequestId,
+    code: ProtocolErrorCode,
+) -> Result<(), ServerError> {
+    queue_event(
+        output,
+        request_id,
+        ServerEvent::ProtocolError { code },
+        None,
+    )
+}
+
+fn active_background(tasks: &[BackgroundTask]) -> usize {
+    tasks.iter().filter(|task| !task.task.is_finished()).count()
+}
+
+async fn reap_background(tasks: &mut Vec<BackgroundTask>) {
+    let mut index = 0;
+    while index < tasks.len() {
+        if tasks[index].task.is_finished() {
+            let task = tasks.swap_remove(index);
+            let _ = task.task.await;
+        } else {
+            index += 1;
+        }
+    }
 }
 
 type EventAcknowledgements = Arc<Mutex<Vec<oneshot::Receiver<Result<(), ()>>>>>;
@@ -670,6 +806,11 @@ struct TurnExecution {
     system_prompt: String,
 }
 
+struct PreparedTurn {
+    turn_id: crate::domain::TurnId,
+    answer: String,
+}
+
 impl TurnExecution {
     async fn run(
         &self,
@@ -678,7 +819,7 @@ impl TurnExecution {
         cancellation: CancellationToken,
         sink: &mut crate::agent_runner::AgentEventSink<'_>,
         acknowledgements: EventAcknowledgements,
-    ) -> Result<String, AgentError> {
+    ) -> Result<PreparedTurn, AgentError> {
         let turn = self.store.begin_turn(dialog_id, content)?;
         let history = match self.store.completed_messages(dialog_id) {
             Ok(history) => history,
@@ -715,15 +856,10 @@ impl TurnExecution {
             }
         }
         match result {
-            Ok(outcome) => {
-                if let Err(error) = self.store.complete_turn(turn.turn_id, &outcome.answer) {
-                    let _ = self
-                        .store
-                        .fail_turn(turn.turn_id, SafeErrorCode::InternalError);
-                    return Err(AgentError::Store(error));
-                }
-                Ok(outcome.answer)
-            }
+            Ok(outcome) => Ok(PreparedTurn {
+                turn_id: turn.turn_id,
+                answer: outcome.answer,
+            }),
             Err(error) => {
                 if error == AgentError::Interrupted {
                     self.store
@@ -735,6 +871,25 @@ impl TurnExecution {
                 Err(error)
             }
         }
+    }
+
+    fn commit(&self, turn_id: crate::domain::TurnId, answer: &str) -> Result<(), AgentError> {
+        if let Err(error) = self.store.complete_turn(turn_id, answer) {
+            let _ = self.store.fail_turn(turn_id, SafeErrorCode::InternalError);
+            return Err(AgentError::Store(error));
+        }
+        Ok(())
+    }
+
+    fn abandon(&self, turn_id: crate::domain::TurnId, interrupted: bool) -> Result<(), AgentError> {
+        if interrupted {
+            self.store
+                .interrupt_turn(turn_id, SafeErrorCode::Interrupted)?;
+        } else {
+            self.store
+                .fail_turn(turn_id, SafeErrorCode::InternalError)?;
+        }
+        Ok(())
     }
 }
 
@@ -749,29 +904,6 @@ fn agent_error_code(error: AgentError) -> SafeErrorCode {
             SafeErrorCode::InternalError
         }
     }
-}
-
-async fn write<W: AsyncWrite + Unpin>(
-    writer: &mut NdjsonWriter<W>,
-    request_id: RequestId,
-    event: ServerEvent,
-) -> Result<(), ServerError> {
-    writer
-        .write_event(&ServerEnvelope {
-            protocol_version: PROTOCOL_VERSION,
-            request_id,
-            event,
-        })
-        .await
-        .map_err(Into::into)
-}
-
-async fn write_error<W: AsyncWrite + Unpin>(
-    writer: &mut NdjsonWriter<W>,
-    request_id: RequestId,
-    code: ProtocolErrorCode,
-) -> Result<(), ServerError> {
-    write(writer, request_id, ServerEvent::ProtocolError { code }).await
 }
 
 fn valid_title(title: &str, max: usize) -> bool {
@@ -800,35 +932,92 @@ fn inspect_query(kind: &InspectKind) -> InspectQuery {
     }
 }
 
-fn spawn_inspection(
+fn start_dialog_list(
+    store: Store,
+    request_id: RequestId,
+    events: mpsc::Sender<InternalEvent>,
+) -> BackgroundTask {
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let dialogs = match store.list_dialogs() {
+            Ok(dialogs) => dialogs,
+            Err(_) => {
+                send_protocol_error(&events, request_id, &task_cancellation);
+                return;
+            }
+        };
+        if dialogs.is_empty() {
+            let _ = send_internal(
+                &events,
+                request_id,
+                ServerEvent::DialogList {
+                    sequence: 0,
+                    dialogs: Vec::new(),
+                    complete: true,
+                },
+                &task_cancellation,
+            );
+            return;
+        }
+        let total = dialogs.len();
+        for (index, dialog) in dialogs.into_iter().enumerate() {
+            if !send_internal(
+                &events,
+                request_id,
+                ServerEvent::DialogList {
+                    sequence: index as u64,
+                    dialogs: vec![crate::protocol::DialogSummary {
+                        id: dialog.id,
+                        title: dialog.title,
+                    }],
+                    complete: index + 1 == total,
+                },
+                &task_cancellation,
+            ) {
+                return;
+            }
+        }
+    });
+    BackgroundTask { cancellation, task }
+}
+
+fn start_inspection(
     service: InspectionService,
     request_id: RequestId,
     kind: InspectKind,
     events: mpsc::Sender<InternalEvent>,
-) -> JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
+) -> BackgroundTask {
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        if task_cancellation.is_cancelled() {
+            return;
+        }
         let mut snapshot = match service.snapshot(inspect_query(&kind)) {
             Ok(value) => value,
             Err(_) => {
-                send_internal(
-                    &events,
-                    request_id,
-                    ServerEvent::ProtocolError {
-                        code: ProtocolErrorCode::InternalError,
-                    },
-                );
+                send_protocol_error(&events, request_id, &task_cancellation);
                 return;
             }
         };
         let mut sequence = 0u64;
         let mut record_sequence = 0u64;
         loop {
+            if task_cancellation.is_cancelled() {
+                let _ = snapshot.close();
+                return;
+            }
             match snapshot.next_page() {
                 Ok(Some(page)) => {
                     for item in page.items {
                         let bytes = match serde_json::to_vec(&item) {
                             Ok(bytes) => bytes,
-                            Err(_) => return,
+                            Err(_) => {
+                                let _ = snapshot.close();
+                                send_protocol_error(&events, request_id, &task_cancellation);
+                                return;
+                            }
                         };
                         let chunks = bytes.chunks(FRAGMENT_BYTES).collect::<Vec<_>>();
                         for (fragment_sequence, chunk) in chunks.iter().enumerate() {
@@ -850,7 +1039,9 @@ fn spawn_inspection(
                                     items: vec![fragment],
                                     complete: false,
                                 },
+                                &task_cancellation,
                             ) {
+                                let _ = snapshot.close();
                                 return;
                             }
                             sequence += 1;
@@ -862,10 +1053,17 @@ fn spawn_inspection(
                     }
                 }
                 Ok(None) => break,
-                Err(_) => return,
+                Err(_) => {
+                    let _ = snapshot.close();
+                    send_protocol_error(&events, request_id, &task_cancellation);
+                    return;
+                }
             }
         }
-        let _ = snapshot.close();
+        if snapshot.close().is_err() {
+            send_protocol_error(&events, request_id, &task_cancellation);
+            return;
+        }
         let _ = send_internal(
             &events,
             request_id,
@@ -875,23 +1073,54 @@ fn spawn_inspection(
                 items: Vec::new(),
                 complete: true,
             },
+            &task_cancellation,
         );
-    })
+    });
+    BackgroundTask { cancellation, task }
 }
 
 fn send_internal(
     events: &mpsc::Sender<InternalEvent>,
     request_id: RequestId,
     event: ServerEvent,
+    cancellation: &CancellationToken,
 ) -> bool {
-    events
-        .blocking_send(InternalEvent {
+    let mut pending = InternalEvent {
+        request_id,
+        event,
+        done: None,
+        ack: None,
+    };
+    loop {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        match events.try_send(pending) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                pending = event;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn send_protocol_error(
+    events: &mpsc::Sender<InternalEvent>,
+    request_id: RequestId,
+    cancellation: &CancellationToken,
+) {
+    if !cancellation.is_cancelled() {
+        let _ = send_internal(
+            events,
             request_id,
-            event,
-            done: None,
-            ack: None,
-        })
-        .is_ok()
+            ServerEvent::ProtocolError {
+                code: ProtocolErrorCode::InternalError,
+            },
+            cancellation,
+        );
+    }
 }
 
 struct ChunkWriter {
@@ -899,11 +1128,17 @@ struct ChunkWriter {
     events: mpsc::Sender<InternalEvent>,
     sequence: u64,
     buffer: Vec<u8>,
+    cancellation: CancellationToken,
+    total_bytes: u64,
+    digest: Sha256,
 }
 
 impl ChunkWriter {
     fn flush_chunks(&mut self, all: bool) -> io::Result<()> {
         while self.buffer.len() >= EXPORT_CHUNK_BYTES || (all && !self.buffer.is_empty()) {
+            if self.cancellation.is_cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
             let length = self.buffer.len().min(EXPORT_CHUNK_BYTES);
             let remainder = self.buffer.split_off(length);
             let chunk = std::mem::replace(&mut self.buffer, remainder);
@@ -911,14 +1146,9 @@ impl ChunkWriter {
                 sequence: self.sequence,
                 data_base64: base64::engine::general_purpose::STANDARD.encode(chunk),
             };
-            self.events
-                .blocking_send(InternalEvent {
-                    request_id: self.request_id,
-                    event,
-                    done: None,
-                    ack: None,
-                })
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session_closed"))?;
+            if !send_internal(&self.events, self.request_id, event, &self.cancellation) {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session_closed"));
+            }
             self.sequence += 1;
         }
         Ok(())
@@ -927,6 +1157,11 @@ impl ChunkWriter {
 
 impl Write for ChunkWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::other("export_too_large"))?;
+        self.digest.update(bytes);
         self.buffer.extend_from_slice(bytes);
         self.flush_chunks(false)?;
         Ok(bytes.len())
@@ -936,43 +1171,81 @@ impl Write for ChunkWriter {
     }
 }
 
-fn spawn_export(
+fn start_export(
     service: InspectionService,
     request_id: RequestId,
     events: mpsc::Sender<InternalEvent>,
-) -> JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
+) -> BackgroundTask {
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let task = tokio::task::spawn_blocking(move || {
         let mut writer = ChunkWriter {
             request_id,
             events: events.clone(),
             sequence: 0,
             buffer: Vec::with_capacity(EXPORT_CHUNK_BYTES),
+            cancellation: task_cancellation.clone(),
+            total_bytes: 0,
+            digest: Sha256::new(),
         };
-        let summary = match service.write_export(&mut writer) {
-            Ok(value) => value,
+        let mut snapshot = match service.snapshot(InspectQuery::Dump) {
+            Ok(snapshot) => snapshot,
             Err(_) => {
-                let _ = send_internal(
-                    &events,
-                    request_id,
-                    ServerEvent::ProtocolError {
-                        code: ProtocolErrorCode::InternalError,
-                    },
-                );
+                send_protocol_error(&events, request_id, &task_cancellation);
                 return;
             }
         };
-        if writer.flush().is_err() {
+        let result = (|| -> Result<u64, ()> {
+            write_export_line(
+                &mut writer,
+                &LogicalExportV1::Header {
+                    format: "logical_export_v1".into(),
+                    version: 1,
+                },
+            )?;
+            let mut records = 0u64;
+            loop {
+                if task_cancellation.is_cancelled() {
+                    return Err(());
+                }
+                match snapshot.next_page().map_err(|_| ())? {
+                    Some(page) => {
+                        for record in page.items {
+                            write_export_line(&mut writer, &LogicalExportV1::Record { record })?;
+                            records += 1;
+                        }
+                        if page.complete {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            Ok(records)
+        })();
+        let close = snapshot.close();
+        if result.is_err() || close.is_err() || writer.flush().is_err() {
+            send_protocol_error(&events, request_id, &task_cancellation);
             return;
         }
-        send_internal(
+        let total_bytes = writer.total_bytes;
+        let sha256 = format!("{:x}", writer.digest.finalize());
+        let _ = send_internal(
             &events,
             request_id,
             ServerEvent::ExportCompleted {
-                total_bytes: summary.total_bytes,
-                sha256: summary.sha256,
+                total_bytes,
+                sha256,
             },
+            &task_cancellation,
         );
-    })
+    });
+    BackgroundTask { cancellation, task }
+}
+
+fn write_export_line(writer: &mut ChunkWriter, record: &LogicalExportV1) -> Result<(), ()> {
+    serde_json::to_writer(&mut *writer, record).map_err(|_| ())?;
+    writer.write_all(b"\n").map_err(|_| ())
 }
 
 #[cfg(test)]

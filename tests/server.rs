@@ -23,7 +23,10 @@ use std::{
     collections::VecDeque,
     io,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tempfile::TempDir;
 use tokio::{
@@ -167,6 +170,7 @@ impl CrontabBackend for FakeCron {
 struct Fixture {
     _dir: TempDir,
     store: Store,
+    inspection: InspectionService,
     server: StdioServer,
 }
 impl Fixture {
@@ -189,17 +193,19 @@ impl Fixture {
             )
             .unwrap(),
         );
+        let inspection = InspectionService::with_page_size(store.clone(), 1).unwrap();
         let server = StdioServer::new(ServerDependencies {
             settings,
             store: store.clone(),
             provider,
             mcp,
             synchronizer,
-            inspection: InspectionService::with_page_size(store.clone(), 1).unwrap(),
+            inspection: inspection.clone(),
         });
         Self {
             _dir: dir,
             store,
+            inspection,
             server,
         }
     }
@@ -312,6 +318,9 @@ async fn send_streams_events_and_commits_answer() {
     );
     assert!(
         matches!(session.event().await.event, ServerEvent::TextDelta { text } if text == "answer")
+    );
+    assert!(
+        matches!(session.event().await.event, ServerEvent::TurnPrepared { answer } if answer == "answer")
     );
     assert!(
         matches!(session.event().await.event, ServerEvent::TurnCompleted { answer } if answer == "answer")
@@ -740,6 +749,278 @@ async fn output_sink_failure_does_not_persist_assistant() {
     assert!(store.completed_messages(dialog).unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn terminal_delivery_failure_does_not_commit_assistant_or_turn() {
+    let fixture = Fixture::new(FakeProvider::new([Reply::Final("must-not-save".into())]));
+    let dialog = fixture.store.create_dialog("chat").unwrap().id;
+    let store = fixture.store.clone();
+    let (client, remote) = duplex(MAX_LINE_BYTES);
+    let (_client_read, client_write) = split(client);
+    let (remote_read, _remote_write) = split(remote);
+    let server = fixture.server;
+    let task = tokio::spawn(async move { server.serve(remote_read, FailAfterLines::new(3)).await });
+    let mut requests = NdjsonWriter::new(client_write);
+    requests
+        .write_request(&RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: req(),
+            request: ClientRequest::SendMessage {
+                dialog_id: dialog,
+                message: "question".into(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    drop(requests);
+    assert!(store.completed_messages(dialog).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dialog_list_pages_multiple_maximum_titles_below_wire_limit() {
+    let fixture = Fixture::new(FakeProvider::new([]));
+    for index in 0..5 {
+        fixture
+            .store
+            .create_dialog(&format!("{index}{}", "x".repeat(256 * 1024 - 1)))
+            .unwrap();
+    }
+    let mut session = Session::start(fixture.server).await;
+    session.event().await;
+    let id = req();
+    session.send(id, ClientRequest::ListDialogs).await;
+    let mut sequence = 0;
+    let mut count = 0;
+    loop {
+        let envelope = session.event().await;
+        assert_eq!(envelope.request_id, id);
+        assert!(serde_json::to_vec(&envelope).unwrap().len() < MAX_LINE_BYTES);
+        match envelope.event {
+            ServerEvent::DialogList {
+                sequence: actual,
+                dialogs,
+                complete,
+            } => {
+                assert_eq!(actual, sequence);
+                sequence += 1;
+                count += dialogs.len();
+                if complete {
+                    break;
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(count, 5);
+    assert!(sequence > 1);
+}
+
+#[tokio::test]
+async fn blocked_stdout_still_processes_confirmation_and_eof() {
+    let call = ModelToolCall {
+        id: "schedule".into(),
+        name: "cron__create".into(),
+        arguments: json!({
+            "name":"report", "schedule":{"kind":"cron","expression":"0 9 * * *"},
+            "timezone":"Europe/Moscow", "prompt":"prepare report"
+        })
+        .to_string(),
+    };
+    let fixture = Fixture::new(FakeProvider::new([
+        Reply::ToolCall(call),
+        Reply::Final("scheduled".into()),
+    ]));
+    let dialog = fixture.store.create_dialog("chat").unwrap().id;
+    let store = fixture.store.clone();
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let blocked = Arc::new(AtomicBool::new(false));
+    let writer = GateWriter::new(4, capture.clone(), blocked.clone());
+    let (client, remote) = duplex(MAX_LINE_BYTES);
+    let (_client_read, client_write) = split(client);
+    let (remote_read, _remote_write) = split(remote);
+    let server = fixture.server;
+    let task = tokio::spawn(async move { server.serve(remote_read, writer).await });
+    let mut requests = NdjsonWriter::new(client_write);
+    let origin = req();
+    requests
+        .write_request(&RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: origin,
+            request: ClientRequest::SendMessage {
+                dialog_id: dialog,
+                message: "schedule it".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let confirmation_id = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let bytes = capture.lock().unwrap().clone();
+            for line in bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                if let Ok(envelope) =
+                    serde_json::from_slice::<deepseek_cli::protocol::ServerEnvelope>(line)
+                    && let ServerEvent::ConfirmationRequired {
+                        confirmation_id, ..
+                    } = envelope.event
+                {
+                    return confirmation_id;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let wrong = req();
+    requests
+        .write_request(&RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: wrong,
+            request: ClientRequest::ConfirmAction { confirmation_id },
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !blocked.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    requests
+        .write_request(&RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: req(),
+            request: ClientRequest::CancelAction {
+                confirmation_id: deepseek_cli::domain::ConfirmationId::new(),
+            },
+        })
+        .await
+        .unwrap();
+    requests
+        .write_request(&RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: origin,
+            request: ClientRequest::ConfirmAction { confirmation_id },
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while store.list_jobs().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    requests.shutdown().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn eof_cooperatively_joins_blocking_inspection_and_releases_snapshot() {
+    let fixture = Fixture::new(FakeProvider::new([]));
+    for index in 0..80 {
+        fixture
+            .store
+            .create_dialog(&format!("{index}{}", "x".repeat(256 * 1024)))
+            .unwrap();
+    }
+    let inspection = fixture.inspection.clone();
+    let writer = GateWriter::new(
+        1,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (client, remote) = duplex(MAX_LINE_BYTES);
+    let (_client_read, client_write) = split(client);
+    let (remote_read, _remote_write) = split(remote);
+    let server = fixture.server;
+    let task = tokio::spawn(async move { server.serve(remote_read, writer).await });
+    let mut requests = NdjsonWriter::new(client_write);
+    requests
+        .write_request(&RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: req(),
+            request: ClientRequest::Inspect {
+                kind: InspectKind::Dialogs,
+            },
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while inspection.active_snapshots() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    requests.shutdown().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(inspection.active_snapshots(), 0);
+}
+
+#[tokio::test]
+async fn eof_cooperatively_joins_blocking_export_and_releases_snapshot() {
+    let fixture = Fixture::new(FakeProvider::new([]));
+    for index in 0..10 {
+        fixture
+            .store
+            .create_dialog(&format!("{index}{}", "x".repeat(256 * 1024)))
+            .unwrap();
+    }
+    let inspection = fixture.inspection.clone();
+    let writer = GateWriter::new(
+        1,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (client, remote) = duplex(MAX_LINE_BYTES);
+    let (_client_read, client_write) = split(client);
+    let (remote_read, _remote_write) = split(remote);
+    let server = fixture.server;
+    let task = tokio::spawn(async move { server.serve(remote_read, writer).await });
+    let mut requests = NdjsonWriter::new(client_write);
+    requests
+        .write_request(&RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: req(),
+            request: ClientRequest::Export,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while inspection.active_snapshots() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    requests.shutdown().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(inspection.active_snapshots(), 0);
+}
+
 struct FailAfterLines {
     accepted_lines: usize,
     limit: usize,
@@ -777,6 +1058,53 @@ impl AsyncWrite for FailAfterLines {
         std::task::Poll::Ready(Ok(()))
     }
 
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+struct GateWriter {
+    line_limit: usize,
+    complete_lines: usize,
+    capture: Arc<Mutex<Vec<u8>>>,
+    blocked: Arc<AtomicBool>,
+}
+
+impl GateWriter {
+    fn new(line_limit: usize, capture: Arc<Mutex<Vec<u8>>>, blocked: Arc<AtomicBool>) -> Self {
+        Self {
+            line_limit,
+            complete_lines: 0,
+            capture,
+            blocked,
+        }
+    }
+}
+
+impl AsyncWrite for GateWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        if self.complete_lines >= self.line_limit {
+            self.blocked.store(true, Ordering::Release);
+            return std::task::Poll::Pending;
+        }
+        self.capture.lock().unwrap().extend_from_slice(bytes);
+        self.complete_lines += bytes.iter().filter(|byte| **byte == b'\n').count();
+        std::task::Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         _: &mut std::task::Context<'_>,

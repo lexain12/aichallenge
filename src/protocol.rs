@@ -174,6 +174,11 @@ pub enum ServerEvent {
         description: String,
         prompt: String,
     },
+    /// The full answer has reached the transport, but the durable turn has not
+    /// yet been committed. Clients must wait for `turn_completed`.
+    TurnPrepared {
+        answer: String,
+    },
     TurnCompleted {
         answer: String,
     },
@@ -227,7 +232,9 @@ impl ServerEnvelope {
             {
                 Err(ProtocolError::ContentTooLong)
             }
-            ServerEvent::TurnCompleted { answer } if answer.len() > MAX_CONTENT_BYTES => {
+            ServerEvent::TurnPrepared { answer } | ServerEvent::TurnCompleted { answer }
+                if answer.len() > MAX_CONTENT_BYTES =>
+            {
                 Err(ProtocolError::ContentTooLong)
             }
             ServerEvent::ExportChunk { data_base64, .. } => {
