@@ -162,7 +162,62 @@ fn managed_block_replacement_preserves_every_outside_byte() {
     let replaced = renderer.replace_managed_block(existing, &[]).unwrap();
     assert_eq!(
         replaced,
-        "MAILTO=me@example.com\r\n# user before\n# BEGIN LIGHT-AGENT MANAGED JOBS\nHOME=/var/lib/light-agent\n# END LIGHT-AGENT MANAGED JOBS\n# user after\r\n"
+        "MAILTO=me@example.com\r\n# user before\n# user after\r\n# BEGIN LIGHT-AGENT MANAGED JOBS\nHOME=/var/lib/light-agent\n# END LIGHT-AGENT MANAGED JOBS\n"
+    );
+}
+
+#[test]
+fn managed_block_moves_to_eof_without_reordering_unmanaged_environment_or_schedule() {
+    let existing = concat!(
+        "SHELL=/bin/bash\r\n",
+        "MAILTO=owner@example.test\n",
+        "# BEGIN LIGHT-AGENT MANAGED JOBS\n",
+        "HOME=/old/home\n",
+        "CRON_TZ=UTC\n",
+        "0 0 * * * /old/agent run-job stale\n",
+        "# END LIGHT-AGENT MANAGED JOBS\n",
+        "TZ=Asia/Tokyo\r\n",
+        "5 4 * * * /usr/bin/unmanaged --flag\r\n",
+        "# outside-tail-without-newline",
+    );
+    let outside = concat!(
+        "SHELL=/bin/bash\r\n",
+        "MAILTO=owner@example.test\n",
+        "TZ=Asia/Tokyo\r\n",
+        "5 4 * * * /usr/bin/unmanaged --flag\r\n",
+        "# outside-tail-without-newline",
+    );
+    let renderer = CronRenderer::new(PathBuf::from("/opt/light-agent/bin/light-agent")).unwrap();
+    let dir = common::private_tempdir();
+    let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    let dialog = store.create_dialog("source").unwrap().id;
+    let job = store
+        .create_job(JobCreate {
+            source_dialog_id: dialog,
+            name: "managed".into(),
+            schedule: ScheduleSpec::parse_cron("17 5 * * *", Moscow).unwrap(),
+            prompt: "not rendered".into(),
+        })
+        .unwrap();
+    let managed = renderer.render(std::slice::from_ref(&job)).unwrap();
+
+    let candidate = renderer
+        .replace_managed_block(existing, std::slice::from_ref(&job))
+        .unwrap();
+    assert_eq!(candidate, format!("{outside}\n{managed}"));
+    assert!(
+        candidate.find("/usr/bin/unmanaged").unwrap()
+            < candidate.find("CRON_TZ=Europe/Moscow").unwrap()
+    );
+    let after_managed_timezone = candidate.split_once("CRON_TZ=Europe/Moscow\n").unwrap().1;
+    assert!(!after_managed_timezone.contains("/usr/bin/unmanaged"));
+    assert!(after_managed_timezone.ends_with("# END LIGHT-AGENT MANAGED JOBS\n"));
+    assert_eq!(
+        candidate,
+        renderer
+            .replace_managed_block(&candidate, std::slice::from_ref(&job))
+            .unwrap(),
+        "second reconciliation must be byte-identical"
     );
 }
 

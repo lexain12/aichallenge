@@ -62,7 +62,11 @@ sets `HOME=/var/lib/light-agent`, then emits a validated `CRON_TZ` and only:
 Cronie also starts jobs in the account home from the passwd database. The HOME
 line and passwd home must agree; the deployment acceptance fails if either is
 different. Task text never appears in the crontab. Do not manually edit inside
-the managed block.
+the managed block. Reconciliation removes an existing managed block and appends
+one normalized block at the end of the crontab. All unmanaged bytes retain their
+original order; only one newline separator is added when the unmanaged content
+does not already end in a newline. Keeping the block at EOF prevents its `HOME`
+or final `CRON_TZ` assignment from changing later unmanaged entries.
 
 Run reconciliation from the same home contract:
 

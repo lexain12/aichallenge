@@ -12,7 +12,7 @@ All commands ran locally on 2026-09-26:
 
 - `cargo fmt --check`: passed;
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`: passed;
-- `cargo test --locked --all-targets --all-features`: 282 passed, 5 ignored,
+- `cargo test --locked --all-targets --all-features`: 283 passed, 5 ignored,
   0 failed;
 - `uv sync --frozen --project telegram_mcp --group dev`: audited 39 packages;
 - `uv run --project telegram_mcp --group dev pytest telegram_mcp/tests -q`:

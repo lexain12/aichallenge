@@ -341,23 +341,23 @@ fn replace_managed_text(existing: &str, managed_block: &str) -> Result<String, S
         .filter(|(_, _, body)| *body == MANAGED_END)
         .collect();
     match (starts.as_slice(), ends.as_slice()) {
-        ([], []) => {
-            let mut result = existing.to_owned();
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push_str(managed_block);
-            Ok(result)
-        }
+        ([], []) => Ok(append_managed_at_eof(existing.to_owned(), managed_block)),
         ([(start, _, _)], [(_, end, _)]) if start < end => {
             let mut result = String::with_capacity(existing.len() + managed_block.len());
             result.push_str(&existing[..*start]);
-            result.push_str(managed_block);
             result.push_str(&existing[*end..]);
-            Ok(result)
+            Ok(append_managed_at_eof(result, managed_block))
         }
         _ => Err(SchedulerError::MalformedManagedBlock),
     }
+}
+
+fn append_managed_at_eof(mut outside: String, managed_block: &str) -> String {
+    if !outside.is_empty() && !outside.ends_with('\n') {
+        outside.push('\n');
+    }
+    outside.push_str(managed_block);
+    outside
 }
 
 fn line_ranges(input: &str) -> Vec<(usize, usize, &str)> {
