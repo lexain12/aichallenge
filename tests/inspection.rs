@@ -1,0 +1,235 @@
+use std::io::Write;
+
+use chrono::{TimeZone, Utc};
+use chrono_tz::Europe::Moscow;
+use deepseek_cli::domain::{JobDesiredState, ToolOwner};
+use deepseek_cli::inspection::{InspectQuery, InspectionService};
+use deepseek_cli::scheduler::ScheduleSpec;
+use deepseek_cli::store::{
+    CronRunFinish, JobCreate, RunClaim, SafeErrorCode, Store, ToolRunFinish, ToolRunStart,
+};
+use serde_json::Value;
+
+fn all_items(service: &InspectionService, query: InspectQuery) -> Vec<Value> {
+    let mut page = service.inspect(query.clone()).unwrap();
+    let mut items = Vec::new();
+    loop {
+        items.append(&mut page.items);
+        let Some(cursor) = page.next_cursor else {
+            assert!(page.complete);
+            break;
+        };
+        page = service.inspect_page(query.clone(), cursor).unwrap();
+    }
+    items
+}
+
+struct ShortWriteRecorder {
+    bytes: Vec<u8>,
+    largest_write: usize,
+}
+
+impl Write for ShortWriteRecorder {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.largest_write = self.largest_write.max(bytes.len());
+        let accepted = bytes.len().min(31);
+        self.bytes.extend_from_slice(&bytes[..accepted]);
+        Ok(accepted)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn dump_export_and_history_cover_all_logical_state_in_stable_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    let first = store.create_dialog("first").unwrap();
+    let second = store.create_dialog("second").unwrap();
+
+    let completed = store.begin_turn(first.id, "question").unwrap();
+    let audit = store
+        .start_tool_run(ToolRunStart {
+            owner: ToolOwner::InteractiveTurn(completed.turn_id),
+            call_id: "call-1".into(),
+            server_name: "telegram".into(),
+            tool_name: "lookup".into(),
+            read_only: true,
+        })
+        .unwrap();
+    store
+        .finish_tool_run(audit, ToolRunFinish::completed())
+        .unwrap();
+    store.complete_turn(completed.turn_id, "answer").unwrap();
+    let failed = store.begin_turn(second.id, "will fail").unwrap();
+    store
+        .fail_turn(failed.turn_id, SafeErrorCode::ProviderError)
+        .unwrap();
+
+    let active = store
+        .create_job(JobCreate {
+            source_dialog_id: first.id,
+            name: "active".into(),
+            schedule: ScheduleSpec::parse_cron("0 9 * * *", Moscow).unwrap(),
+            prompt: "daily task".into(),
+        })
+        .unwrap();
+    store.mark_job_sync_applied(active.id).unwrap();
+    let RunClaim::Claimed(claim) = store
+        .claim_run(
+            active.id,
+            Utc.with_ymd_and_hms(2026, 9, 26, 6, 0, 0).unwrap(),
+        )
+        .unwrap()
+    else {
+        panic!("expected claimed run")
+    };
+    store
+        .finish_run(claim.run.id, CronRunFinish::completed("done"))
+        .unwrap();
+
+    let missed = store
+        .create_job(JobCreate {
+            source_dialog_id: second.id,
+            name: "missed".into(),
+            schedule: ScheduleSpec::parse_once_at("2026-09-26T10:30", Moscow).unwrap(),
+            prompt: "one-time task".into(),
+        })
+        .unwrap();
+    store.mark_job_sync_applied(missed.id).unwrap();
+    store
+        .mark_missed_once_jobs(Utc.with_ymd_and_hms(2026, 9, 26, 7, 31, 0).unwrap())
+        .unwrap();
+    let deleted = store
+        .create_job(JobCreate {
+            source_dialog_id: second.id,
+            name: "deleted".into(),
+            schedule: ScheduleSpec::parse_cron("15 8 * * *", Moscow).unwrap(),
+            prompt: "deleted task".into(),
+        })
+        .unwrap();
+    store
+        .set_job_desired_state(deleted.id, JobDesiredState::Deleted)
+        .unwrap();
+
+    let service = InspectionService::with_page_size(store.clone(), 2).unwrap();
+    let dump = all_items(&service, InspectQuery::Dump);
+    assert_eq!(
+        dump.iter()
+            .map(|item| item["record_type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "dialog", "dialog", "turn", "turn", "message", "message", "message", "job", "job",
+            "job", "run", "run", "tool_run"
+        ]
+    );
+    assert_eq!(dump, all_items(&service, InspectQuery::Dump));
+
+    let history = all_items(&service, InspectQuery::History(Some(first.id)));
+    assert!(
+        history
+            .iter()
+            .any(|item| item["record_type"] == "service_event")
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|item| item["record_type"] == "message")
+            .count(),
+        2
+    );
+    assert!(
+        history
+            .iter()
+            .filter(|item| item["record_type"] == "message")
+            .all(|item| item.get("job_name").is_none())
+    );
+
+    let mut first_export = Vec::new();
+    let summary = service.write_export(&mut first_export).unwrap();
+    assert_eq!(summary.total_bytes as usize, first_export.len());
+    assert_eq!(summary.records, 13);
+    assert_eq!(summary.sha256.len(), 64);
+    let mut second_export = Vec::new();
+    service.write_export(&mut second_export).unwrap();
+    assert_eq!(first_export, second_export);
+    let records = String::from_utf8(first_export).unwrap();
+    assert!(
+        records
+            .lines()
+            .next()
+            .unwrap()
+            .contains("logical_export_v1")
+    );
+    assert_eq!(records.lines().count(), 14);
+}
+
+#[test]
+fn export_is_streamed_and_has_no_secret_or_raw_payload_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    let dialog = store.create_dialog("safe").unwrap();
+    let turn = store.begin_turn(dialog.id, "ordinary message").unwrap();
+    let tool = store
+        .start_tool_run(ToolRunStart {
+            owner: ToolOwner::InteractiveTurn(turn.turn_id),
+            call_id: "opaque-call".into(),
+            server_name: "remote".into(),
+            tool_name: "read".into(),
+            read_only: true,
+        })
+        .unwrap();
+    store
+        .finish_tool_run(tool, ToolRunFinish::failed(SafeErrorCode::ToolError))
+        .unwrap();
+    store
+        .complete_turn(turn.turn_id, "ordinary answer")
+        .unwrap();
+    let service = InspectionService::new(store);
+
+    let mut writer = ShortWriteRecorder {
+        bytes: Vec::new(),
+        largest_write: 0,
+    };
+    service.write_export(&mut writer).unwrap();
+    assert!(writer.largest_write <= 262_144);
+    let export = String::from_utf8(writer.bytes).unwrap();
+    for forbidden in [
+        "api_key",
+        "bearer_token",
+        "mcp_url",
+        "provider_body",
+        "raw_error",
+        "arguments",
+        "tool_result",
+    ] {
+        assert!(!export.contains(forbidden), "leaked field: {forbidden}");
+    }
+    assert!(export.contains("opaque-call"));
+    assert!(export.contains("tool_error"));
+}
+
+#[test]
+fn inspection_pages_are_bounded_and_cursor_order_is_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    for index in 0..7 {
+        store.create_dialog(&format!("dialog-{index}")).unwrap();
+    }
+    let service = InspectionService::with_page_size(store, 3).unwrap();
+    let first = service.inspect(InspectQuery::Dialogs).unwrap();
+    assert_eq!(first.items.len(), 3);
+    assert!(!first.complete);
+    let second = service
+        .inspect_page(InspectQuery::Dialogs, first.next_cursor.unwrap())
+        .unwrap();
+    assert_eq!(second.items.len(), 3);
+    assert!(!second.complete);
+    let third = service
+        .inspect_page(InspectQuery::Dialogs, second.next_cursor.unwrap())
+        .unwrap();
+    assert_eq!(third.items.len(), 1);
+    assert!(third.complete);
+}

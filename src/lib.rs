@@ -11,6 +11,7 @@ pub mod dialog;
 pub mod domain;
 pub mod facts;
 pub mod goal_definition;
+pub mod inspection;
 pub mod invariants;
 pub mod mcp;
 pub mod memory;
