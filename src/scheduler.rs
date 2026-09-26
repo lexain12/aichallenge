@@ -370,6 +370,29 @@ fn line_ranges(input: &str) -> Vec<(usize, usize, &str)> {
 pub type CrontabFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, SchedulerError>> + Send + 'a>>;
 
+/// Injectable wall clock for deterministic run claiming. Production uses
+/// [`SystemCronClock`]; tests can pin DST and missed-run boundaries.
+pub trait CronClock: Send + Sync {
+    fn now(&self) -> DateTime<Utc>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemCronClock;
+
+impl CronClock for SystemCronClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
+/// Best-effort post-claim reconciliation. Its intentionally opaque error
+/// cannot expose backend diagnostics through the cron runner.
+pub type CronReconcileFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>>;
+
+pub trait CronRunReconciler: Send + Sync {
+    fn reconcile<'a>(&'a self, now: DateTime<Utc>) -> CronReconcileFuture<'a>;
+}
+
 pub trait CrontabBackend: Send + Sync {
     fn list(&self) -> CrontabFuture<'_, String>;
     fn validate<'a>(&'a self, candidate: &'a str) -> CrontabFuture<'a, ()>;
@@ -580,6 +603,12 @@ impl CronSynchronizer {
             self.store.mark_sync_snapshot_applied(&snapshot)?;
             Ok(SyncReport::Installed { jobs: active.len() })
         })
+    }
+}
+
+impl CronRunReconciler for CronSynchronizer {
+    fn reconcile<'a>(&'a self, now: DateTime<Utc>) -> CronReconcileFuture<'a> {
+        Box::pin(async move { self.sync_at(now).await.map(|_| ()).map_err(|_| ()) })
     }
 }
 

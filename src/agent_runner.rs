@@ -1,15 +1,17 @@
 //! Bounded full-history turns shared by interactive and scheduled execution.
 
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    domain::{DialogId, ToolOwner},
+    domain::{DialogId, JobId, RunId, ToolOwner},
     provider::{ModelToolCall, Provider, ProviderMessage, TokenUsage},
+    scheduler::{CronClock, CronRunReconciler, ScheduleSpec, SystemCronClock},
     store::{
-        MessageRole, SafeErrorCode, Store, StoreError, StoredMessage, ToolRunFinish, ToolRunStart,
+        CronRunFinish, MessageRole, RunClaim, SafeErrorCode, Store, StoreError, StoredMessage,
+        ToolRunFinish, ToolRunStart,
     },
     tools::{
         ConversationStep, ToolConversation, ToolExecutionError, ToolExecutionResult, ToolExecutor,
@@ -23,6 +25,203 @@ pub struct AgentInput {
     pub system_prompt: String,
     pub history: Vec<StoredMessage>,
     pub prompt: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CronRunOutcome {
+    Inactive,
+    Skipped(RunId),
+    Completed(RunId),
+}
+
+/// Safe cron-run failures. These values are suitable for stderr and never
+/// contain provider diagnostics, prompts, tool arguments, paths, or secrets.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CronRunError {
+    #[error("store_error")]
+    Store,
+    #[error("provider_error")]
+    Provider,
+    #[error("context_too_long")]
+    ContextTooLong,
+    #[error("tool_error")]
+    Tool,
+    #[error("tool_round_limit")]
+    ToolRoundLimit,
+    #[error("interrupted")]
+    Interrupted,
+    #[error("timed_out")]
+    TimedOut,
+    #[error("internal_error")]
+    Internal,
+}
+
+pub struct CronAgentService {
+    store: Store,
+    runner: AgentRunner,
+    system_prompt: String,
+    timeout: Duration,
+    reconciler: Option<Arc<dyn CronRunReconciler>>,
+    clock: Arc<dyn CronClock>,
+}
+
+impl CronAgentService {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        store: Store,
+        provider: Arc<dyn Provider>,
+        mcp: Arc<dyn ToolExecutor>,
+        system_prompt: impl Into<String>,
+        max_tool_rounds: usize,
+        max_provider_request_bytes: usize,
+        max_message_bytes: usize,
+        timeout: Duration,
+        reconciler: Option<Arc<dyn CronRunReconciler>>,
+    ) -> Self {
+        let runner = AgentRunner::new(
+            provider,
+            mcp,
+            store.clone(),
+            max_tool_rounds,
+            max_provider_request_bytes,
+            max_message_bytes,
+        );
+        Self {
+            store,
+            runner,
+            system_prompt: system_prompt.into(),
+            timeout,
+            reconciler,
+            clock: Arc::new(SystemCronClock),
+        }
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn CronClock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub async fn run_job(
+        &self,
+        job_id: JobId,
+        cancellation: CancellationToken,
+    ) -> Result<CronRunOutcome, CronRunError> {
+        if cancellation.is_cancelled() {
+            return Err(CronRunError::Interrupted);
+        }
+        let now = self.clock.now();
+        let claim = self
+            .store
+            .claim_run(job_id, now)
+            .map_err(|_| CronRunError::Store)?;
+        let claim = match claim {
+            RunClaim::Inactive => return Ok(CronRunOutcome::Inactive),
+            RunClaim::Skipped(run) => return Ok(CronRunOutcome::Skipped(run.id)),
+            RunClaim::Claimed(claim) => claim,
+        };
+
+        let run_id = claim.run.id;
+        let deadline = tokio::time::Instant::now() + self.timeout;
+
+        // The claim transaction has already disabled a once-at job and made
+        // its desired state pending. Removing the stale line is best effort;
+        // execution remains at-most-once even when crontab is unavailable.
+        if matches!(claim.job.schedule, ScheduleSpec::OnceAt { .. })
+            && let Some(reconciler) = &self.reconciler
+        {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    self.store.finish_run(
+                        run_id,
+                        CronRunFinish::interrupted(SafeErrorCode::Interrupted),
+                    ).map_err(|_| CronRunError::Store)?;
+                    return Err(CronRunError::Interrupted);
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    self.store.finish_run(run_id, CronRunFinish::timed_out())
+                        .map_err(|_| CronRunError::Store)?;
+                    return Err(CronRunError::TimedOut);
+                }
+                _ = reconciler.reconcile(now) => {}
+            }
+        }
+
+        let run_cancellation = CancellationToken::new();
+        let mut sink = |_event| Ok(());
+        let execution = self.runner.run(
+            AgentInput {
+                owner: ToolOwner::CronRun(run_id),
+                system_prompt: self.system_prompt.clone(),
+                history: Vec::new(),
+                prompt: claim.job.prompt,
+            },
+            run_cancellation.clone(),
+            &mut sink,
+        );
+        tokio::pin!(execution);
+        let deadline_sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_sleep);
+
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                run_cancellation.cancel();
+                let _ = execution.await;
+                self.store.finish_run(
+                    run_id,
+                    CronRunFinish::interrupted(SafeErrorCode::Interrupted),
+                ).map_err(|_| CronRunError::Store)?;
+                return Err(CronRunError::Interrupted);
+            }
+            _ = &mut deadline_sleep => {
+                run_cancellation.cancel();
+                let _ = execution.await;
+                self.store.finish_run(run_id, CronRunFinish::timed_out())
+                    .map_err(|_| CronRunError::Store)?;
+                return Err(CronRunError::TimedOut);
+            }
+            result = &mut execution => result,
+        };
+
+        match result {
+            Ok(outcome) => {
+                self.store
+                    .finish_run(run_id, CronRunFinish::completed(outcome.answer))
+                    .map_err(|_| CronRunError::Store)?;
+                Ok(CronRunOutcome::Completed(run_id))
+            }
+            Err(AgentError::Interrupted) => {
+                self.store
+                    .finish_run(
+                        run_id,
+                        CronRunFinish::interrupted(SafeErrorCode::Interrupted),
+                    )
+                    .map_err(|_| CronRunError::Store)?;
+                Err(CronRunError::Interrupted)
+            }
+            Err(error) => {
+                let (run_error, code) = cron_error(error);
+                self.store
+                    .finish_run(run_id, CronRunFinish::failed(code))
+                    .map_err(|_| CronRunError::Store)?;
+                Err(run_error)
+            }
+        }
+    }
+}
+
+fn cron_error(error: AgentError) -> (CronRunError, SafeErrorCode) {
+    match error {
+        AgentError::Provider => (CronRunError::Provider, SafeErrorCode::ProviderError),
+        AgentError::ContextTooLong => (CronRunError::ContextTooLong, SafeErrorCode::ContextTooLong),
+        AgentError::Tool => (CronRunError::Tool, SafeErrorCode::ToolError),
+        AgentError::ToolRoundLimit => (CronRunError::ToolRoundLimit, SafeErrorCode::ToolRoundLimit),
+        AgentError::Interrupted => (CronRunError::Interrupted, SafeErrorCode::Interrupted),
+        AgentError::Store(_) | AgentError::ContentTooLong | AgentError::Output => {
+            (CronRunError::Internal, SafeErrorCode::InternalError)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
