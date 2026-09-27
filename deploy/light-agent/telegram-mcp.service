@@ -1,0 +1,40 @@
+[Unit]
+Description=Light Agent Telegram MCP loopback service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=telegram-mcp
+Group=telegram-mcp
+WorkingDirectory=/opt/telegram-mcp/site
+EnvironmentFile=/etc/telegram-mcp/telegram-mcp.env
+Environment=HOME=/var/lib/telegram-mcp
+Environment=PYTHONPATH=/opt/telegram-mcp/site
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -c "from telegram_mcp.server import main; main()"
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+StateDirectory=telegram-mcp
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

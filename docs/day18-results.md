@@ -2,10 +2,12 @@
 
 Date: 2026-09-27 (Europe/Moscow)
 
-Status: local preflight Steps 1–5 passed. Read-only live Cronie discovery found
-and isolated a deployment blocker; mutating VM acceptance remains pending. No
-remote crontab change, SSH change, deployment, service change, or reboot is
-claimed by this document.
+Status: local preflight Steps 1–5 passed. The light-agent runtime, forced-command
+SSH access, terminal client, Cronie, and loopback Telegram MCP are installed and
+partially accepted on the target VM. Reboot recovery passed. End-to-end model
+turns and model-driven cron mutation remain blocked because authenticated
+DeepSeek requests from the VM time out, while the same key succeeds from the
+Mac. This document therefore does not claim complete production readiness.
 
 ## Local deterministic verification
 
@@ -35,26 +37,63 @@ rendering evidence only; it is not evidence from a real VM.
 
 ## Live acceptance
 
-Read-only discovery on the target Ubuntu 25.10 environment established that
-Cronie 1.7.2 is installed and that `crontab -V` succeeds. It also established
-that piping a candidate to `crontab -T -` fails with a bounded `premature EOF`
-diagnostic because this Cronie expects `-T <file>`. No candidate task text,
-address, credential, or other secret was recorded.
+The authorized live window on the target Ubuntu 25.10 environment established:
 
-The local backend and runbook now create an owner-only, fsynced temporary
-regular file, pass only its random path as the `-T` argument, and clean it up on
-success, failure, timeout, or cancellation. Deployment of that correction and
-the live path-form recheck remain pending; this document does not claim the VM
-has been fixed.
+- Cronie 1.7.2 is installed, enabled, and active. Installing it replaced the
+  distribution `cron` package and removed the `ubuntu-standard` metapackage; a
+  root-only pre-install rollback snapshot was retained on the VM.
+- `crontab -V` succeeds. The corrected owner-only path-form preflight,
+  `crontab -T <temporary-file>`, succeeds without installing the candidate.
+  The deployed runtime is the reviewed `0ab9298` source build, and `cron-sync`
+  succeeds before and after reboot with zero scheduled commands.
+- The `light-agent` account has `/var/lib/light-agent` as HOME, `/bin/sh` as its
+  forced-command shell, no password login or sudo access, a `0700` home, `0600`
+  configuration/database/key files, and the root-owned executable under
+  `/opt/light-agent/bin`.
+- OpenSSH's existing `AllowUsers` policy was extended to include only the new
+  account, validated with `sshd -t`, and reloaded without losing the existing
+  administrative connection. The dedicated key returns the versioned protocol
+  hello and cannot request an arbitrary remote command.
+- Telegram MCP is enabled as a separate systemd service and listens only on
+  `127.0.0.1:8000`. The checked-in unit passed Ubuntu's
+  `systemd-analyze verify`, was installed, and restarted active. MCP initialize
+  returned success. A direct, read-only probe verified exactly the expected
+  `list_chats`, `read_chat`, and `send_message` catalog annotations and
+  completed `list_chats` without recording its result.
+- The Mac terminal client is installed owner-locally with an owner-only config.
+  A PTY session created and listed two independent dialogs, then exited cleanly.
+  The VM-local restricted SQL shell returned only requested status fields. A
+  bounded `/export` completed with local byte-count/checksum verification; the
+  temporary export was then removed.
+- An authorized reboot changed the kernel boot ID. Cronie and Telegram MCP
+  returned enabled/active, the MCP listener remained loopback-only, file modes
+  remained correct, `cron-sync` succeeded, and ignored test
+  `live_reboot_recovery` reopened a persisted dialog.
 
-The following ignored checks also remain intentionally unexecuted:
+### External DeepSeek blocker
+
+The ignored `live_deepseek_no_tools` check reached the VM and created a durable
+turn, but the turn ended with the safe code `provider_error`. Follow-up probes
+recorded no prompts, answers, credentials, or provider bodies and established:
+
+- unauthenticated TLS access from the VM reaches the official endpoint quickly;
+- authenticated `/models`, `/user/balance`, and a minimal streaming completion
+  all time out from the VM;
+- the same API key receives HTTP 200 for `/models` from the Mac through the same
+  resolved CDN edge;
+- the VM has no usable IPv6 route for an alternate source path.
+
+Together these probes show an observed source-path-specific authenticated
+timeout. They do not establish whether the cause is provider policy, an
+intermediary, routing, or another source-dependent network condition. The Mac
+comparison narrows the symptom but does not prove that the key, model, DNS, or
+TLS can be excluded for every VM request. Until authenticated requests from the
+VM succeed, the following tests cannot honestly pass and remain pending:
 
 - DeepSeek response without tools;
-- two-dialog SSH roundtrip;
-- read-only Telegram MCP call through the VM loopback service;
-- explicitly confirmed cron create/delete roundtrip;
-- persistence and service recovery after an authorized reboot.
+- model responses in two independent dialogs;
+- model-selected read-only Telegram tool use;
+- explicitly confirmed cron create/delete roundtrip and execution.
 
-When authorized, record timestamps and safe pass/fail summaries only. Do not
-paste credentials, key material, private addresses, task text, answers, raw MCP
-payloads, database rows, or export contents here.
+No credential, key material, private address, task text, model answer, raw MCP
+payload, database row, or export content is recorded here.
