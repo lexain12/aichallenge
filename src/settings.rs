@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -47,6 +48,7 @@ struct RawServerSettings {
 struct RawProviderSettings {
     api_key: Option<String>,
     base_url: Option<String>,
+    proxy_url: Option<String>,
     model: Option<String>,
     max_tokens: Option<u32>,
     timeout_seconds: Option<u64>,
@@ -113,6 +115,7 @@ struct RawClientSettings {
 pub struct ProviderSettings {
     api_key: String,
     base_url: Url,
+    proxy_url: Option<Url>,
     model: String,
     max_tokens: u32,
     timeout: Duration,
@@ -125,6 +128,10 @@ impl ProviderSettings {
 
     pub fn base_url(&self) -> &Url {
         &self.base_url
+    }
+
+    pub fn proxy_url(&self) -> Option<&Url> {
+        self.proxy_url.as_ref()
     }
 
     pub fn model(&self) -> &str {
@@ -145,6 +152,7 @@ impl fmt::Debug for ProviderSettings {
         f.debug_struct("ProviderSettings")
             .field("api_key", &"[redacted]")
             .field("base_url", &"[redacted]")
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "[redacted]"))
             .field("model", &self.model)
             .field("max_tokens", &self.max_tokens)
             .field("timeout", &self.timeout)
@@ -302,6 +310,12 @@ impl ServerSettings {
                     .unwrap_or("https://api.deepseek.com"),
                 "provider.base_url",
             )?,
+            proxy_url: raw
+                .provider
+                .proxy_url
+                .as_deref()
+                .map(checked_proxy_url)
+                .transpose()?,
             model: nonblank(
                 raw.provider
                     .model
@@ -556,6 +570,29 @@ fn checked_http_url(value: &str, field: &'static str) -> Result<Url, SettingsErr
         return Err(SettingsError::Invalid(field));
     }
     Ok(url)
+}
+
+fn checked_proxy_url(value: &str) -> Result<Url, SettingsError> {
+    let invalid = || SettingsError::Invalid("provider.proxy_url");
+    let authority = value.strip_prefix("http://").ok_or_else(invalid)?;
+    if authority
+        .bytes()
+        .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'\\' | b'@'))
+    {
+        return Err(invalid());
+    }
+    let (host, port) = authority.rsplit_once(':').ok_or_else(invalid)?;
+    let host = host
+        .strip_prefix('[')
+        .map(|host| host.strip_suffix(']').ok_or_else(invalid))
+        .transpose()?
+        .unwrap_or(host);
+    if !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        || !port.parse::<u16>().is_ok_and(|port| port > 0)
+    {
+        return Err(invalid());
+    }
+    Url::parse(value).map_err(|_| invalid())
 }
 
 fn nonblank(value: String, field: &'static str) -> Result<String, SettingsError> {

@@ -32,8 +32,15 @@ impl DeepSeekProvider {
             settings.base_url().as_str().trim_end_matches('/')
         ))
         .map_err(|_| ProviderError::new("configuration"))?;
-        let http = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .timeout(settings.timeout())
+            .no_proxy();
+        if let Some(proxy_url) = settings.proxy_url() {
+            let proxy = reqwest::Proxy::https(proxy_url.as_str())
+                .map_err(|_| ProviderError::new("configuration"))?;
+            client = client.proxy(proxy);
+        }
+        let http = client
             .build()
             .map_err(|_| ProviderError::new("configuration"))?;
         Ok(Self {

@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::time::Duration;
 
 use deepseek_cli::provider::{
     AssistantTurn, DeepSeekProvider, ModelToolCall, ModelToolDefinition, Provider, ProviderMessage,
@@ -6,6 +7,8 @@ use deepseek_cli::provider::{
 use deepseek_cli::settings::ServerSettings;
 use serde_json::json;
 use tempfile::NamedTempFile;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -19,6 +22,47 @@ fn provider(server: &MockServer, key: &str) -> DeepSeekProvider {
     .unwrap();
     let settings = ServerSettings::load(file.path(), None).unwrap();
     DeepSeekProvider::new(settings.provider()).unwrap()
+}
+
+#[tokio::test]
+async fn proxy_routes_https_provider_request_through_connect() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let destination_port = destination.local_addr().unwrap().port();
+    let proxy = tokio::spawn(async move {
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .expect("provider did not connect to the configured proxy")
+            .unwrap();
+        let mut stream = BufReader::new(stream);
+        let mut request_line = String::new();
+        stream.read_line(&mut request_line).await.unwrap();
+        stream
+            .get_mut()
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        request_line
+    });
+
+    let mut file = NamedTempFile::new().unwrap();
+    write!(
+        file,
+        "[provider]\napi_key = 'test-key'\nbase_url = 'https://127.0.0.1:{destination_port}'\nproxy_url = 'http://127.0.0.1:{proxy_port}'\ntimeout_seconds = 2\n"
+    )
+    .unwrap();
+    let settings = ServerSettings::load(file.path(), None).unwrap();
+    let provider = DeepSeekProvider::new(settings.provider()).unwrap();
+    let error = provider
+        .stream_turn(&[ProviderMessage::user("test")], &[], &mut |_| Ok(()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.safe_code(), "request");
+    assert_eq!(
+        proxy.await.unwrap(),
+        format!("CONNECT 127.0.0.1:{destination_port} HTTP/1.1\r\n")
+    );
 }
 
 fn sse(deltas: Vec<serde_json::Value>, finish_reason: Option<&str>, done: bool) -> String {

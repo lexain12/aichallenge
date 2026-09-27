@@ -1,12 +1,62 @@
 use std::io::Write;
 
-use deepseek_cli::settings::{ClientSettings, ServerSettings};
+use deepseek_cli::settings::{ClientSettings, ServerSettings, SettingsError};
 use tempfile::NamedTempFile;
 
 fn config(contents: &str) -> NamedTempFile {
     let mut file = NamedTempFile::new().unwrap();
     file.write_all(contents.as_bytes()).unwrap();
     file
+}
+
+#[test]
+fn proxy_url_accepts_loopback_http_and_redacts_debug_output() {
+    let file = config("[provider]\napi_key = 'key'\nproxy_url = 'http://127.0.0.1:18080'\n");
+    let settings = ServerSettings::load(file.path(), None).unwrap();
+    assert_eq!(
+        settings.provider().proxy_url().unwrap().as_str(),
+        "http://127.0.0.1:18080/"
+    );
+    let debug = format!("{settings:?} {:?}", settings.provider());
+    assert!(!debug.contains("127.0.0.1:18080"));
+    assert!(debug.contains("proxy_url"));
+
+    let ipv6 = config("[provider]\napi_key = 'key'\nproxy_url = 'http://[::1]:18080'\n");
+    let settings = ServerSettings::load(ipv6.path(), None).unwrap();
+    assert_eq!(
+        settings.provider().proxy_url().unwrap().as_str(),
+        "http://[::1]:18080/"
+    );
+}
+
+#[test]
+fn proxy_url_rejects_non_loopback_or_malformed_values() {
+    for url in [
+        "https://127.0.0.1:18080",
+        "http://localhost:18080",
+        "http://192.0.2.1:18080",
+        "http://0.0.0.0:18080",
+        "http://127.0.0.1",
+        "http://127.0.0.1:0",
+        "http://user:pass@127.0.0.1:18080",
+        "http://@127.0.0.1:18080",
+        "http://127.0.0.1:18080/",
+        "http://127.0.0.1:18080/path",
+        "http://127.0.0.1:18080?token=secret",
+        "http://127.0.0.1:18080#fragment",
+        "not a URL",
+    ] {
+        let file = config(&format!(
+            "[provider]\napi_key = 'key'\nproxy_url = '{url}'\n"
+        ));
+        assert!(
+            matches!(
+                ServerSettings::load(file.path(), None),
+                Err(SettingsError::Invalid("provider.proxy_url"))
+            ),
+            "accepted or misclassified {url}"
+        );
+    }
 }
 
 #[test]
