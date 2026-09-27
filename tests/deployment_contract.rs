@@ -15,6 +15,47 @@ fn deployment_file(path: &str) -> String {
 }
 
 #[test]
+fn mac_deepseek_runbook_documents_a_persistent_loopback_route() {
+    for required in [
+        "127.0.0.1:18081",
+        "127.0.0.1:18080",
+        "api.deepseek.com:443",
+        "http://127.0.0.1:18080",
+        "ssh -N -T",
+        "-R 127.0.0.1:18080:127.0.0.1:18081",
+        "ExitOnForwardFailure=yes",
+        "ServerAliveInterval=30",
+        "ServerAliveCountMax=3",
+        "launchctl bootstrap",
+        "launchctl kickstart",
+        "KeepAlive",
+        "dedicated tunnel identity",
+        "Mac is off or asleep",
+        "no direct fallback",
+    ] {
+        assert!(
+            RUNBOOK.contains(required),
+            "Mac route runbook missing {required}"
+        );
+    }
+    for required in [
+        "local.light-agent.deepseek-proxy",
+        "local.light-agent.deepseek-tunnel",
+        "<key>ProgramArguments</key>",
+        "<key>RunAtLoad</key><true/>",
+        "<key>KeepAlive</key><true/>",
+        "plutil -lint ~/Library/LaunchAgents/local.light-agent.deepseek-proxy.plist",
+        "plutil -lint ~/Library/LaunchAgents/local.light-agent.deepseek-tunnel.plist",
+        "launchctl print gui/$(id -u)/local.light-agent.deepseek-tunnel",
+    ] {
+        assert!(
+            RUNBOOK.contains(required),
+            "Mac launchd runbook missing {required}"
+        );
+    }
+}
+
+#[test]
 fn deployment_paths_make_fixed_commands_resolve_the_default_config() {
     assert_eq!(RUNTIME_HOME, "/var/lib/light-agent");
     let runbook = RUNBOOK.split_whitespace().collect::<Vec<_>>().join(" ");

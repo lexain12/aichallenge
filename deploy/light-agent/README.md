@@ -335,6 +335,99 @@ The client launches system OpenSSH as the argument vector
 `ssh -T <alias> /opt/light-agent/bin/light-agent serve-stdio`; the client does
 not invoke a local shell or override the user, port, identity, or host-key policy.
 
+## Mac-routed DeepSeek HTTPS
+
+The optional `[provider] proxy_url = "http://127.0.0.1:18080"` points the VM
+agent at a VM-local reverse-forward listener. Only DeepSeek provider requests
+use it; Telegram MCP remains on VM `127.0.0.1:8000`. TLS and the API token stay
+end-to-end between the VM agent and DeepSeek. The Mac proxy accepts only
+`CONNECT api.deepseek.com:443` and listens only on `127.0.0.1:18081`.
+There is no direct fallback: if the tunnel is down or the Mac is off or asleep,
+model requests and cron runs that need DeepSeek fail. They must not silently
+use VM direct egress.
+
+Prepare a dedicated tunnel identity, separate from the administrator key and
+the `light-agent` forced-command client key. Task 3 must create and validate a
+dedicated VM tunnel account and SSH policy before these commands are run. The
+account should have a locked password, no sudo, no PTY or shell command access,
+and remote forwarding limited to `127.0.0.1:18080`; preserve existing SSH
+administrator and client access. The dedicated key may carry
+`restrict,port-forwarding,permitlisten="127.0.0.1:18080"`, while the account's
+sshd policy uses `AllowTcpForwarding remote`, `PermitListen 127.0.0.1:18080`,
+`PermitOpen none`, and `GatewayPorts no`. Validate the effective sshd policy
+and a fresh administrator login before leaving any SSH change in place.
+
+Use a separate `light-agent-tunnel-vm` host alias with the dedicated tunnel
+identity, `IdentitiesOnly yes`, and `StrictHostKeyChecking yes`. The tunnel
+command is:
+
+```bash
+ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:18080:127.0.0.1:18081 light-agent-tunnel-vm
+```
+
+For persistence, install two owner-owned LaunchAgents in
+`~/Library/LaunchAgents`. Replace the proxy script placeholder below with its
+absolute installed path; verify the chosen Python 3 interpreter exists on the
+Mac. The proxy plist is
+`~/Library/LaunchAgents/local.light-agent.deepseek-proxy.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.light-agent.deepseek-proxy</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/ABSOLUTE/PATH/deploy/light-agent/mac/deepseek_connect_proxy.py</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+</dict></plist>
+```
+
+The tunnel plist is
+`~/Library/LaunchAgents/local.light-agent.deepseek-tunnel.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.light-agent.deepseek-tunnel</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/ssh</string>
+    <string>-N</string><string>-T</string>
+    <string>-o</string><string>ExitOnForwardFailure=yes</string>
+    <string>-o</string><string>ServerAliveInterval=30</string>
+    <string>-o</string><string>ServerAliveCountMax=3</string>
+    <string>-R</string><string>127.0.0.1:18080:127.0.0.1:18081</string>
+    <string>light-agent-tunnel-vm</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+</dict></plist>
+```
+
+Keep the plists owner-only, with no credentials or payload logs. After
+reviewing their final paths and SSH alias, validate and start them:
+
+```bash
+plutil -lint ~/Library/LaunchAgents/local.light-agent.deepseek-proxy.plist
+plutil -lint ~/Library/LaunchAgents/local.light-agent.deepseek-tunnel.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.light-agent.deepseek-proxy.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.light-agent.deepseek-tunnel.plist
+launchctl print gui/$(id -u)/local.light-agent.deepseek-proxy
+launchctl print gui/$(id -u)/local.light-agent.deepseek-tunnel
+```
+
+After an update, use `launchctl kickstart -k
+gui/$(id -u)/local.light-agent.deepseek-proxy` and the corresponding tunnel
+label. Verify both jobs, the Mac loopback listener, and the VM listener's
+loopback bind before enabling the provider setting. The launchd jobs reconnect
+after process exit or login; they cannot keep the route available while the
+Mac is off or asleep.
+
 ## Telegram MCP
 
 Deploy the offline Linux site bundle under a separate, non-login `telegram-mcp`
