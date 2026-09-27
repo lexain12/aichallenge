@@ -339,7 +339,7 @@ not invoke a local shell or override the user, port, identity, or host-key polic
 
 The optional `[provider] proxy_url = "http://127.0.0.1:18080"` points the VM
 agent at a VM-local reverse-forward listener. Only DeepSeek provider requests
-use it; Telegram MCP remains on VM `127.0.0.1:8000`. TLS and the API token stay
+use it; Telegram MCP serves on VM `127.0.0.1:8000`. TLS and the API token stay
 end-to-end between the VM agent and DeepSeek. The Mac proxy accepts only
 `CONNECT api.deepseek.com:443` and listens only on `127.0.0.1:18081`.
 There is no direct fallback: if the tunnel is down or the Mac is off or asleep,
@@ -350,20 +350,36 @@ Prepare a dedicated tunnel identity, separate from the administrator key and
 the `light-agent` forced-command client key. Task 3 must create and validate a
 dedicated VM tunnel account and SSH policy before these commands are run. The
 account should have a locked password, no sudo, no PTY or shell command access,
-and remote forwarding limited to `127.0.0.1:18080`; preserve existing SSH
-administrator and client access. The dedicated key may carry
-`restrict,port-forwarding,permitlisten="127.0.0.1:18080"`, while the account's
-sshd policy uses `AllowTcpForwarding remote`, `PermitListen 127.0.0.1:18080`,
-`PermitOpen none`, and `GatewayPorts no`. Validate the effective sshd policy
-and a fresh administrator login before leaving any SSH change in place.
+and remote forwarding limited to `127.0.0.1:18080` and
+`127.0.0.1:18082`; preserve existing SSH administrator and client access. The
+dedicated key may carry
+`restrict,port-forwarding,permitlisten="127.0.0.1:18080",permitlisten="127.0.0.1:18082"`,
+while the account's sshd policy uses `AllowTcpForwarding remote`,
+`PermitListen 127.0.0.1:18080 127.0.0.1:18082`, `PermitOpen none`, and
+`GatewayPorts no`. Validate the effective sshd policy and a fresh
+administrator login before leaving any SSH change in place.
 
 Use a separate `light-agent-tunnel-vm` host alias with the dedicated tunnel
 identity, `IdentitiesOnly yes`, and `StrictHostKeyChecking yes`. The tunnel
 command is:
 
 ```bash
-ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:18080:127.0.0.1:18081 light-agent-tunnel-vm
+ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:18080:127.0.0.1:18081 -R 127.0.0.1:18082:<OPERATOR_RESOLVED_TELEGRAM_DC_IP>:<TELEGRAM_DC_PORT> light-agent-tunnel-vm
 ```
+
+Resolve the Telegram session's current DC destination on the Mac before
+installing the tunnel. Replace `<OPERATOR_RESOLVED_TELEGRAM_DC_IP>` and
+`<TELEGRAM_DC_PORT>` locally with that destination; do not put the session
+string, auth key, or resolved IP in this repository or service logs. The second
+fixed reverse forward listens only on VM `127.0.0.1:18082` and carries raw
+Telegram DC TCP traffic through the Mac. It is not a SOCKS or general-purpose
+proxy.
+If Telegram changes the session's DC destination, update the launchd forward
+to match before restarting Telegram MCP. Set `TELEGRAM_RELAY_PORT=18082` in
+`/etc/telegram-mcp/telegram-mcp.env` only after the second listener is ready.
+The Telegram MCP process keeps the session's original DC id and auth key; only
+its connection host and port change. Without the setting, it uses the session's
+original endpoint.
 
 For persistence, install two owner-owned LaunchAgents in
 `~/Library/LaunchAgents`. Replace the proxy script placeholder below with its
@@ -401,6 +417,7 @@ The tunnel plist is
     <string>-o</string><string>ServerAliveInterval=30</string>
     <string>-o</string><string>ServerAliveCountMax=3</string>
     <string>-R</string><string>127.0.0.1:18080:127.0.0.1:18081</string>
+    <string>-R</string><string>127.0.0.1:18082:&lt;OPERATOR_RESOLVED_TELEGRAM_DC_IP&gt;:&lt;TELEGRAM_DC_PORT&gt;</string>
     <string>light-agent-tunnel-vm</string>
   </array>
   <key>RunAtLoad</key><true/>

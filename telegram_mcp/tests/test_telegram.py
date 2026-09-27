@@ -10,6 +10,8 @@ import pytest
 from telegram_mcp.config import Settings
 from telegram_mcp.models import ChatListResult, ReadChatResult, SendMessageResult
 from telegram_mcp.telegram import TelegramToolFailure, TelethonGateway
+from telethon.crypto.authkey import AuthKey
+from telethon.sessions import StringSession
 
 
 NOW = datetime(2026, 9, 25, 10, 30, tzinfo=timezone.utc)
@@ -161,6 +163,64 @@ async def test_lazy_client_is_constructed_once_and_connected_once(monkeypatch) -
 
     assert calls == [(("session", "session-secret"), 123, "hash-secret")]
     assert created.connect_calls == 1
+
+
+async def test_relay_changes_only_session_endpoint_before_client_construction(monkeypatch) -> None:
+    import telegram_mcp.telegram as telegram
+
+    original = StringSession()
+    original.set_dc(4, "192.0.2.42", 443)
+    original.auth_key = AuthKey(bytes([42]) * 256)
+    session_string = original.save()
+    captured = []
+    dc_calls = []
+    created = FakeClient()
+
+    class TrackingSession(StringSession):
+        def set_dc(self, dc_id, server_address, port):
+            dc_calls.append((dc_id, server_address, port))
+            super().set_dc(dc_id, server_address, port)
+
+    def client_factory(session, api_id, api_hash, **kwargs):
+        captured.append((session.dc_id, session.server_address, session.port, session.auth_key.key))
+        return created
+
+    monkeypatch.setattr(telegram, "StringSession", TrackingSession)
+    monkeypatch.setattr(telegram, "TelegramClient", client_factory)
+    configured = Settings.from_env(
+        {
+            "TELEGRAM_API_ID": "123",
+            "TELEGRAM_API_HASH": "hash-secret",
+            "TELETHON_SESSION_STRING": session_string,
+            "TELEGRAM_RELAY_PORT": "18082",
+        }
+    )
+    gateway = TelethonGateway(configured)
+
+    await gateway.list_chats(None, 1)
+
+    assert dc_calls == [(4, "127.0.0.1", 18082)]
+    assert captured == [(4, "127.0.0.1", 18082, bytes([42]) * 256)]
+
+
+async def test_without_relay_preserves_original_session_endpoint(monkeypatch) -> None:
+    import telegram_mcp.telegram as telegram
+
+    original = StringSession()
+    original.set_dc(4, "192.0.2.42", 443)
+    original.auth_key = AuthKey(bytes([42]) * 256)
+    captured = []
+
+    def client_factory(session, api_id, api_hash, **kwargs):
+        captured.append((session.dc_id, session.server_address, session.port, session.auth_key.key))
+        return FakeClient()
+
+    monkeypatch.setattr(telegram, "TelegramClient", client_factory)
+    gateway = TelethonGateway(Settings(123, "hash-secret", original.save()))
+
+    await gateway.list_chats(None, 1)
+
+    assert captured == [(4, "192.0.2.42", 443, bytes([42]) * 256)]
 
 
 async def test_real_client_disables_internal_send_retries(monkeypatch) -> None:

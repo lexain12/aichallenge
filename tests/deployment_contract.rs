@@ -56,6 +56,24 @@ fn mac_deepseek_runbook_documents_a_persistent_loopback_route() {
 }
 
 #[test]
+fn telegram_relay_runbook_limits_second_forward_to_one_dc_endpoint() {
+    let runbook = RUNBOOK.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in [
+        "TELEGRAM_RELAY_PORT=18082",
+        "127.0.0.1:18082",
+        "-R 127.0.0.1:18082:<OPERATOR_RESOLVED_TELEGRAM_DC_IP>:<TELEGRAM_DC_PORT>",
+        "PermitListen 127.0.0.1:18080 127.0.0.1:18082",
+        "permitlisten=\"127.0.0.1:18080\",permitlisten=\"127.0.0.1:18082\"",
+        "not a SOCKS or general-purpose proxy",
+    ] {
+        assert!(
+            runbook.contains(required),
+            "Telegram relay runbook missing {required}"
+        );
+    }
+}
+
+#[test]
 fn deployment_paths_make_fixed_commands_resolve_the_default_config() {
     assert_eq!(RUNTIME_HOME, "/var/lib/light-agent");
     let runbook = RUNBOOK.split_whitespace().collect::<Vec<_>>().join(" ");

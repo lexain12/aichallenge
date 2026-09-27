@@ -96,8 +96,12 @@ class TelethonGateway:
         async with self._connect_lock:
             try:
                 if self._client is None:
+                    session = StringSession(self._settings.session_string)
+                    if self._settings.relay_port is not None:
+                        original_dc_id = session.dc_id
+                        session.set_dc(original_dc_id, "127.0.0.1", self._settings.relay_port)
                     self._client = TelegramClient(
-                        StringSession(self._settings.session_string),
+                        session,
                         self._settings.api_id,
                         self._settings.api_hash,
                         request_retries=0,
