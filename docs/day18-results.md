@@ -2,12 +2,12 @@
 
 Date: 2026-09-27 (Europe/Moscow)
 
-Status: local preflight Steps 1–5 passed. The light-agent runtime, forced-command
-SSH access, terminal client, Cronie, and loopback Telegram MCP are installed and
-partially accepted on the target VM. Reboot recovery passed. End-to-end model
-turns and model-driven cron mutation remain blocked because authenticated
-DeepSeek requests from the VM time out, while the same key succeeds from the
-Mac. This document therefore does not claim complete production readiness.
+Status: the light agent is deployed on the target VM and accepted end to end
+through the Mac-routed DeepSeek and Telegram paths. Forced-command SSH, multiple
+dialogs, persisted dialog recovery, confirmed scheduling, VM-local inspection,
+and a scheduled Telegram write were exercised live. Availability of both
+external services now depends on the Mac being awake, logged in, and running the
+two LaunchAgents.
 
 ## Local deterministic verification
 
@@ -15,14 +15,14 @@ Rust commands were rerun locally on 2026-09-27:
 
 - `cargo fmt --check`: passed;
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`: passed;
-- `cargo test --locked --all-targets --all-features`: 297 passed, 5 ignored,
+- `cargo test --locked --all-targets --all-features`: 313 passed, 5 ignored,
   0 failed;
 
-Python verification last ran locally on 2026-09-26:
+Python verification ran locally on 2026-09-27:
 
-- `uv sync --frozen --project telegram_mcp --group dev`: audited 39 packages;
-- `uv run --project telegram_mcp --group dev pytest telegram_mcp/tests -q`:
-  50 passed;
+- `/usr/bin/python3 -m unittest discover -s deploy/light-agent/mac -p
+  'test_*.py'`: 10 passed;
+- `telegram_mcp/.venv/bin/python -m pytest telegram_mcp/tests -q`: 71 passed;
 - `git diff --check`: passed.
 
 The legacy-name scan reported only reviewed, non-legacy uses: export result
@@ -70,30 +70,46 @@ The authorized live window on the target Ubuntu 25.10 environment established:
   remained correct, `cron-sync` succeeded, and ignored test
   `live_reboot_recovery` reopened a persisted dialog.
 
-### External DeepSeek blocker
+### Mac-routed DeepSeek and Telegram acceptance
 
-The ignored `live_deepseek_no_tools` check reached the VM and created a durable
-turn, but the turn ended with the safe code `provider_error`. Follow-up probes
-recorded no prompts, answers, credentials, or provider bodies and established:
+The source-path-specific DeepSeek timeout was resolved without exposing the
+provider credential to the Mac proxy. A loopback-only CONNECT proxy on the Mac
+accepts only `api.deepseek.com:443`; a dedicated, non-login VM identity exposes
+it as `127.0.0.1:18080`. The provider uses that endpoint explicitly and does not
+fall back to ambient proxies or direct egress. Both LaunchAgents recovered after
+restart. An authenticated status request returned HTTP 200 through the route.
 
-- unauthenticated TLS access from the VM reaches the official endpoint quickly;
-- authenticated `/models`, `/user/balance`, and a minimal streaming completion
-  all time out from the VM;
-- the same API key receives HTTP 200 for `/models` from the Mac through the same
-  resolved CDN edge;
-- the VM has no usable IPv6 route for an alternate source path.
+The following ignored live checks passed through the installed Mac terminal
+client and VM runtime:
 
-Together these probes show an observed source-path-specific authenticated
-timeout. They do not establish whether the cause is provider policy, an
-intermediary, routing, or another source-dependent network condition. The Mac
-comparison narrows the symptom but does not prove that the key, model, DNS, or
-TLS can be excluded for every VM request. Until authenticated requests from the
-VM succeed, the following tests cannot honestly pass and remain pending:
-
-- DeepSeek response without tools;
+- a DeepSeek response without tools;
 - model responses in two independent dialogs;
-- model-selected read-only Telegram tool use;
-- explicitly confirmed cron create/delete roundtrip and execution.
+- model-selected read-only Telegram MCP use;
+- an explicitly confirmed cron create/delete roundtrip;
+- cleanup with zero scheduled crontab commands.
 
-No credential, key material, private address, task text, model answer, raw MCP
-payload, database row, or export content is recorded here.
+The VM could not reach its Telegram DC directly. The existing restricted reverse
+tunnel was extended with a second fixed listener at `127.0.0.1:18082`, forwarding
+only to the session's current DC through the Mac. Telethon preserves the original
+DC id and auth key, overrides only the endpoint, and fails closed if Telegram
+requests a DC migration. This is not a SOCKS or general-purpose proxy. Telegram
+MCP remained bound to `127.0.0.1:8000`, and its list/read path passed through the
+relay.
+
+With explicit operator authorization, a `once_at` job was created through the
+terminal confirmation preview for 2026-09-27 16:04 Europe/Moscow. Its prompt
+targeted one named private chat and Saved Messages without embedding message
+content. The cron run completed once. Metadata-only audit recorded two successful
+`list_chats` calls, one successful `read_chat`, and one successful
+`send_message`; an independent status-only MCP check observed a new recent
+outgoing Saved Messages entry. The message text, chat identifiers, and tool
+payloads were not printed or recorded here.
+
+Generic MCP writes still do not have an in-protocol confirmation gate. The live
+Telegram write relied on the operator's explicit one-time authorization and an
+exact terminal preview for the scheduled task. The scheduler confirmation
+mechanism applies to creating the job, not to arbitrary MCP writes inside a
+normal or scheduled turn.
+
+No credential, key material, private Telegram endpoint, task payload, model
+answer, raw MCP payload, database row, or message content is recorded here.

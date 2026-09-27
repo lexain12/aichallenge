@@ -303,19 +303,24 @@ fn runbook_documents_reversible_ubuntu_cronie_package_transition() {
 }
 
 #[test]
-fn live_results_report_observation_without_unproved_provider_causality() {
+fn live_results_report_routed_acceptance_and_remaining_boundaries() {
     let results = RESULTS.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        results.contains("observed source-path-specific authenticated timeout"),
-        "results must describe only the observed failure"
+        results.contains("authenticated status request returned HTTP 200 through the route"),
+        "results must record the routed status evidence"
     );
     assert!(
-        results.contains("Until authenticated requests from the VM succeed"),
-        "results must use an outcome-based unblock condition"
+        results.contains("Mac being awake, logged in, and running the two LaunchAgents"),
+        "results must retain the Mac availability dependency"
+    );
+    assert!(
+        results.contains("Generic MCP writes still do not have an in-protocol confirmation gate"),
+        "results must retain the generic MCP write confirmation boundary"
     );
     for forbidden in [
         "This isolates the remaining failure",
         "Until DeepSeek accepts the VM's egress address",
+        "Until authenticated requests from the VM succeed",
     ] {
         assert!(
             !results.contains(forbidden),

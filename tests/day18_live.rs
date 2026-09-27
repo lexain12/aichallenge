@@ -8,13 +8,41 @@ use std::time::Duration;
 
 use deepseek_cli::domain::{ConfirmationId, DialogId, RequestId};
 use deepseek_cli::protocol::{
-    ClientRequest, PROTOCOL_VERSION, RequestEnvelope, ServerEnvelope, ServerEvent,
+    ClientRequest, ConfirmationAction, ConfirmationScheduleKind, PROTOCOL_VERSION,
+    ProtocolErrorCode, RequestEnvelope, ScheduleConfirmationPreview, ServerEnvelope, ServerEvent,
 };
 use deepseek_cli::remote_client::{RemoteSession, SshTransport};
 use deepseek_cli::settings::ClientSettings;
 use tokio::process::{ChildStdin, ChildStdout};
 
 type LiveSession = RemoteSession<ChildStdout, ChildStdin>;
+
+fn completed_tools_match(started: &[String], finished: &[(String, ProtocolErrorCode)]) -> bool {
+    started.len() == finished.len()
+        && started
+            .iter()
+            .zip(finished)
+            .all(|(started, (finished, code))| {
+                started == finished && *code == ProtocolErrorCode::Ok
+            })
+}
+
+#[test]
+fn completed_tool_trace_requires_matching_successes() {
+    let started = vec!["telegram__list_chats".to_owned()];
+    assert!(completed_tools_match(
+        &started,
+        &[("telegram__list_chats".to_owned(), ProtocolErrorCode::Ok)]
+    ));
+    assert!(!completed_tools_match(&started, &[]));
+    assert!(!completed_tools_match(
+        &started,
+        &[(
+            "telegram__list_chats".to_owned(),
+            ProtocolErrorCode::InternalError,
+        )]
+    ));
+}
 
 fn require_flag(name: &str) {
     assert_eq!(
@@ -93,6 +121,7 @@ async fn completed_turn(
     )
     .await;
     let mut tools = Vec::new();
+    let mut finished_tools = Vec::new();
     loop {
         let event = timed_event(session).await;
         if event.request_id != request_id {
@@ -100,7 +129,12 @@ async fn completed_turn(
         }
         match event.event {
             ServerEvent::ToolStarted { name } => tools.push(name),
+            ServerEvent::ToolFinished { name, code } => finished_tools.push((name, code)),
             ServerEvent::TurnCompleted { answer } => {
+                assert!(
+                    completed_tools_match(&tools, &finished_tools),
+                    "tool execution did not complete successfully"
+                );
                 assert!(!answer.trim().is_empty(), "empty durable answer");
                 return tools;
             }
@@ -126,14 +160,78 @@ async fn delete_dialog(session: &mut LiveSession, dialog_id: DialogId) {
     }
 }
 
-async fn confirm_and_complete(session: &mut LiveSession, originating_request_id: RequestId) {
-    let confirmation_id: ConfirmationId = loop {
+#[derive(Clone, Copy)]
+enum ExpectedJobId {
+    None,
+    Some,
+}
+
+struct ExpectedPreview<'a> {
+    action: ConfirmationAction,
+    job_id: ExpectedJobId,
+    name: &'a str,
+    schedule_kind: ConfirmationScheduleKind,
+    schedule_value: &'a str,
+    timezone: &'a str,
+    task: &'a str,
+}
+
+fn preview_matches(preview: &ScheduleConfirmationPreview, expected: &ExpectedPreview<'_>) -> bool {
+    preview.action == expected.action
+        && match expected.job_id {
+            ExpectedJobId::None => preview.job_id.is_none(),
+            ExpectedJobId::Some => preview.job_id.is_some(),
+        }
+        && preview.name == expected.name
+        && preview.schedule_kind == expected.schedule_kind
+        && preview.schedule_value == expected.schedule_value
+        && preview.timezone == expected.timezone
+        && preview.task == expected.task
+}
+
+#[test]
+fn confirmation_preview_matching_rejects_wrong_mutation() {
+    let preview = ScheduleConfirmationPreview {
+        action: ConfirmationAction::Create,
+        job_id: None,
+        name: "check".into(),
+        schedule_kind: ConfirmationScheduleKind::Cron,
+        schedule_value: "17 5 * * *".into(),
+        timezone: "Europe/Moscow".into(),
+        task: "Reply with a health status.".into(),
+    };
+    let expected = ExpectedPreview {
+        action: ConfirmationAction::Create,
+        job_id: ExpectedJobId::None,
+        name: "check",
+        schedule_kind: ConfirmationScheduleKind::Cron,
+        schedule_value: "17 5 * * *",
+        timezone: "Europe/Moscow",
+        task: "Reply with a health status.",
+    };
+    assert!(preview_matches(&preview, &expected));
+    let mut wrong = preview.clone();
+    wrong.action = ConfirmationAction::Delete;
+    assert!(!preview_matches(&wrong, &expected));
+    wrong = preview;
+    wrong.task = "different".into();
+    assert!(!preview_matches(&wrong, &expected));
+}
+
+async fn confirm_and_complete(
+    session: &mut LiveSession,
+    originating_request_id: RequestId,
+    expected_tool: &str,
+    expected_preview: ExpectedPreview<'_>,
+) {
+    let (confirmation_id, preview): (ConfirmationId, ScheduleConfirmationPreview) = loop {
         let event = timed_event(session).await;
         if event.request_id == originating_request_id {
             match event.event {
                 ServerEvent::ConfirmationRequired {
-                    confirmation_id, ..
-                } => break confirmation_id,
+                    confirmation_id,
+                    preview,
+                } => break (confirmation_id, preview),
                 ServerEvent::TurnFailed { .. } | ServerEvent::ProtocolError { .. } => {
                     panic!("scheduled mutation proposal failed")
                 }
@@ -141,6 +239,10 @@ async fn confirm_and_complete(session: &mut LiveSession, originating_request_id:
             }
         }
     };
+    assert!(
+        preview_matches(&preview, &expected_preview),
+        "unexpected scheduled mutation preview"
+    );
     send(
         session,
         ClientRequest::ConfirmAction {
@@ -149,11 +251,21 @@ async fn confirm_and_complete(session: &mut LiveSession, originating_request_id:
         },
     )
     .await;
+    let mut mutation_completed = false;
     loop {
         let event = timed_event(session).await;
         if event.request_id == originating_request_id {
             match event.event {
+                ServerEvent::ToolFinished { name, code } if name == expected_tool => {
+                    assert_eq!(
+                        code,
+                        deepseek_cli::protocol::ProtocolErrorCode::Ok,
+                        "scheduled mutation tool failed"
+                    );
+                    mutation_completed = true;
+                }
                 ServerEvent::TurnCompleted { answer } => {
+                    assert!(mutation_completed, "scheduled mutation did not complete");
                     assert!(!answer.trim().is_empty(), "empty durable answer");
                     return;
                 }
@@ -237,12 +349,26 @@ async fn live_confirmed_cron_roundtrip() {
         ClientRequest::SendMessage {
             dialog_id: dialog,
             message: format!(
-                "Create a cron job named {job_name} for 05:17 Europe/Moscow whose task is to reply with a health status."
+                "Create exactly one cron job named {job_name} with cron expression 17 5 * * *, timezone Europe/Moscow, and task text exactly: Reply with a health status."
             ),
         },
     )
     .await;
-    confirm_and_complete(&mut session, originating_request_id).await;
+    confirm_and_complete(
+        &mut session,
+        originating_request_id,
+        "cron__create",
+        ExpectedPreview {
+            action: ConfirmationAction::Create,
+            job_id: ExpectedJobId::None,
+            name: &job_name,
+            schedule_kind: ConfirmationScheduleKind::Cron,
+            schedule_value: "17 5 * * *",
+            timezone: "Europe/Moscow",
+            task: "Reply with a health status.",
+        },
+    )
+    .await;
     let delete_request_id = send(
         &mut session,
         ClientRequest::SendMessage {
@@ -251,7 +377,21 @@ async fn live_confirmed_cron_roundtrip() {
         },
     )
     .await;
-    confirm_and_complete(&mut session, delete_request_id).await;
+    confirm_and_complete(
+        &mut session,
+        delete_request_id,
+        "cron__delete",
+        ExpectedPreview {
+            action: ConfirmationAction::Delete,
+            job_id: ExpectedJobId::Some,
+            name: &job_name,
+            schedule_kind: ConfirmationScheduleKind::Cron,
+            schedule_value: "17 5 * * *",
+            timezone: "Europe/Moscow",
+            task: "Reply with a health status.",
+        },
+    )
+    .await;
     delete_dialog(&mut session, dialog).await;
 }
 
