@@ -187,6 +187,7 @@ async def test_relay_changes_only_session_endpoint_before_client_construction(mo
 
     monkeypatch.setattr(telegram, "StringSession", TrackingSession)
     monkeypatch.setattr(telegram, "TelegramClient", client_factory)
+    monkeypatch.setattr(telegram, "_RelayTelegramClient", client_factory, raising=False)
     configured = Settings.from_env(
         {
             "TELEGRAM_API_ID": "123",
@@ -221,6 +222,109 @@ async def test_without_relay_preserves_original_session_endpoint(monkeypatch) ->
     await gateway.list_chats(None, 1)
 
     assert captured == [(4, "192.0.2.42", 443, bytes([42]) * 256)]
+
+
+async def test_installed_telethon_switch_dc_mutates_session_before_reconnect(monkeypatch) -> None:
+    from telethon import TelegramClient
+
+    session = StringSession()
+    session.set_dc(4, "192.0.2.42", 443)
+    session.auth_key = AuthKey(bytes([42]) * 256)
+    client = TelegramClient(session, 123, "synthetic-hash")
+
+    async def destination(_new_dc):
+        return SimpleNamespace(id=5, ip_address="192.0.2.99", port=443)
+
+    async def stop_before_reconnect():
+        raise RuntimeError("offline test stopped reconnect")
+
+    monkeypatch.setattr(client, "_get_dc", destination)
+    monkeypatch.setattr(client, "_disconnect", stop_before_reconnect)
+
+    with pytest.raises(RuntimeError, match="offline test stopped reconnect"):
+        await client._switch_dc(5)
+
+    assert (session.dc_id, session.server_address, session.port) == (5, "192.0.2.99", 443)
+    assert session.auth_key is None
+
+
+async def test_relay_mode_blocks_user_migration_before_session_change(monkeypatch) -> None:
+    from telethon import TelegramClient, errors
+    from telethon.tl.functions.users import GetUsersRequest
+    from telethon.tl.types import InputUserSelf
+
+    original = StringSession()
+    original.set_dc(4, "192.0.2.42", 443)
+    original.auth_key = AuthKey(bytes([42]) * 256)
+
+    monkeypatch.setattr(TelegramClient, "is_connected", lambda self: True)
+
+    async def authorized(_client):
+        return True
+
+    async def get_me(_client):
+        return user(7, "Owner")
+
+    monkeypatch.setattr(TelegramClient, "is_user_authorized", authorized)
+    monkeypatch.setattr(TelegramClient, "get_me", get_me)
+    gateway = TelethonGateway(Settings(123, "synthetic-hash", original.save(), relay_port=18082))
+    await gateway.list_chats(None, 1)
+    client = gateway._client
+
+    async def destination(_new_dc):
+        return SimpleNamespace(id=5, ip_address="192.0.2.99", port=443)
+
+    disconnect_calls = []
+
+    async def stop_before_reconnect():
+        disconnect_calls.append(True)
+        raise RuntimeError("offline test stopped reconnect")
+
+    monkeypatch.setattr(client, "_get_dc", destination)
+    monkeypatch.setattr(client, "_disconnect", stop_before_reconnect)
+
+    class MigratingSender:
+        def send(self, request, *, ordered):
+            async def migration_response():
+                raise errors.UserMigrateError(request=request, capture=5)
+
+            return asyncio.create_task(migration_response())
+
+    async def migrating_dialogs():
+        await client._call(MigratingSender(), GetUsersRequest([InputUserSelf()]))
+        yield dialog(8, "Unreachable")
+
+    monkeypatch.setattr(client, "iter_dialogs", migrating_dialogs)
+    with pytest.raises(TelegramToolFailure) as caught:
+        await gateway.list_chats("not-saved", 1)
+
+    assert caught.value.code == "delivery_unknown"
+    assert "192.0.2.99" not in str(caught.value)
+    assert (client.session.dc_id, client.session.server_address, client.session.port) == (
+        4, "127.0.0.1", 18082
+    )
+    assert client.session.auth_key.key == bytes([42]) * 256
+    assert disconnect_calls == []
+
+
+async def test_without_relay_constructs_the_ordinary_telegram_client(monkeypatch) -> None:
+    from telethon import TelegramClient
+
+    monkeypatch.setattr(TelegramClient, "is_connected", lambda self: True)
+
+    async def authorized(_client):
+        return True
+
+    async def get_me(_client):
+        return user(7, "Owner")
+
+    monkeypatch.setattr(TelegramClient, "is_user_authorized", authorized)
+    monkeypatch.setattr(TelegramClient, "get_me", get_me)
+    gateway = TelethonGateway(Settings(123, "synthetic-hash", ""))
+
+    await gateway.list_chats(None, 1)
+
+    assert type(gateway._client) is TelegramClient
 
 
 async def test_real_client_disables_internal_send_retries(monkeypatch) -> None:

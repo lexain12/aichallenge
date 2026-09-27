@@ -37,6 +37,11 @@ class TelegramToolFailure(Exception):
         self.candidates = candidates or []
 
 
+class _RelayTelegramClient(TelegramClient):
+    async def _switch_dc(self, new_dc: int) -> None:
+        raise TelegramToolFailure("delivery_unknown", "Telegram operation outcome is unknown")
+
+
 @dataclass(frozen=True)
 class _ResolvedChat:
     summary: ChatSummary
@@ -100,7 +105,12 @@ class TelethonGateway:
                     if self._settings.relay_port is not None:
                         original_dc_id = session.dc_id
                         session.set_dc(original_dc_id, "127.0.0.1", self._settings.relay_port)
-                    self._client = TelegramClient(
+                    client_type = (
+                        _RelayTelegramClient
+                        if self._settings.relay_port is not None
+                        else TelegramClient
+                    )
+                    self._client = client_type(
                         session,
                         self._settings.api_id,
                         self._settings.api_hash,

@@ -375,8 +375,10 @@ fixed reverse forward listens only on VM `127.0.0.1:18082` and carries raw
 Telegram DC TCP traffic through the Mac. It is not a SOCKS or general-purpose
 proxy.
 If Telegram changes the session's DC destination, update the launchd forward
-to match before restarting Telegram MCP. Set `TELEGRAM_RELAY_PORT=18082` in
-`/etc/telegram-mcp/telegram-mcp.env` only after the second listener is ready.
+to match before restarting Telegram MCP. In relay mode a Telegram DC migration
+fails safely instead of connecting directly to the new DC. Set
+`TELEGRAM_RELAY_PORT=18082` in `/etc/telegram-mcp/telegram-mcp.env` only after
+the second listener is ready.
 The Telegram MCP process keeps the session's original DC id and auth key; only
 its connection host and port change. Without the setting, it uses the session's
 original endpoint.
