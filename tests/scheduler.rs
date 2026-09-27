@@ -659,49 +659,127 @@ async fn sqlite_lock_during_reconciliation_obeys_deadline_and_never_installs_lat
 }
 
 #[cfg(unix)]
-fn fake_crontab(dir: &std::path::Path, version: &str) -> (PathBuf, PathBuf, PathBuf) {
+struct FakeCrontab {
+    executable: PathBuf,
+    log: PathBuf,
+    installed: PathBuf,
+    validated: PathBuf,
+    validation_modes: PathBuf,
+    validation_paths: PathBuf,
+}
+
+#[cfg(unix)]
+fn fake_crontab(dir: &std::path::Path, version: &str) -> FakeCrontab {
     use std::os::unix::fs::PermissionsExt;
 
     let executable = dir.join("fake-crontab");
     let log = dir.join("argv.log");
     let installed = dir.join("installed");
+    let validated = dir.join("validated");
+    let validation_modes = dir.join("validation-modes");
+    let validation_paths = dir.join("validation-paths");
     let script = format!(
-        "#!/bin/sh\n[ \"$LC_ALL\" = C ] && [ \"$LANG\" = C ] || exit 7\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  -V) printf '%s\\n' '{}' ;;\n  -T) input=$(cat); case \"$input\" in *CRON_TZ=*) exit 0 ;; *) exit 9 ;; esac ;;\n  -l) printf 'no crontab for test\\n' >&2; exit 1 ;;\n  -) cat > '{}' ;;\n  *) exit 8 ;;\nesac\n",
+        "#!/bin/sh\n[ \"$LC_ALL\" = C ] && [ \"$LANG\" = C ] || exit 7\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  -V) printf '%s\\n' '{}' ;;\n  -T)\n    [ \"$#\" -eq 2 ] || exit 10\n    [ -f \"$2\" ] && [ ! -L \"$2\" ] || exit 11\n    mode=$(stat -f '%Lp' \"$2\" 2>/dev/null || stat -c '%a' \"$2\") || exit 12\n    printf '%s\\n' \"$mode\" >> '{}'\n    printf '%s\\n' \"$2\" >> '{}'\n    cp \"$2\" '{}' || exit 13\n    case \"$(cat \"$2\")\" in *CRON_TZ=*) exit 0 ;; *) exit 9 ;; esac ;;\n  -l) printf 'no crontab for test\\n' >&2; exit 1 ;;\n  -) cat > '{}' ;;\n  *) exit 8 ;;\nesac\n",
         log.display(),
         version,
+        validation_modes.display(),
+        validation_paths.display(),
+        validated.display(),
         installed.display()
     );
     std::fs::write(&executable, script).unwrap();
     let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(&executable, permissions).unwrap();
-    (executable, log, installed)
+    FakeCrontab {
+        executable,
+        log,
+        installed,
+        validated,
+        validation_modes,
+        validation_paths,
+    }
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn system_preflight_requires_cronie_and_t_validation_without_a_shell() {
     let dir = common::private_tempdir();
-    let (not_cronie, _, _) = fake_crontab(dir.path(), "Vixie Cron 4.1");
-    let backend = SystemCrontabBackend::new(not_cronie).unwrap();
+    let not_cronie = fake_crontab(dir.path(), "Vixie Cron 4.1");
+    let backend = SystemCrontabBackend::new(not_cronie.executable, dir.path().to_owned()).unwrap();
     assert_eq!(
         backend.preflight().await.unwrap_err(),
         SchedulerError::UnsupportedCron
     );
 
     let other = common::private_tempdir();
-    let (cronie, log, installed) = fake_crontab(other.path(), "cronie 1.7.2");
-    let backend = SystemCrontabBackend::new(cronie).unwrap();
+    let cronie = fake_crontab(other.path(), "cronie 1.7.2");
+    let backend = SystemCrontabBackend::new(cronie.executable, other.path().to_owned()).unwrap();
     backend.preflight().await.unwrap();
     assert_eq!(backend.list().await.unwrap(), "");
     let candidate = "CRON_TZ=Europe/Moscow\n0 9 * * * /opt/light-agent/bin/light-agent run-job 123e4567-e89b-42d3-a456-426614174000\n";
     backend.validate(candidate).await.unwrap();
     backend.install(candidate).await.unwrap();
-    assert_eq!(std::fs::read_to_string(installed).unwrap(), candidate);
     assert_eq!(
-        std::fs::read_to_string(log).unwrap(),
-        "-V\n-T -\n-l\n-T -\n-\n"
+        std::fs::read_to_string(cronie.installed).unwrap(),
+        candidate
     );
+    assert_eq!(
+        std::fs::read_to_string(cronie.validated).unwrap(),
+        candidate
+    );
+    assert_eq!(
+        std::fs::read_to_string(cronie.validation_modes).unwrap(),
+        "600\n600\n"
+    );
+    let validation_paths = std::fs::read_to_string(cronie.validation_paths).unwrap();
+    let validation_paths = validation_paths
+        .lines()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    assert_eq!(validation_paths.len(), 2);
+    for path in &validation_paths {
+        assert_eq!(path.parent(), Some(other.path()));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(".light-agent-crontab-"));
+        assert!(name.ends_with(".part"));
+        assert!(!path.exists(), "validation file was not cleaned up");
+    }
+    let argv = std::fs::read_to_string(cronie.log).unwrap();
+    let lines = argv.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 5);
+    assert_eq!(lines[0], "-V");
+    assert_eq!(lines[1], format!("-T {}", validation_paths[0].display()));
+    assert_eq!(lines[2], "-l");
+    assert_eq!(lines[3], format!("-T {}", validation_paths[1].display()));
+    assert_eq!(lines[4], "-");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_crontab_validation_removes_the_owner_only_candidate_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = common::private_tempdir();
+    let executable = directory.path().join("rejecting-crontab");
+    let validation_path = directory.path().join("validation-path");
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  -T) printf '%s' \"$2\" > '{}'; exit 9 ;;\n  *) exit 0 ;;\nesac\n",
+            validation_path.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = SystemCrontabBackend::new(executable, directory.path().to_owned()).unwrap();
+
+    assert_eq!(
+        backend.validate("CRON_TZ=UTC\n0 0 * * * /bin/true\n").await,
+        Err(SchedulerError::Backend)
+    );
+    let candidate_path = PathBuf::from(std::fs::read_to_string(validation_path).unwrap());
+    assert!(!candidate_path.exists());
 }
 
 #[cfg(unix)]
@@ -767,17 +845,87 @@ async fn dropping_preflight_and_list_kills_and_reaps_hanging_crontab_children() 
     let dir = common::private_tempdir();
     let (executable, version_pid_path, list_pid_path) = hanging_crontab(dir.path());
 
-    let backend = SystemCrontabBackend::new(executable.clone()).unwrap();
+    let backend = SystemCrontabBackend::new(executable.clone(), dir.path().to_owned()).unwrap();
     let preflight = tokio::spawn(async move { backend.preflight().await });
     let version_pid = wait_for_pid_file(&version_pid_path).await;
     preflight.abort();
     let _ = preflight.await;
     assert_process_exits(version_pid).await;
 
-    let backend = SystemCrontabBackend::new(executable).unwrap();
+    let backend = SystemCrontabBackend::new(executable, dir.path().to_owned()).unwrap();
     let list = tokio::spawn(async move { backend.list().await });
     let list_pid = wait_for_pid_file(&list_pid_path).await;
     list.abort();
     let _ = list.await;
     assert_process_exits(list_pid).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_validation_kills_child_and_removes_candidate_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = common::private_tempdir();
+    let executable = directory.path().join("hanging-validation-crontab");
+    let child_pid_path = directory.path().join("validation.pid");
+    let candidate_path_record = directory.path().join("validation.path");
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  -T) printf '%s' \"$$\" > '{}'; printf '%s' \"$2\" > '{}'; exec sleep 30 ;;\n  *) exit 0 ;;\nesac\n",
+            child_pid_path.display(),
+            candidate_path_record.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = SystemCrontabBackend::new(executable, directory.path().to_owned()).unwrap();
+    let validation =
+        tokio::spawn(async move { backend.validate("CRON_TZ=UTC\n0 0 * * * /bin/true\n").await });
+    let child_pid = wait_for_pid_file(&child_pid_path).await;
+    let path_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let candidate_path = loop {
+        if let Ok(path) = std::fs::read_to_string(&candidate_path_record)
+            && !path.is_empty()
+        {
+            break PathBuf::from(path);
+        }
+        assert!(
+            tokio::time::Instant::now() < path_deadline,
+            "child never recorded its validation path"
+        );
+        tokio::task::yield_now().await;
+    };
+    assert!(candidate_path.exists());
+
+    validation.abort();
+    let _ = validation.await;
+    assert_process_exits(child_pid).await;
+    assert!(!candidate_path.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn real_cronie_path_validation_works_when_cronie_is_available() {
+    let executable = PathBuf::from("/usr/bin/crontab");
+    let Ok(version) = std::process::Command::new(&executable).arg("-V").output() else {
+        return;
+    };
+    let identity = format!(
+        "{}{}",
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&version.stderr)
+    )
+    .to_ascii_lowercase();
+    if !version.status.success() || !identity.contains("cronie") {
+        return;
+    }
+    let directory = common::private_tempdir();
+    let backend = SystemCrontabBackend::new(executable, directory.path().to_owned()).unwrap();
+    backend.preflight().await.unwrap();
+    backend
+        .validate("CRON_TZ=UTC\n0 0 * * * /bin/true\n")
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }

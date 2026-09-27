@@ -964,7 +964,8 @@ async fn reconciliation_timeout_kills_the_crontab_preflight_process() {
     let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(&executable, permissions).unwrap();
-    let backend = Arc::new(SystemCrontabBackend::new(executable).unwrap());
+    let backend =
+        Arc::new(SystemCrontabBackend::new(executable, directory.path().to_owned()).unwrap());
     let synchronizer = Arc::new(
         CronSynchronizer::new(
             fixture.store.clone(),

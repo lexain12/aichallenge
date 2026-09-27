@@ -48,10 +48,21 @@ Only Cronie is supported. Before allowing scheduled mutations, verify on the VM:
 
 ```bash
 /usr/bin/crontab -V
-printf 'HOME=/var/lib/light-agent\nCRON_TZ=UTC\n0 0 * * * /bin/true\n' | /usr/bin/crontab -T -
+sudo -u light-agent -H /bin/sh <<'LIGHT_AGENT_CRONIE_PREFLIGHT'
+set -eu
+umask 077
+validation_file=$(mktemp /var/lib/light-agent/.light-agent-crontab-preflight.XXXXXX)
+trap 'rm -f -- "$validation_file"' EXIT HUP INT TERM
+chmod 0600 "$validation_file"
+printf 'HOME=/var/lib/light-agent\nCRON_TZ=UTC\n0 0 * * * /bin/true\n' > "$validation_file"
+/usr/bin/crontab -T "$validation_file"
+LIGHT_AGENT_CRONIE_PREFLIGHT
 ```
 
 The version must identify Cronie and syntax validation must exit successfully.
+Cronie 1.7 requires `-T` to receive a regular file path; `-T -` is not a
+portable stdin form. The trap must remove the owner-only probe on success,
+failure, or interruption.
 Install and inspect only the `light-agent` account's crontab. The managed block
 sets `HOME=/var/lib/light-agent`, then emits a validated `CRON_TZ` and only:
 

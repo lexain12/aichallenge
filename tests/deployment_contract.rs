@@ -3,6 +3,7 @@ use deepseek_cli::scheduler::RUNTIME_HOME;
 const RUNBOOK: &str = include_str!("../deploy/light-agent/README.md");
 const SERVER_EXAMPLE: &str = include_str!("../light-agent.example.toml");
 const AUTHORIZED_KEY: &str = include_str!("../deploy/light-agent/authorized_keys.example");
+const GITIGNORE: &str = include_str!("../.gitignore");
 
 #[test]
 fn deployment_paths_make_fixed_commands_resolve_the_default_config() {
@@ -39,4 +40,18 @@ fn runbook_documents_owner_aware_recovery_and_reconciliation() {
     ] {
         assert!(RUNBOOK.contains(required), "runbook missing {required}");
     }
+}
+
+#[test]
+fn runbook_uses_a_cleaned_owner_only_file_for_cronie_validation() {
+    for required in [
+        "mktemp",
+        "chmod 0600",
+        "trap 'rm -f -- \"$validation_file\"'",
+        "/usr/bin/crontab -T \"$validation_file\"",
+    ] {
+        assert!(RUNBOOK.contains(required), "runbook missing {required}");
+    }
+    assert!(!RUNBOOK.contains("crontab -T -"));
+    assert!(GITIGNORE.contains("*.light-agent-crontab-*.part"));
 }

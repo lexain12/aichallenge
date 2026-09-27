@@ -18,3 +18,4 @@
 *.sqlite3-wal
 *.sqlite3-shm
 *.light-agent-export-*.part
+*.light-agent-crontab-*.part

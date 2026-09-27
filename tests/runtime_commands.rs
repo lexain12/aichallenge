@@ -118,7 +118,7 @@ fn sigterm_cancels_and_joins_cron_sync_sqlite_worker() {
     fs::write(
         &crontab,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n  -V) printf 'cronie 1.7.2\\n' ;;\n  -T) cat >/dev/null; touch '{}'; while [ ! -f '{}' ]; do sleep 0.01; done ;;\n  *) exit 9 ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\n  -V) printf 'cronie 1.7.2\\n' ;;\n  -T) [ \"$#\" -eq 2 ] && cat \"$2\" >/dev/null || exit 8; touch '{}'; while [ ! -f '{}' ]; do sleep 0.01; done ;;\n  *) exit 9 ;;\nesac\n",
             marker.display(),
             release.display(),
         ),

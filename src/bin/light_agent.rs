@@ -228,9 +228,23 @@ fn synchronizer(
     settings: &ServerSettings,
     store: Store,
 ) -> Result<Arc<CronSynchronizer>, AppError> {
+    let database_path = if settings.database_path().is_absolute() {
+        settings.database_path().to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| AppError::Scheduler)?
+            .join(settings.database_path())
+    };
+    let validation_directory = database_path
+        .parent()
+        .ok_or(AppError::Scheduler)?
+        .to_owned();
     let backend = Arc::new(
-        SystemCrontabBackend::new(settings.scheduler().crontab_binary().to_owned())
-            .map_err(|_| AppError::Scheduler)?,
+        SystemCrontabBackend::new(
+            settings.scheduler().crontab_binary().to_owned(),
+            validation_directory,
+        )
+        .map_err(|_| AppError::Scheduler)?,
     );
     CronSynchronizer::new(
         store,

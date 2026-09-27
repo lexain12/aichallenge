@@ -1,19 +1,23 @@
 # Day 18 verification results
 
-Date: 2026-09-26 (Europe/Moscow)
+Date: 2026-09-27 (Europe/Moscow)
 
-Status: local preflight Steps 1–5 passed. Live VM acceptance is pending
-explicit authorization and has not been performed. No VM connection, remote
-crontab change, SSH change, deployment, or reboot is claimed by this document.
+Status: local preflight Steps 1–5 passed. Read-only live Cronie discovery found
+and isolated a deployment blocker; mutating VM acceptance remains pending. No
+remote crontab change, SSH change, deployment, service change, or reboot is
+claimed by this document.
 
 ## Local deterministic verification
 
-All commands ran locally on 2026-09-26:
+Rust commands were rerun locally on 2026-09-27:
 
 - `cargo fmt --check`: passed;
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`: passed;
-- `cargo test --locked --all-targets --all-features`: 283 passed, 5 ignored,
+- `cargo test --locked --all-targets --all-features`: 297 passed, 5 ignored,
   0 failed;
+
+Python verification last ran locally on 2026-09-26:
+
 - `uv sync --frozen --project telegram_mcp --group dev`: audited 39 packages;
 - `uv run --project telegram_mcp --group dev pytest telegram_mcp/tests -q`:
   50 passed;
@@ -31,8 +35,19 @@ rendering evidence only; it is not evidence from a real VM.
 
 ## Live acceptance
 
-Pending authorization. The following ignored checks remain intentionally
-unexecuted during local preflight:
+Read-only discovery on the target Ubuntu 25.10 environment established that
+Cronie 1.7.2 is installed and that `crontab -V` succeeds. It also established
+that piping a candidate to `crontab -T -` fails with a bounded `premature EOF`
+diagnostic because this Cronie expects `-T <file>`. No candidate task text,
+address, credential, or other secret was recorded.
+
+The local backend and runbook now create an owner-only, fsynced temporary
+regular file, pass only its random path as the `-T` argument, and clean it up on
+success, failure, timeout, or cancellation. Deployment of that correction and
+the live path-form recheck remain pending; this document does not claim the VM
+has been fixed.
+
+The following ignored checks also remain intentionally unexecuted:
 
 - DeepSeek response without tools;
 - two-dialog SSH roundtrip;

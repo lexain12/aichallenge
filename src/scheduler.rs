@@ -2,7 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -420,15 +420,19 @@ pub trait CrontabBackend: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct SystemCrontabBackend {
     executable: PathBuf,
+    validation_directory: ValidationDirectory,
 }
 
 impl SystemCrontabBackend {
-    pub fn new(executable: PathBuf) -> Result<Self, SchedulerError> {
+    pub fn new(executable: PathBuf, validation_directory: PathBuf) -> Result<Self, SchedulerError> {
         validate_executable_path(&executable)?;
-        Ok(Self { executable })
+        Ok(Self {
+            executable,
+            validation_directory: ValidationDirectory::open(validation_directory)?,
+        })
     }
 
-    async fn feed(
+    async fn feed_stdin(
         &self,
         arguments: &[&str],
         input: &str,
@@ -454,6 +458,167 @@ impl SystemCrontabBackend {
             .wait_with_output()
             .await
             .map_err(|_| SchedulerError::Backend)
+    }
+
+    async fn validate_candidate(
+        &self,
+        candidate: &str,
+    ) -> Result<std::process::Output, SchedulerError> {
+        let validation = ValidationFile::create(&self.validation_directory, candidate)?;
+        let output = Command::new(&self.executable)
+            .arg("-T")
+            .arg(validation.path())
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await;
+        let cleanup = validation.cleanup();
+        let output = output.map_err(|_| SchedulerError::Backend)?;
+        cleanup?;
+        Ok(output)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ValidationDirectory {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl ValidationDirectory {
+    fn open(path: PathBuf) -> Result<Self, SchedulerError> {
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(SchedulerError::Backend)
+        }
+        #[cfg(unix)]
+        {
+            if !path.is_absolute() {
+                return Err(SchedulerError::InvalidPath);
+            }
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| SchedulerError::Backend)?;
+            if !metadata.is_dir()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o7777 != 0o700
+            {
+                return Err(SchedulerError::Backend);
+            }
+            Ok(Self {
+                path,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+    }
+
+    fn validate_identity(&self) -> Result<(), SchedulerError> {
+        #[cfg(not(unix))]
+        {
+            Err(SchedulerError::Backend)
+        }
+        #[cfg(unix)]
+        {
+            let metadata =
+                std::fs::symlink_metadata(&self.path).map_err(|_| SchedulerError::Backend)?;
+            if !metadata.is_dir()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o7777 != 0o700
+                || metadata.dev() != self.device
+                || metadata.ino() != self.inode
+            {
+                return Err(SchedulerError::Backend);
+            }
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ValidationFile {
+    path: Option<PathBuf>,
+}
+
+impl ValidationFile {
+    fn create(directory: &ValidationDirectory, candidate: &str) -> Result<Self, SchedulerError> {
+        directory.validate_identity()?;
+        for _ in 0..16 {
+            let name = format!(".light-agent-crontab-{}.part", uuid::Uuid::new_v4());
+            let path = directory.path.join(name);
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let mut file = match options.open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(SchedulerError::Backend),
+            };
+            let validation = Self {
+                path: Some(path.clone()),
+            };
+            if validate_validation_file(&file, &path).is_err()
+                || file.write_all(candidate.as_bytes()).is_err()
+                || file.sync_all().is_err()
+            {
+                return Err(SchedulerError::Backend);
+            }
+            return Ok(validation);
+        }
+        Err(SchedulerError::Backend)
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("validation path exists")
+    }
+
+    fn cleanup(mut self) -> Result<(), SchedulerError> {
+        let path = self.path.take().expect("validation path exists");
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(SchedulerError::Backend),
+        }
+    }
+}
+
+impl Drop for ValidationFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn validate_validation_file(file: &File, path: &Path) -> Result<(), SchedulerError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (file, path);
+        Err(SchedulerError::Backend)
+    }
+    #[cfg(unix)]
+    {
+        let metadata = file.metadata().map_err(|_| SchedulerError::Backend)?;
+        let path_metadata = std::fs::symlink_metadata(path).map_err(|_| SchedulerError::Backend)?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.dev() != path_metadata.dev()
+            || metadata.ino() != path_metadata.ino()
+        {
+            return Err(SchedulerError::Backend);
+        }
+        Ok(())
     }
 }
 
@@ -485,7 +650,7 @@ impl CrontabBackend for SystemCrontabBackend {
 
     fn validate<'a>(&'a self, candidate: &'a str) -> CrontabFuture<'a, ()> {
         Box::pin(async move {
-            let output = self.feed(&["-T", "-"], candidate).await?;
+            let output = self.validate_candidate(candidate).await?;
             output
                 .status
                 .success()
@@ -496,7 +661,7 @@ impl CrontabBackend for SystemCrontabBackend {
 
     fn install<'a>(&'a self, candidate: &'a str) -> CrontabFuture<'a, ()> {
         Box::pin(async move {
-            let output = self.feed(&["-"], candidate).await?;
+            let output = self.feed_stdin(&["-"], candidate).await?;
             output
                 .status
                 .success()
@@ -530,7 +695,7 @@ impl CrontabBackend for SystemCrontabBackend {
             }
             let probe = "CRON_TZ=UTC\n0 0 * * * /bin/true\n";
             let validated = self
-                .feed(&["-T", "-"], probe)
+                .validate_candidate(probe)
                 .await
                 .map_err(|_| SchedulerError::UnsupportedCron)?;
             validated
