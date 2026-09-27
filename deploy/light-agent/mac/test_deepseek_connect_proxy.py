@@ -4,8 +4,11 @@ import importlib.util
 import io
 import logging
 from pathlib import Path
+import queue
 import socket
+import socketserver
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr
 from unittest import mock
@@ -152,6 +155,149 @@ class ProxyTests(unittest.TestCase):
             with redirect_stderr(output):
                 server.handle_error(None, ("private-client", 1234))
         self.assertEqual(output.getvalue(), "")
+
+    def test_relay_keeps_response_moving_while_upload_is_backpressured(self):
+        client, proxy_client = socket.socketpair()
+        proxy_upstream, upstream = socket.socketpair()
+        proxy_upstream.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        client.settimeout(2)
+        upstream.settimeout(5)
+        upload = b"u" * (512 * 1024)
+        errors = []
+
+        def send_upload():
+            try:
+                client.sendall(upload)
+            except OSError as error:
+                errors.append(error)
+
+        def run_relay():
+            try:
+                self.proxy.relay(proxy_client, proxy_upstream)
+            except OSError as error:
+                errors.append(error)
+
+        sender = threading.Thread(target=send_upload, daemon=True)
+        worker = threading.Thread(
+            target=run_relay,
+            daemon=True,
+        )
+        try:
+            worker.start()
+            sender.start()
+            time.sleep(0.05)  # Let the upload fill the upstream send buffer.
+            upstream.sendall(b"reply")
+            reply = bytearray()
+            while len(reply) < 5:
+                reply.extend(client.recv(5 - len(reply)))
+            self.assertEqual(bytes(reply), b"reply")
+            received = bytearray()
+            while len(received) < len(upload):
+                chunk = upstream.recv(65536)
+                self.assertTrue(chunk)
+                received.extend(chunk)
+            sender.join(2)
+            self.assertFalse(sender.is_alive())
+            self.assertEqual(bytes(received), upload)
+            client.shutdown(socket.SHUT_WR)
+            self.assertEqual(upstream.recv(1), b"")
+            upstream.shutdown(socket.SHUT_WR)
+            self.assertEqual(client.recv(1), b"")
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+        finally:
+            for connection in (client, proxy_client, proxy_upstream, upstream):
+                connection.close()
+            sender.join(2)
+            worker.join(2)
+
+    def test_header_deadline_is_total_across_fragments(self):
+        clock = [0.0]
+        request = (
+            b"CONNECT api.deepseek.com:443 HTTP/1.1\r\n"
+            b"Host: api.deepseek.com:443\r\n\r\n"
+        )
+
+        class TrickleSocket:
+            def __init__(self):
+                self.remaining = request
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def recv(self, count):
+                clock[0] += 1.0
+                chunk, self.remaining = self.remaining[:1], self.remaining[1:]
+                return chunk
+
+        with mock.patch("time.monotonic", side_effect=lambda: clock[0]):
+            self.assertFalse(self.proxy.read_request(TrickleSocket()))
+
+    def test_header_deadline_rejects_a_late_final_fragment(self):
+        clock = [0.0]
+
+        class LateSocket:
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def recv(self, count):
+                clock[0] = 5.1
+                return (
+                    b"CONNECT api.deepseek.com:443 HTTP/1.1\r\n"
+                    b"Host: api.deepseek.com:443\r\n\r\n"
+                )
+
+        with mock.patch("time.monotonic", side_effect=lambda: clock[0]):
+            self.assertFalse(self.proxy.read_request(LateSocket()))
+
+    def test_server_caps_handlers_and_releases_capacity(self):
+        started = queue.Queue()
+        release = threading.Event()
+
+        class HoldingHandler(socketserver.BaseRequestHandler):
+            def handle(self):
+                started.put(None)
+                release.wait(10)
+
+        class LimitedServer(self.proxy.ProxyServer):
+            MAX_HANDLERS = 2
+
+        server = LimitedServer(("127.0.0.1", 0), HoldingHandler, bind_and_activate=False)
+        clients = []
+
+        def dispatch():
+            peer, request = socket.socketpair()
+            clients.append(peer)
+            server.process_request(request, ("local", 0))
+            return peer
+
+        try:
+            for _ in range(2):
+                dispatch()
+                started.get(timeout=1)
+            third = dispatch()
+            third.settimeout(0.5)
+            self.assertEqual(third.recv(1), b"")
+            self.assertTrue(started.empty())
+            release.set()
+            for connection in clients[:2]:
+                connection.close()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                fourth = dispatch()
+                try:
+                    started.get(timeout=0.1)
+                    break
+                except queue.Empty:
+                    fourth.close()
+            else:
+                self.fail("handler capacity was not released")
+        finally:
+            release.set()
+            for connection in clients:
+                connection.close()
+            server.server_close()
 
 
 if __name__ == "__main__":
