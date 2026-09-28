@@ -157,8 +157,10 @@ where
             .map_err(|_| ClientError::TransportClosed)
     }
 
-    pub async fn finish(mut self) -> Result<(), ClientError> {
-        let Some(mut child) = self.child.take() else {
+    pub async fn finish(self) -> Result<(), ClientError> {
+        let RemoteSession { writer, child, .. } = self;
+        drop(writer);
+        let Some(mut child) = child else {
             return Ok(());
         };
         let status = match tokio::time::timeout(SSH_EXIT_TIMEOUT, child.wait()).await {
@@ -173,5 +175,34 @@ where
         } else {
             Err(ClientError::SshExit)
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn finish_closes_child_stdin_before_waiting_for_exit() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "while IFS= read -r line; do :; done"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let reader = child.stdout.take().unwrap();
+        let writer = child.stdin.take().unwrap();
+        let mut session = RemoteSession {
+            reader: NdjsonReader::new(reader),
+            writer: NdjsonWriter::new(writer),
+            child: Some(child),
+        };
+
+        session.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), session.finish())
+            .await
+            .expect("child should exit promptly after stdin EOF")
+            .expect("child should exit successfully");
     }
 }
