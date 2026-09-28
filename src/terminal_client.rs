@@ -43,6 +43,7 @@ pub enum ClientAction {
     Job(JobId),
     Runs(JobId),
     Audit,
+    Permission(bool),
     Dump,
     Export(PathBuf),
 }
@@ -113,6 +114,11 @@ pub fn parse_terminal_input(input: &str) -> Result<ClientAction, ClientInputErro
             no_arguments()?;
             Ok(ClientAction::Audit)
         }
+        "/permission" => match rest {
+            "on" => Ok(ClientAction::Permission(true)),
+            "off" => Ok(ClientAction::Permission(false)),
+            _ => Err(ClientInputError::InvalidCommand),
+        },
         "/dump" => {
             no_arguments()?;
             Ok(ClientAction::Dump)
@@ -536,6 +542,10 @@ enum PendingRequest {
         confirmation_id: ConfirmationId,
         accepted: bool,
     },
+    Permission {
+        dialog_id: DialogId,
+        confirmation_required: bool,
+    },
     Inspection(InspectionAssembler),
     Export(AtomicExport),
 }
@@ -591,7 +601,23 @@ where
         ClientAction::Jobs => inspection_request(InspectKind::Jobs),
         ClientAction::Job(job_id) => inspection_request(InspectKind::Job { job_id }),
         ClientAction::Runs(job_id) => inspection_request(InspectKind::Runs { job_id }),
-        ClientAction::Audit => inspection_request(InspectKind::Audit),
+        ClientAction::Audit => {
+            let dialog_id = state.active_dialog.ok_or(ClientError::NoActiveDialog)?;
+            inspection_request(InspectKind::Audit { dialog_id })
+        }
+        ClientAction::Permission(confirmation_required) => {
+            let dialog_id = state.active_dialog.ok_or(ClientError::NoActiveDialog)?;
+            (
+                ClientRequest::SetDialogPermission {
+                    dialog_id,
+                    confirmation_required,
+                },
+                PendingRequest::Permission {
+                    dialog_id,
+                    confirmation_required,
+                },
+            )
+        }
         ClientAction::Dump => inspection_request(InspectKind::Dump),
         ClientAction::Export(path) => (
             ClientRequest::Export,
@@ -692,6 +718,24 @@ where
                 dialog_id,
                 escape_terminal_bounded(&title, MAX_LABEL_BYTES)
             );
+            output
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|_| ClientError::Output)?;
+            finished = true;
+        }
+        (
+            PendingRequest::Permission {
+                dialog_id: expected_dialog,
+                confirmation_required: expected_required,
+            },
+            ServerEvent::DialogPermissionChanged {
+                dialog_id,
+                confirmation_required,
+            },
+        ) if dialog_id == *expected_dialog && confirmation_required == *expected_required => {
+            let state = if confirmation_required { "on" } else { "off" };
+            let line = format!("permission {state} for dialog {dialog_id}\n");
             output
                 .write_all(line.as_bytes())
                 .await
@@ -820,7 +864,7 @@ where
         ) => {
             let records = assembler.push(kind, sequence, items, complete)?;
             for record in records {
-                let line = if assembler.kind == InspectKind::Audit {
+                let line = if matches!(assembler.kind, InspectKind::Audit { .. }) {
                     let separator = if assembler.record_sequence > 1 {
                         "----\n"
                     } else {

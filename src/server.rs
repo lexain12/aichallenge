@@ -513,6 +513,28 @@ impl StdioServer {
                     self.start_dialog_list(request_id, events, background, output)?;
                 }
             }
+            SetDialogPermission {
+                dialog_id,
+                confirmation_required,
+            } => match self
+                .dependencies
+                .store
+                .set_cron_confirmation_required(dialog_id, confirmation_required)
+            {
+                Ok(_) => queue_event(
+                    output,
+                    request_id,
+                    ServerEvent::DialogPermissionChanged {
+                        dialog_id,
+                        confirmation_required,
+                    },
+                    None,
+                )?,
+                Err(StoreError::NotFound) => {
+                    queue_error(output, request_id, ProtocolErrorCode::InvalidRequest)?
+                }
+                Err(_) => queue_error(output, request_id, ProtocolErrorCode::InternalError)?,
+            },
             SendMessage { dialog_id, message } => {
                 if message.len() > self.dependencies.settings.max_message_bytes() {
                     queue_error(output, request_id, ProtocolErrorCode::ContentTooLong)?;
@@ -1069,7 +1091,7 @@ fn inspect_query(kind: &InspectKind) -> InspectQuery {
         InspectKind::Jobs => InspectQuery::Jobs,
         InspectKind::Job { job_id } => InspectQuery::Job(*job_id),
         InspectKind::Runs { job_id } => InspectQuery::Runs(*job_id),
-        InspectKind::Audit => InspectQuery::Audit,
+        InspectKind::Audit { dialog_id } => InspectQuery::Audit(*dialog_id),
         InspectKind::Dump => InspectQuery::Dump,
     }
 }

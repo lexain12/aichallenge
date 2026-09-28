@@ -195,7 +195,7 @@ fn export_is_streamed_and_has_no_secret_or_raw_payload_fields() {
         .complete_turn(turn.turn_id, "ordinary answer")
         .unwrap();
     let service = InspectionService::new(store);
-    let audit = all_items(&service, InspectQuery::Audit);
+    let audit = all_items(&service, InspectQuery::Audit(dialog.id));
     assert_eq!(audit.len(), 1);
     assert_eq!(
         audit[0]["arguments"],
@@ -203,7 +203,11 @@ fn export_is_streamed_and_has_no_secret_or_raw_payload_fields() {
     );
     assert!(audit[0].get("call_id").is_none());
     assert!(
-        !format!("{:?}", service.inspect(InspectQuery::Audit).unwrap()).contains("private marker")
+        !format!(
+            "{:?}",
+            service.inspect(InspectQuery::Audit(dialog.id)).unwrap()
+        )
+        .contains("private marker")
     );
 
     let dump = all_items(&service, InspectQuery::Dump);
@@ -229,6 +233,99 @@ fn export_is_streamed_and_has_no_secret_or_raw_payload_fields() {
     }
     assert!(export.contains("opaque-call"));
     assert!(export.contains("tool_error"));
+}
+
+#[test]
+fn audit_is_scoped_to_one_dialog_and_includes_its_cron_runs() {
+    let dir = common::private_tempdir();
+    let store = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    let first = store.create_dialog("first").unwrap();
+    let second = store.create_dialog("second").unwrap();
+
+    let first_turn = store.begin_turn(first.id, "first question").unwrap();
+    let first_tool = store
+        .start_tool_run(ToolRunStart {
+            owner: ToolOwner::InteractiveTurn(first_turn.turn_id),
+            call_id: "first-interactive".into(),
+            server_name: "telegram".into(),
+            tool_name: "read_chat".into(),
+            read_only: true,
+            arguments: "{}".into(),
+        })
+        .unwrap();
+    store
+        .finish_tool_run(first_tool, ToolRunFinish::completed())
+        .unwrap();
+    store
+        .complete_turn(first_turn.turn_id, "first answer")
+        .unwrap();
+
+    let second_turn = store.begin_turn(second.id, "second question").unwrap();
+    let second_tool = store
+        .start_tool_run(ToolRunStart {
+            owner: ToolOwner::InteractiveTurn(second_turn.turn_id),
+            call_id: "second-interactive".into(),
+            server_name: "telegram".into(),
+            tool_name: "read_chat".into(),
+            read_only: true,
+            arguments: "{}".into(),
+        })
+        .unwrap();
+    store
+        .finish_tool_run(second_tool, ToolRunFinish::completed())
+        .unwrap();
+    store
+        .complete_turn(second_turn.turn_id, "second answer")
+        .unwrap();
+
+    let job = store
+        .create_job(JobCreate {
+            source_dialog_id: first.id,
+            name: "first cron".into(),
+            schedule: ScheduleSpec::parse_cron("0 9 * * *", Moscow).unwrap(),
+            prompt: "cron prompt".into(),
+        })
+        .unwrap();
+    store.mark_job_sync_applied(job.id).unwrap();
+    let RunClaim::Claimed(claim) = store
+        .claim_run(job.id, Utc.with_ymd_and_hms(2026, 9, 28, 6, 0, 0).unwrap())
+        .unwrap()
+    else {
+        panic!("expected claimed run")
+    };
+    let cron_tool = store
+        .start_tool_run(ToolRunStart {
+            owner: ToolOwner::CronRun(claim.run.id),
+            call_id: "first-cron".into(),
+            server_name: "telegram".into(),
+            tool_name: "list_chats".into(),
+            read_only: true,
+            arguments: "{}".into(),
+        })
+        .unwrap();
+    store
+        .finish_tool_run(cron_tool, ToolRunFinish::completed())
+        .unwrap();
+    store
+        .finish_run(claim.run.id, CronRunFinish::completed("done"))
+        .unwrap();
+
+    let audit = all_items(
+        &InspectionService::new(store),
+        InspectQuery::Audit(first.id),
+    );
+    assert_eq!(
+        audit
+            .iter()
+            .map(|record| record["id"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![first_tool, cron_tool]
+    );
+    assert!(
+        audit
+            .iter()
+            .all(|record| record["id"].as_i64() != Some(second_tool))
+    );
 }
 
 #[test]

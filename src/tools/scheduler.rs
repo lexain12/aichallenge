@@ -348,18 +348,24 @@ impl SchedulerToolExecutor {
         &self,
         action: CanonicalAction,
     ) -> Result<ToolExecutionResult, ToolExecutionError> {
-        let preview = action.preview();
-        let issued_at = self.clock.now();
-        let expires_at = issued_at + self.confirmation_timeout;
-        let request = ConfirmationRequest {
-            id: ConfirmationId::new(),
-            request_id: self.request_id,
-            action_hash: action_hash(self.request_id, &action)?,
-            preview,
-            expires_at,
+        let confirmation_required = match self.store.get_dialog(self.source_dialog_id) {
+            Ok(dialog) => dialog.cron_confirmation_required,
+            Err(_) => return Ok(safe_error("store_error")),
         };
-        if self.broker.confirm(request).await.is_err() || self.clock.now() >= expires_at {
-            return Ok(safe_error("confirmation_rejected"));
+        if confirmation_required {
+            let preview = action.preview();
+            let issued_at = self.clock.now();
+            let expires_at = issued_at + self.confirmation_timeout;
+            let request = ConfirmationRequest {
+                id: ConfirmationId::new(),
+                request_id: self.request_id,
+                action_hash: action_hash(self.request_id, &action)?,
+                preview,
+                expires_at,
+            };
+            if self.broker.confirm(request).await.is_err() || self.clock.now() >= expires_at {
+                return Ok(safe_error("confirmation_rejected"));
+            }
         }
 
         let (mutated, snapshot_bound) = match action {

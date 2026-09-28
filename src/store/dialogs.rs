@@ -8,6 +8,7 @@ use crate::domain::{DialogId, TurnId, TurnStatus};
 pub struct Dialog {
     pub id: DialogId,
     pub title: String,
+    pub cron_confirmation_required: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -50,6 +51,7 @@ impl Store {
         Ok(Dialog {
             id: DialogId::new(db.last_insert_rowid()).map_err(|_| StoreError::Database)?,
             title: title.into(),
+            cron_confirmation_required: true,
             created_at: timestamp.clone(),
             updated_at: timestamp,
         })
@@ -58,14 +60,15 @@ impl Store {
     pub fn list_dialogs(&self) -> Result<Vec<DialogSummary>, StoreError> {
         let db = self.connection()?;
         let mut statement =
-            db.prepare("SELECT id,title,created_at,updated_at FROM dialogs ORDER BY id")?;
+            db.prepare("SELECT id,title,cron_confirmation_required,created_at,updated_at FROM dialogs ORDER BY id")?;
         Ok(statement
             .query_map([], |r| {
                 Ok(Dialog {
                     id: DialogId::new(r.get(0)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
                     title: r.get(1)?,
-                    created_at: r.get(2)?,
-                    updated_at: r.get(3)?,
+                    cron_confirmation_required: r.get(2)?,
+                    created_at: r.get(3)?,
+                    updated_at: r.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -83,7 +86,7 @@ impl Store {
         let after = after.map(DialogId::get).unwrap_or(0);
         let db = self.connection()?;
         let mut statement = db.prepare(
-            "SELECT id,title,created_at,updated_at FROM dialogs
+            "SELECT id,title,cron_confirmation_required,created_at,updated_at FROM dialogs
              WHERE id > ?1 ORDER BY id LIMIT ?2",
         )?;
         Ok(statement
@@ -91,8 +94,9 @@ impl Store {
                 Ok(Dialog {
                     id: DialogId::new(row.get(0)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
                     title: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
+                    cron_confirmation_required: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -101,14 +105,15 @@ impl Store {
     pub fn get_dialog(&self, id: DialogId) -> Result<DialogSummary, StoreError> {
         let db = self.connection()?;
         db.query_row(
-            "SELECT id,title,created_at,updated_at FROM dialogs WHERE id=?1",
+            "SELECT id,title,cron_confirmation_required,created_at,updated_at FROM dialogs WHERE id=?1",
             [id.get()],
             |row| {
                 Ok(Dialog {
                     id: DialogId::new(row.get(0)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
                     title: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
+                    cron_confirmation_required: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
                 })
             },
         )
@@ -126,6 +131,23 @@ impl Store {
             return Err(StoreError::NotFound);
         }
         Ok(())
+    }
+
+    pub fn set_cron_confirmation_required(
+        &self,
+        id: DialogId,
+        required: bool,
+    ) -> Result<Dialog, StoreError> {
+        let db = self.connection()?;
+        if db.execute(
+            "UPDATE dialogs SET cron_confirmation_required=?2,updated_at=?3 WHERE id=?1",
+            params![id.get(), required, now()],
+        )? == 0
+        {
+            return Err(StoreError::NotFound);
+        }
+        drop(db);
+        self.get_dialog(id)
     }
 
     pub fn delete_dialog(&self, id: DialogId) -> Result<(), StoreError> {

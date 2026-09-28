@@ -321,15 +321,18 @@ impl Store {
                         tx.execute_batch(SCHEMA_V3)?;
                         tx.execute_batch(SCHEMA_V4)?;
                         tx.execute_batch(SCHEMA_V5)?;
+                        tx.execute_batch(SCHEMA_V6)?;
                     }
                     [2] => {
                         tx.execute_batch(SCHEMA_V3)?;
                         tx.execute_batch(SCHEMA_V4)?;
                         tx.execute_batch(SCHEMA_V5)?;
+                        tx.execute_batch(SCHEMA_V6)?;
                     }
-                    [3] => { tx.execute_batch(SCHEMA_V4)?; tx.execute_batch(SCHEMA_V5)?; }
-                    [4] => tx.execute_batch(SCHEMA_V5)?,
-                    [5] => {}
+                    [3] => { tx.execute_batch(SCHEMA_V4)?; tx.execute_batch(SCHEMA_V5)?; tx.execute_batch(SCHEMA_V6)?; }
+                    [4] => { tx.execute_batch(SCHEMA_V5)?; tx.execute_batch(SCHEMA_V6)?; }
+                    [5] => tx.execute_batch(SCHEMA_V6)?,
+                    [6] => {}
                     _ => return Err(StoreError::UnsupportedSchema),
                 }
             } else {
@@ -346,6 +349,7 @@ impl Store {
                 tx.execute_batch(SCHEMA_V3)?;
                 tx.execute_batch(SCHEMA_V4)?;
                 tx.execute_batch(SCHEMA_V5)?;
+                tx.execute_batch(SCHEMA_V6)?;
             }
             Ok(())
         })?;
@@ -1033,6 +1037,11 @@ UPDATE schema_version SET version=4;
 const SCHEMA_V5: &str = "
 ALTER TABLE tool_runs ADD COLUMN arguments TEXT;
 UPDATE schema_version SET version=5;
+";
+
+const SCHEMA_V6: &str = "
+ALTER TABLE dialogs ADD COLUMN cron_confirmation_required INTEGER NOT NULL DEFAULT 1 CHECK(cron_confirmation_required IN (0,1));
+UPDATE schema_version SET version=6;
 ";
 
 #[cfg(all(test, unix))]

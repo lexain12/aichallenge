@@ -154,6 +154,7 @@ fn v4_audit_rows_migrate_with_missing_arguments() {
         .unwrap();
     db.execute_batch(
         "ALTER TABLE tool_runs DROP COLUMN arguments;
+         ALTER TABLE dialogs DROP COLUMN cron_confirmation_required;
          UPDATE schema_version SET version=4;",
     )
     .unwrap();
@@ -265,6 +266,7 @@ fn v3_migration_backfills_pending_tool_runtime_owner_from_parent() {
         "DROP INDEX pending_tools_by_runtime_owner;
          ALTER TABLE tool_runs DROP COLUMN arguments;
          ALTER TABLE tool_runs DROP COLUMN runtime_owner_id;
+         ALTER TABLE dialogs DROP COLUMN cron_confirmation_required;
          UPDATE schema_version SET version=3;",
     )
     .unwrap();
@@ -293,6 +295,7 @@ fn v3_migration_terminalizes_pending_tool_without_a_live_owned_parent() {
         "DROP INDEX pending_tools_by_runtime_owner;
          ALTER TABLE tool_runs DROP COLUMN arguments;
          ALTER TABLE tool_runs DROP COLUMN runtime_owner_id;
+         ALTER TABLE dialogs DROP COLUMN cron_confirmation_required;
          UPDATE schema_version SET version=3;",
     )
     .unwrap();

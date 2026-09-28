@@ -735,6 +735,9 @@ protected as secret material.
 
 The terminal client supports multiple dialogs and the read-only views used by
 `/dialogs`, `/history`, `/jobs`, `/job`, `/runs`, `/audit`, and `/dump`.
+`/audit` requires an active dialog and returns only its interactive tool calls
+plus tool calls from cron jobs created by that dialog. There is no global audit
+view in the remote client.
 `/export <local-path>` streams a bounded JSONL export to the Mac, verifies byte
 count and SHA-256 incrementally, fsyncs, and atomically renames only after a
 complete transfer. The local path is never sent to the server.
@@ -749,9 +752,12 @@ It accepts only one bounded read statement and must not be exposed through the
 SSH forced command. Prefer logical `/dump` or `/export` for ordinary inspection.
 
 Schedule create/update/enable/disable/delete requests require an explicit,
-terminal-safe confirmation showing the action, job identity, name, schedule,
-timezone, and full task text. An unanswered or expired confirmation must not
-mutate SQLite or the crontab.
+terminal-safe confirmation by default. `/permission off` disables those
+confirmation prompts only for the active dialog; `/permission on` restores
+them. The setting is persisted per dialog, and new or migrated dialogs default
+to `on`. When enabled, the prompt shows the action, job identity, name,
+schedule, timezone, and full task text. An unanswered or expired confirmation
+must not mutate SQLite or the crontab.
 
 ## Backup and restore
 

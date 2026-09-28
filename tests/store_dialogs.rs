@@ -15,7 +15,7 @@ fn setup() -> (TempDir, Store, Connection) {
 }
 
 #[test]
-fn migration_creates_exact_v5_schema() {
+fn migration_creates_exact_v6_schema() {
     let (dir, store, db) = setup();
     let tables: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
         .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
@@ -37,7 +37,7 @@ fn migration_creates_exact_v5_schema() {
         db.query_row("SELECT version FROM schema_version", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        5
+        6
     );
     assert_eq!(
         db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
@@ -48,6 +48,68 @@ fn migration_creates_exact_v5_schema() {
     chrono::DateTime::parse_from_rfc3339(&d.created_at).unwrap();
     let reopened = Store::open(dir.path().join("agent.sqlite")).unwrap();
     assert_eq!(reopened.list_dialogs().unwrap()[0].id, d.id);
+}
+
+#[test]
+fn cron_confirmation_permission_defaults_on_and_persists_per_dialog() {
+    let (dir, store, _) = setup();
+    let first = store.create_dialog("first").unwrap();
+    let second = store.create_dialog("second").unwrap();
+    assert!(first.cron_confirmation_required);
+    assert!(second.cron_confirmation_required);
+
+    let updated = store
+        .set_cron_confirmation_required(first.id, false)
+        .unwrap();
+    assert!(!updated.cron_confirmation_required);
+    assert!(
+        !store
+            .get_dialog(first.id)
+            .unwrap()
+            .cron_confirmation_required
+    );
+    assert!(
+        store
+            .get_dialog(second.id)
+            .unwrap()
+            .cron_confirmation_required
+    );
+
+    drop(store);
+    let reopened = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    assert!(
+        !reopened
+            .get_dialog(first.id)
+            .unwrap()
+            .cron_confirmation_required
+    );
+    assert!(
+        reopened
+            .get_dialog(second.id)
+            .unwrap()
+            .cron_confirmation_required
+    );
+}
+
+#[test]
+fn v5_dialogs_migrate_with_cron_confirmation_enabled() {
+    let (dir, store, db) = setup();
+    let dialog = store.create_dialog("legacy").unwrap();
+    db.execute_batch(
+        "ALTER TABLE dialogs DROP COLUMN cron_confirmation_required;
+         UPDATE schema_version SET version=5;",
+    )
+    .unwrap();
+    drop(db);
+    drop(store);
+
+    let reopened = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    assert!(
+        reopened
+            .get_dialog(dialog.id)
+            .unwrap()
+            .cron_confirmation_required
+    );
 }
 
 #[cfg(unix)]
@@ -464,7 +526,7 @@ fn incompatible_schemas_and_memory_databases_are_rejected() {
         Err(StoreError::InvalidPath)
     ));
     let (_new_dir, _store, db) = setup();
-    db.execute("UPDATE schema_version SET version=6", [])
+    db.execute("UPDATE schema_version SET version=7", [])
         .unwrap();
     // A future version must not be silently downgraded.
     assert!(matches!(

@@ -128,6 +128,14 @@ fn terminal_commands_parse_strictly() {
         ClientAction::Runs(_)
     ));
     assert_eq!(parse_terminal_input("/audit").unwrap(), ClientAction::Audit);
+    assert_eq!(
+        parse_terminal_input("/permission on").unwrap(),
+        ClientAction::Permission(true)
+    );
+    assert_eq!(
+        parse_terminal_input("/permission off").unwrap(),
+        ClientAction::Permission(false)
+    );
     assert_eq!(parse_terminal_input("/dump").unwrap(), ClientAction::Dump);
     assert_eq!(
         parse_terminal_input("/export /tmp/state.jsonl").unwrap(),
@@ -146,6 +154,9 @@ fn terminal_commands_parse_strictly() {
         "/job nope",
         "/runs",
         "/audit extra",
+        "/permission",
+        "/permission yes",
+        "/permission off extra",
         "/dump extra",
         "/export",
         "/exit now",
@@ -156,6 +167,69 @@ fn terminal_commands_parse_strictly() {
             "accepted {invalid:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn permission_command_updates_the_active_dialog_and_renders_state() {
+    let (client_wire, server_wire) = tokio::io::duplex(64 * 1024);
+    let (client_read, client_write) = tokio::io::split(client_wire);
+    let session = RemoteSession::from_streams(client_read, client_write);
+    let (mut user, client_input) = tokio::io::duplex(4096);
+    let output = SharedWriter::default();
+    let output_view = output.clone();
+    let client = tokio::spawn(TerminalClient::run(
+        session,
+        client_input,
+        output,
+        SharedWriter::default(),
+    ));
+    let (server_read, server_write) = tokio::io::split(server_wire);
+    let mut requests = NdjsonReader::new(server_read);
+    let mut events = NdjsonWriter::new(server_write);
+    events
+        .write_event(&envelope(RequestId::new(), ServerEvent::Hello))
+        .await
+        .unwrap();
+
+    let dialog_id = DialogId::new(7).unwrap();
+    user.write_all(b"/open 7\n").await.unwrap();
+    let open = requests.read_request().await.unwrap().unwrap();
+    events
+        .write_event(&envelope(
+            open.request_id,
+            ServerEvent::DialogOpened {
+                dialog_id,
+                title: "dialog".into(),
+            },
+        ))
+        .await
+        .unwrap();
+
+    user.write_all(b"/permission off\n").await.unwrap();
+    let permission = requests.read_request().await.unwrap().unwrap();
+    assert_eq!(
+        permission.request,
+        ClientRequest::SetDialogPermission {
+            dialog_id,
+            confirmation_required: false,
+        }
+    );
+    events
+        .write_event(&envelope(
+            permission.request_id,
+            ServerEvent::DialogPermissionChanged {
+                dialog_id,
+                confirmation_required: false,
+            },
+        ))
+        .await
+        .unwrap();
+    wait_for_text(&output_view, "permission off for dialog 7").await;
+
+    user.write_all(b"/exit\n").await.unwrap();
+    user.shutdown().await.unwrap();
+    drop(events);
+    assert_eq!(client.await.unwrap(), Ok(()));
 }
 
 #[test]
@@ -479,8 +553,8 @@ async fn confirmation_and_fragmented_inspection_use_originating_request() {
     assert!(matches!(
         audit.request,
         ClientRequest::Inspect {
-            kind: InspectKind::Audit
-        }
+            kind: InspectKind::Audit { dialog_id }
+        } if dialog_id == DialogId::new(1).unwrap()
     ));
     let mut audit_sequence = 0_u64;
     for (index, record) in [
@@ -491,7 +565,7 @@ async fn confirmation_and_fragmented_inspection_use_originating_request() {
         let chunks: Vec<_> = if index == 0 { bytes.chunks(17).collect() } else { vec![bytes.as_slice()] };
         for (fragment_sequence, chunk) in chunks.iter().enumerate() {
             let fragment = serde_json::json!({"record_fragment": {"record_sequence": index, "fragment_sequence": fragment_sequence, "complete": fragment_sequence + 1 == chunks.len(), "encoding": "base64", "data": base64::engine::general_purpose::STANDARD.encode(chunk)}});
-            events.write_event(&envelope(audit.request_id, ServerEvent::InspectionResult { kind: InspectKind::Audit, sequence: audit_sequence, items: vec![fragment], complete: false })).await.unwrap();
+            events.write_event(&envelope(audit.request_id, ServerEvent::InspectionResult { kind: InspectKind::Audit { dialog_id: DialogId::new(1).unwrap() }, sequence: audit_sequence, items: vec![fragment], complete: false })).await.unwrap();
             audit_sequence += 1;
         }
     }
@@ -499,7 +573,9 @@ async fn confirmation_and_fragmented_inspection_use_originating_request() {
         .write_event(&envelope(
             audit.request_id,
             ServerEvent::InspectionResult {
-                kind: InspectKind::Audit,
+                kind: InspectKind::Audit {
+                    dialog_id: DialogId::new(1).unwrap(),
+                },
                 sequence: audit_sequence,
                 items: vec![],
                 complete: true,

@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 
 use crate::domain::{ConfirmationId, DialogId, JobId, RequestId};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_LINE_BYTES: usize = 1_048_576;
 pub const MAX_CONTENT_BYTES: usize = 262_144;
 pub const EXPORT_CHUNK_BYTES: usize = 65_536;
@@ -107,6 +107,10 @@ pub enum ClientRequest {
     DeleteDialog {
         dialog_id: DialogId,
     },
+    SetDialogPermission {
+        dialog_id: DialogId,
+        confirmation_required: bool,
+    },
     SendMessage {
         dialog_id: DialogId,
         message: String,
@@ -140,7 +144,9 @@ pub enum InspectKind {
     Runs {
         job_id: JobId,
     },
-    Audit,
+    Audit {
+        dialog_id: DialogId,
+    },
     Dump,
 }
 
@@ -200,6 +206,10 @@ pub enum ServerEvent {
     DialogOpened {
         dialog_id: DialogId,
         title: String,
+    },
+    DialogPermissionChanged {
+        dialog_id: DialogId,
+        confirmation_required: bool,
     },
     ResponseStarted {
         dialog_id: DialogId,
@@ -270,6 +280,14 @@ impl std::fmt::Debug for ServerEvent {
                 .debug_struct("DialogOpened")
                 .field("dialog_id", dialog_id)
                 .field("title", title)
+                .finish(),
+            Self::DialogPermissionChanged {
+                dialog_id,
+                confirmation_required,
+            } => f
+                .debug_struct("DialogPermissionChanged")
+                .field("dialog_id", dialog_id)
+                .field("confirmation_required", confirmation_required)
                 .finish(),
             Self::ResponseStarted { dialog_id } => f
                 .debug_struct("ResponseStarted")

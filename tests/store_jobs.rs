@@ -34,6 +34,7 @@ fn v1_database_migrates_jobs_and_runs_without_losing_dialogs() {
          DROP TABLE runtime_coordination;
          DROP TABLE cron_runs;
          DROP TABLE cron_jobs;
+         ALTER TABLE dialogs DROP COLUMN cron_confirmation_required;
          UPDATE schema_version SET version=1;",
     )
     .unwrap();
@@ -47,7 +48,13 @@ fn v1_database_migrates_jobs_and_runs_without_losing_dialogs() {
             .query_row("SELECT version FROM schema_version", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        5
+        6
+    );
+    assert!(
+        migrated
+            .get_dialog(dialog)
+            .unwrap()
+            .cron_confirmation_required
     );
     migrated.create_job(recurring(dialog)).unwrap();
 }

@@ -30,7 +30,9 @@ fn inspection_event_and_envelope_debug_hide_fragment_payloads() {
     let marker = "PLAINTEXT_AUDIT_ARGUMENT_MARKER_6371";
     let encoded = base64::engine::general_purpose::STANDARD.encode(marker);
     let event = ServerEvent::InspectionResult {
-        kind: InspectKind::Audit,
+        kind: InspectKind::Audit {
+            dialog_id: dialog_id(),
+        },
         sequence: 7,
         items: vec![
             json!({"record_fragment":{"data":encoded,"complete":true},"unsafe_preview":marker}),
@@ -71,6 +73,10 @@ fn round_trips_every_request_and_event() {
         },
         ClientRequest::DeleteDialog {
             dialog_id: dialog_id(),
+        },
+        ClientRequest::SetDialogPermission {
+            dialog_id: dialog_id(),
+            confirmation_required: false,
         },
         ClientRequest::SendMessage {
             dialog_id: dialog_id(),
@@ -113,6 +119,10 @@ fn round_trips_every_request_and_event() {
         ServerEvent::DialogOpened {
             dialog_id: dialog_id(),
             title: "Work".into(),
+        },
+        ServerEvent::DialogPermissionChanged {
+            dialog_id: dialog_id(),
+            confirmation_required: false,
         },
         ServerEvent::ResponseStarted {
             dialog_id: dialog_id(),
@@ -310,12 +320,12 @@ async fn inspection_pages_cover_more_than_one_mib() {
 #[tokio::test]
 async fn rejects_unknown_fields_and_types() {
     let cases = [
-        json!({"protocol_version": 1, "request_id": request_id(), "request": {"type": "list_dialogs"}, "ignored": true}),
-        json!({"protocol_version": 1, "request_id": request_id(), "request": {"type": "send_message", "dialog_id": 1, "message": "Hi", "path": "/tmp/x"}}),
-        json!({"protocol_version": 1, "request_id": request_id(), "request": {"type": "export", "path": "/tmp/x"}}),
-        json!({"protocol_version": 1, "request_id": request_id(), "request": {"type": "unknown"}}),
-        json!({"protocol_version": "1", "request_id": request_id(), "request": {"type": "list_dialogs"}}),
-        json!({"protocol_version": 1, "request_id": request_id(), "request": {"type": "open_dialog", "dialog_id": 0}}),
+        json!({"protocol_version": 2, "request_id": request_id(), "request": {"type": "list_dialogs"}, "ignored": true}),
+        json!({"protocol_version": 2, "request_id": request_id(), "request": {"type": "send_message", "dialog_id": 1, "message": "Hi", "path": "/tmp/x"}}),
+        json!({"protocol_version": 2, "request_id": request_id(), "request": {"type": "export", "path": "/tmp/x"}}),
+        json!({"protocol_version": 2, "request_id": request_id(), "request": {"type": "unknown"}}),
+        json!({"protocol_version": "2", "request_id": request_id(), "request": {"type": "list_dialogs"}}),
+        json!({"protocol_version": 2, "request_id": request_id(), "request": {"type": "open_dialog", "dialog_id": 0}}),
     ];
     for value in cases {
         let line = format!("{value}\n");
@@ -331,7 +341,7 @@ async fn rejects_unknown_fields_and_types() {
 async fn rejects_version_mismatch_before_dispatch() {
     let line = format!(
         "{}\n",
-        json!({"protocol_version": 2, "request_id": request_id(), "request": {"type": "list_dialogs"}})
+        json!({"protocol_version": 3, "request_id": request_id(), "request": {"type": "list_dialogs"}})
     );
     let error = NdjsonReader::new(line.as_bytes())
         .read_request()

@@ -430,6 +430,45 @@ async fn dialog_crud_round_trip() {
 }
 
 #[tokio::test]
+async fn dialog_permission_update_is_persisted_only_for_the_target_dialog() {
+    let fixture = Fixture::new(FakeProvider::new([]));
+    let first = fixture.store.create_dialog("first").unwrap();
+    let second = fixture.store.create_dialog("second").unwrap();
+    let store = fixture.store.clone();
+    let mut session = Session::start(fixture.server).await;
+    session.event().await;
+
+    session
+        .send(
+            req(),
+            ClientRequest::SetDialogPermission {
+                dialog_id: first.id,
+                confirmation_required: false,
+            },
+        )
+        .await;
+    assert_eq!(
+        session.event().await.event,
+        ServerEvent::DialogPermissionChanged {
+            dialog_id: first.id,
+            confirmation_required: false,
+        }
+    );
+    assert!(
+        !store
+            .get_dialog(first.id)
+            .unwrap()
+            .cron_confirmation_required
+    );
+    assert!(
+        store
+            .get_dialog(second.id)
+            .unwrap()
+            .cron_confirmation_required
+    );
+}
+
+#[tokio::test]
 async fn send_streams_events_and_commits_answer() {
     let fixture = Fixture::new(FakeProvider::new([Reply::Final("answer".into())]));
     let dialog = fixture.store.create_dialog("chat").unwrap().id;

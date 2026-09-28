@@ -489,6 +489,30 @@ async fn mutation_waits_for_matching_confirmation() {
 }
 
 #[tokio::test]
+async fn dialog_permission_off_applies_mutation_without_requesting_confirmation() {
+    let fixture = Fixture::new(FakeBackend::success());
+    fixture
+        .store
+        .set_cron_confirmation_required(fixture.source_dialog_id, false)
+        .unwrap();
+    let broker = ImmediateBroker::rejecting(ConfirmationError::Rejected);
+    let executor = fixture.executor(broker.clone(), request(REQUEST_A));
+
+    let result = executor
+        .call(&call(
+            "cron__create",
+            create_arguments("task without confirmation"),
+        ))
+        .await
+        .unwrap();
+
+    assert!(!result.is_error);
+    assert!(broker.requests.lock().unwrap().is_empty());
+    assert_eq!(fixture.store.list_jobs().unwrap().len(), 1);
+    assert_eq!(fixture.backend.installed.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn rejection_changes_no_state() {
     assert_confirmation_error_changes_no_state(ConfirmationError::Rejected).await;
 }

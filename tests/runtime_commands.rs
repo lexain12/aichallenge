@@ -236,7 +236,7 @@ crontab_binary = "/usr/bin/crontab"
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 1, "{stdout}");
     let event: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(event["protocol_version"], 1);
+    assert_eq!(event["protocol_version"], 2);
     assert_eq!(event["event"]["type"], "hello");
 }
 

@@ -1,8 +1,9 @@
 # Day 18 light agent
 
 Day 18 is a small remote agent: DeepSeek streaming, bounded tool calling, MCP,
-multiple durable dialogs, and confirmed cron jobs. The agent runs on a VM over a
-forced-command SSH stdio session; the interactive terminal client runs on macOS.
+multiple durable dialogs, and cron jobs with per-dialog confirmation policy.
+The agent runs on a VM over a forced-command SSH stdio session; the interactive
+terminal client runs on macOS.
 There is no TCP listener, daemon mode, compaction layer, or hidden background
 conversation process.
 

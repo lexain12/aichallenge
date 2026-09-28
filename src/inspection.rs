@@ -42,7 +42,7 @@ pub enum InspectQuery {
     Jobs,
     Job(JobId),
     Runs(JobId),
-    Audit,
+    Audit(DialogId),
     Dump,
 }
 
@@ -53,7 +53,7 @@ enum CursorScope {
     Jobs,
     Job(JobId),
     Runs(JobId),
-    Audit,
+    Audit(DialogId),
     Dump,
 }
 
@@ -65,7 +65,7 @@ impl From<&InspectQuery> for CursorScope {
             InspectQuery::Jobs => Self::Jobs,
             InspectQuery::Job(id) => Self::Job(*id),
             InspectQuery::Runs(id) => Self::Runs(*id),
-            InspectQuery::Audit => Self::Audit,
+            InspectQuery::Audit(id) => Self::Audit(*id),
             InspectQuery::Dump => Self::Dump,
         }
     }
@@ -844,7 +844,7 @@ fn read_snapshot_page(
                 Ok(rows)
             }
             InspectQuery::Runs(job_id) => query_runs(db, job_id, *offset, page_size + 1),
-            InspectQuery::Audit => query_audit(db, *offset, page_size + 1),
+            InspectQuery::Audit(dialog_id) => query_audit(db, dialog_id, *offset, page_size + 1),
             InspectQuery::Dump => query_dump(db, *offset, page_size + 1),
         })(),
     )?;
@@ -1084,11 +1084,38 @@ fn query_runs(
         .collect()
 }
 
-fn query_audit(db: &Connection, offset: u64, limit: usize) -> Result<Vec<Value>, InspectionError> {
+fn query_audit(
+    db: &Connection,
+    dialog_id: DialogId,
+    offset: u64,
+    limit: usize,
+) -> Result<Vec<Value>, InspectionError> {
+    let exists: bool = map_db(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM dialogs WHERE id=?1)",
+        [dialog_id.get()],
+        |row| row.get(0),
+    ))?;
+    if !exists {
+        return Err(StoreError::NotFound.into());
+    }
     let (limit, offset) = limit_offset(limit, offset)?;
-    let mut statement =
-        map_db(db.prepare("SELECT id FROM tool_runs ORDER BY id LIMIT ?1 OFFSET ?2"))?;
-    let ids = map_db(statement.query_map(params![limit, offset], |row| row.get::<_, i64>(0)))?;
+    let mut statement = map_db(db.prepare(
+        "SELECT tr.id
+         FROM tool_runs tr
+         LEFT JOIN turns t
+           ON tr.owner_kind='interactive_turn' AND tr.owner_id=t.id
+         LEFT JOIN cron_runs r
+           ON tr.owner_kind='cron_run' AND tr.owner_id=r.id
+         LEFT JOIN cron_jobs j ON r.job_id=j.id
+         WHERE (tr.owner_kind='interactive_turn' AND t.dialog_id=?1)
+            OR (tr.owner_kind='cron_run' AND j.source_dialog_id=?1)
+         ORDER BY tr.id LIMIT ?2 OFFSET ?3",
+    ))?;
+    let ids = map_db(
+        statement.query_map(params![dialog_id.get(), limit, offset], |row| {
+            row.get::<_, i64>(0)
+        }),
+    )?;
     map_db(ids.collect::<rusqlite::Result<Vec<_>>>())?
         .into_iter()
         .map(|id| load_tool_run(db, id, true))
