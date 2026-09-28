@@ -22,6 +22,7 @@ fn start(owner: ToolOwner, read_only: bool) -> ToolRunStart {
         server_name: "telegram".into(),
         tool_name: "get_messages".into(),
         read_only,
+        arguments: "{}".into(),
     }
 }
 
@@ -36,9 +37,11 @@ fn complete_work(store: &Store, owner: ToolOwner, audit_id: i64) {
 }
 
 #[test]
-fn tool_run_stores_route_status_and_read_only_but_no_arguments() {
+fn tool_run_stores_complete_object_arguments() {
     let (_dir, store, db, owner) = setup();
-    let id = store.start_tool_run(start(owner, true)).unwrap();
+    let mut request = start(owner, true);
+    request.arguments = "{ \"chat_id\": \"private marker\" }".into();
+    let id = store.start_tool_run(request).unwrap();
     store
         .finish_tool_run(id, ToolRunFinish::completed())
         .unwrap();
@@ -51,6 +54,11 @@ fn tool_run_stores_route_status_and_read_only_but_no_arguments() {
     assert!(rows[0].read_only);
     assert_eq!(rows[0].status, ToolRunStatus::Completed);
     assert_eq!(rows[0].safe_error_code, None);
+    assert_eq!(
+        rows[0].arguments.as_deref(),
+        Some("{ \"chat_id\": \"private marker\" }")
+    );
+    assert!(!format!("{:?}", rows[0]).contains("private marker"));
     chrono::DateTime::parse_from_rfc3339(&rows[0].started_at).unwrap();
     chrono::DateTime::parse_from_rfc3339(rows[0].finished_at.as_ref().unwrap()).unwrap();
     let columns: Vec<String> = db
@@ -74,12 +82,51 @@ fn tool_run_stores_route_status_and_read_only_but_no_arguments() {
             "safe_error_code",
             "started_at",
             "finished_at",
-            "runtime_owner_id"
+            "runtime_owner_id",
+            "arguments"
         ]
     );
-    for forbidden in ["argument", "hash", "result", "url", "raw_error"] {
+    for forbidden in ["hash", "result", "url", "raw_error"] {
         assert!(columns.iter().all(|c| !c.contains(forbidden)));
     }
+}
+
+#[test]
+fn invalid_arguments_are_rejected_without_an_audit_row_or_raw_error() {
+    let (_dir, store, _db, owner) = setup();
+    for bad in ["broken private marker", "[]", "null", &"x".repeat(524_289)] {
+        let mut request = start(owner, true);
+        request.arguments = bad.into();
+        assert!(!format!("{request:?}").contains(bad));
+        let error = store.start_tool_run(request).unwrap_err();
+        assert_eq!(error, StoreError::InvalidMetadata);
+        assert!(!format!("{error:?}").contains("private marker"));
+        assert!(store.list_tool_runs().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn argument_limit_counts_utf8_bytes_and_accepts_exact_boundary() {
+    let (_dir, store, _db, owner) = setup();
+    let raw = format!("{{\"v\":\"{}\"}}", "é".repeat((524_288 - 8) / 2));
+    assert_eq!(raw.len(), 524_288);
+    let mut at_limit = start(owner, true);
+    at_limit.arguments = raw.clone();
+    store.start_tool_run(at_limit).unwrap();
+    assert_eq!(
+        store.list_tool_runs().unwrap()[0].arguments.as_deref(),
+        Some(raw.as_str())
+    );
+
+    let mut over_limit = start(owner, true);
+    over_limit.call_id = "too_large".into();
+    over_limit.arguments = format!("{{\"v\":\"{}x\"}}", "é".repeat((524_288 - 8) / 2));
+    assert_eq!(over_limit.arguments.len(), 524_289);
+    assert_eq!(
+        store.start_tool_run(over_limit),
+        Err(StoreError::InvalidMetadata)
+    );
+    assert_eq!(store.list_tool_runs().unwrap().len(), 1);
 }
 
 #[test]
@@ -96,6 +143,25 @@ fn terminal_audit_status_is_visible_after_reopening_the_database() {
     let audit = &reopened.list_tool_runs().unwrap()[0];
     assert_eq!(audit.status, ToolRunStatus::Failed);
     assert_eq!(audit.safe_error_code, Some(SafeErrorCode::ToolError));
+}
+
+#[test]
+fn v4_audit_rows_migrate_with_missing_arguments() {
+    let (dir, store, db, owner) = setup();
+    let id = store.start_tool_run(start(owner, true)).unwrap();
+    store
+        .finish_tool_run(id, ToolRunFinish::completed())
+        .unwrap();
+    db.execute_batch(
+        "ALTER TABLE tool_runs DROP COLUMN arguments;
+         UPDATE schema_version SET version=4;",
+    )
+    .unwrap();
+    drop(db);
+    drop(store);
+
+    let reopened = Store::open(dir.path().join("agent.sqlite")).unwrap();
+    assert_eq!(reopened.list_tool_runs().unwrap()[0].arguments, None);
 }
 
 #[test]
@@ -197,6 +263,7 @@ fn v3_migration_backfills_pending_tool_runtime_owner_from_parent() {
     let db = Connection::open(&path).unwrap();
     db.execute_batch(
         "DROP INDEX pending_tools_by_runtime_owner;
+         ALTER TABLE tool_runs DROP COLUMN arguments;
          ALTER TABLE tool_runs DROP COLUMN runtime_owner_id;
          UPDATE schema_version SET version=3;",
     )
@@ -224,6 +291,7 @@ fn v3_migration_terminalizes_pending_tool_without_a_live_owned_parent() {
     let db = Connection::open(&path).unwrap();
     db.execute_batch(
         "DROP INDEX pending_tools_by_runtime_owner;
+         ALTER TABLE tool_runs DROP COLUMN arguments;
          ALTER TABLE tool_runs DROP COLUMN runtime_owner_id;
          UPDATE schema_version SET version=3;",
     )

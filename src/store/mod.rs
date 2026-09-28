@@ -320,13 +320,16 @@ impl Store {
                         tx.execute_batch(SCHEMA_V2)?;
                         tx.execute_batch(SCHEMA_V3)?;
                         tx.execute_batch(SCHEMA_V4)?;
+                        tx.execute_batch(SCHEMA_V5)?;
                     }
                     [2] => {
                         tx.execute_batch(SCHEMA_V3)?;
                         tx.execute_batch(SCHEMA_V4)?;
+                        tx.execute_batch(SCHEMA_V5)?;
                     }
-                    [3] => tx.execute_batch(SCHEMA_V4)?,
-                    [4] => {}
+                    [3] => { tx.execute_batch(SCHEMA_V4)?; tx.execute_batch(SCHEMA_V5)?; }
+                    [4] => tx.execute_batch(SCHEMA_V5)?,
+                    [5] => {}
                     _ => return Err(StoreError::UnsupportedSchema),
                 }
             } else {
@@ -342,6 +345,7 @@ impl Store {
                 tx.execute_batch(SCHEMA_V2)?;
                 tx.execute_batch(SCHEMA_V3)?;
                 tx.execute_batch(SCHEMA_V4)?;
+                tx.execute_batch(SCHEMA_V5)?;
             }
             Ok(())
         })?;
@@ -1024,6 +1028,11 @@ SET status=CASE WHEN read_only=1 THEN 'failed' ELSE 'uncertain' END,
 WHERE status='pending' AND runtime_owner_id IS NULL;
 CREATE INDEX pending_tools_by_runtime_owner ON tool_runs(runtime_owner_id) WHERE status='pending';
 UPDATE schema_version SET version=4;
+";
+
+const SCHEMA_V5: &str = "
+ALTER TABLE tool_runs ADD COLUMN arguments TEXT;
+UPDATE schema_version SET version=5;
 ";
 
 #[cfg(all(test, unix))]

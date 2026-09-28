@@ -285,6 +285,13 @@ fn call(id: &str, name: &str) -> ModelToolCall {
     }
 }
 
+#[test]
+fn model_tool_call_debug_redacts_arguments() {
+    let mut value = call("opaque", "read");
+    value.arguments = "{\"secret\":\"private marker\"}".into();
+    assert!(!format!("{value:?}").contains("private marker"));
+}
+
 fn tool_turn(calls: Vec<ModelToolCall>) -> ProviderReply {
     ProviderReply::Turn(AssistantTurn::ToolCalls {
         content: None,
@@ -400,8 +407,10 @@ async fn failed_and_interrupted_messages_never_replay() {
 #[tokio::test]
 async fn tool_messages_exist_only_during_current_loop() {
     let f = fixture();
+    let mut private_call = call("call-1", "read");
+    private_call.arguments = "{\"chat_id\":\"private marker\"}".into();
     let provider = FakeProvider::new([
-        tool_turn(vec![call("call-1", "read")]),
+        tool_turn(vec![private_call]),
         final_text("first answer"),
         final_text("second answer"),
     ]);
@@ -423,6 +432,10 @@ async fn tool_messages_exist_only_during_current_loop() {
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
+    assert_eq!(
+        f.store.list_tool_runs().unwrap()[0].arguments.as_deref(),
+        Some("{\"chat_id\":\"private marker\"}")
+    );
     assert_eq!(requests[1][2]["role"], "assistant");
     assert_eq!(requests[1][3]["role"], "tool");
     assert_eq!(

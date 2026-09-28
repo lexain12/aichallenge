@@ -79,11 +79,21 @@ pub struct InspectionCursor {
     scope: CursorScope,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct InspectionResult {
     pub items: Vec<Value>,
     pub next_cursor: Option<InspectionCursor>,
     pub complete: bool,
+}
+
+impl std::fmt::Debug for InspectionResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InspectionResult")
+            .field("item_count", &self.items.len())
+            .field("next_cursor", &self.next_cursor)
+            .field("complete", &self.complete)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1081,7 +1091,7 @@ fn query_audit(db: &Connection, offset: u64, limit: usize) -> Result<Vec<Value>,
     let ids = map_db(statement.query_map(params![limit, offset], |row| row.get::<_, i64>(0)))?;
     map_db(ids.collect::<rusqlite::Result<Vec<_>>>())?
         .into_iter()
-        .map(|id| load_tool_run(db, id))
+        .map(|id| load_tool_run(db, id, true))
         .collect()
 }
 
@@ -1112,7 +1122,7 @@ fn query_dump(db: &Connection, offset: u64, limit: usize) -> Result<Vec<Value>, 
             "message" => load_message(db, numeric_id.ok_or(InspectionError::Store)?),
             "job" => load_job(db, text_id.as_deref().ok_or(InspectionError::Store)?),
             "run" => load_run(db, numeric_id.ok_or(InspectionError::Store)?),
-            "tool_run" => load_tool_run(db, numeric_id.ok_or(InspectionError::Store)?),
+            "tool_run" => load_tool_run(db, numeric_id.ok_or(InspectionError::Store)?, false),
             _ => Err(InspectionError::Store),
         })
         .collect()
@@ -1216,12 +1226,12 @@ fn load_run(db: &Connection, id: i64) -> Result<Value, InspectionError> {
     ))
 }
 
-fn load_tool_run(db: &Connection, id: i64) -> Result<Value, InspectionError> {
+fn load_tool_run(db: &Connection, id: i64, for_audit: bool) -> Result<Value, InspectionError> {
     map_db(db.query_row(
-        "SELECT id,owner_kind,owner_id,call_id,server_name,tool_name,read_only,status,safe_error_code,started_at,finished_at FROM tool_runs WHERE id=?1",
+        "SELECT id,owner_kind,owner_id,call_id,server_name,tool_name,read_only,status,safe_error_code,started_at,finished_at,arguments FROM tool_runs WHERE id=?1",
         [id],
         |row| {
-            Ok(json!({
+            let mut record = json!({
                 "record_type": "tool_run",
                 "id": row.get::<_, i64>(0)?,
                 "owner": {
@@ -1236,7 +1246,16 @@ fn load_tool_run(db: &Connection, id: i64) -> Result<Value, InspectionError> {
                 "safe_error_code": row.get::<_, Option<String>>(8)?,
                 "started_at": row.get::<_, String>(9)?,
                 "finished_at": row.get::<_, Option<String>>(10)?,
-            }))
+            });
+            if for_audit {
+                record.as_object_mut().unwrap().remove("call_id");
+                let arguments: Option<String> = row.get(11)?;
+                let arguments = arguments
+                    .map(|raw| serde_json::from_str::<Value>(&raw).map_err(|_| rusqlite::Error::InvalidQuery))
+                    .transpose()?;
+                record["arguments"] = arguments.map_or(Value::Null, |value| value);
+            }
+            Ok(record)
         },
     ))
 }

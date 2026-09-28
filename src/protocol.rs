@@ -72,12 +72,22 @@ pub struct RequestEnvelope {
     pub request: ClientRequest,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerEnvelope {
     pub protocol_version: u16,
     pub request_id: RequestId,
     pub event: ServerEvent,
+}
+
+impl std::fmt::Debug for ServerEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerEnvelope")
+            .field("protocol_version", &self.protocol_version)
+            .field("request_id", &self.request_id)
+            .field("event", &self.event)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -178,7 +188,7 @@ pub struct DialogSummary {
     pub title: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerEvent {
     Hello,
@@ -240,6 +250,98 @@ pub enum ServerEvent {
     ProtocolError {
         code: ProtocolErrorCode,
     },
+}
+
+impl std::fmt::Debug for ServerEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hello => f.write_str("Hello"),
+            Self::DialogList {
+                sequence,
+                dialogs,
+                complete,
+            } => f
+                .debug_struct("DialogList")
+                .field("sequence", sequence)
+                .field("dialogs", dialogs)
+                .field("complete", complete)
+                .finish(),
+            Self::DialogOpened { dialog_id, title } => f
+                .debug_struct("DialogOpened")
+                .field("dialog_id", dialog_id)
+                .field("title", title)
+                .finish(),
+            Self::ResponseStarted { dialog_id } => f
+                .debug_struct("ResponseStarted")
+                .field("dialog_id", dialog_id)
+                .finish(),
+            Self::TextDelta { text } => f.debug_struct("TextDelta").field("text", text).finish(),
+            Self::ToolStarted { name } => {
+                f.debug_struct("ToolStarted").field("name", name).finish()
+            }
+            Self::ToolFinished { name, code } => f
+                .debug_struct("ToolFinished")
+                .field("name", name)
+                .field("code", code)
+                .finish(),
+            Self::ConfirmationRequired {
+                confirmation_id,
+                preview,
+            } => f
+                .debug_struct("ConfirmationRequired")
+                .field("confirmation_id", confirmation_id)
+                .field("preview", preview)
+                .finish(),
+            Self::ConfirmationResolved {
+                confirmation_id,
+                accepted,
+            } => f
+                .debug_struct("ConfirmationResolved")
+                .field("confirmation_id", confirmation_id)
+                .field("accepted", accepted)
+                .finish(),
+            Self::TurnPrepared { answer } => f
+                .debug_struct("TurnPrepared")
+                .field("answer", answer)
+                .finish(),
+            Self::TurnCompleted { answer } => f
+                .debug_struct("TurnCompleted")
+                .field("answer", answer)
+                .finish(),
+            Self::TurnFailed { code } => f.debug_struct("TurnFailed").field("code", code).finish(),
+            Self::InspectionResult {
+                kind,
+                sequence,
+                items,
+                complete,
+            } => f
+                .debug_struct("InspectionResult")
+                .field("kind", kind)
+                .field("sequence", sequence)
+                .field("item_count", &items.len())
+                .field("complete", complete)
+                .finish(),
+            Self::ExportChunk {
+                sequence,
+                data_base64,
+            } => f
+                .debug_struct("ExportChunk")
+                .field("sequence", sequence)
+                .field("data_base64", data_base64)
+                .finish(),
+            Self::ExportCompleted {
+                total_bytes,
+                sha256,
+            } => f
+                .debug_struct("ExportCompleted")
+                .field("total_bytes", total_bytes)
+                .field("sha256", sha256)
+                .finish(),
+            Self::ProtocolError { code } => {
+                f.debug_struct("ProtocolError").field("code", code).finish()
+            }
+        }
+    }
 }
 
 impl RequestEnvelope {

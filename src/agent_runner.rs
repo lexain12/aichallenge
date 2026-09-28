@@ -659,6 +659,7 @@ impl AgentRunner {
                         server_name: route.server_name.to_owned(),
                         tool_name: route.tool_name.to_owned(),
                         read_only,
+                        arguments: call.arguments.clone(),
                     },
                     cancellation,
                     execution_deadline,

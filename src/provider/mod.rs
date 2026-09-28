@@ -39,10 +39,19 @@ struct ProviderToolCall {
     function: ProviderFunctionCall,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 struct ProviderFunctionCall {
     name: String,
     arguments: String,
+}
+
+impl fmt::Debug for ProviderFunctionCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderFunctionCall")
+            .field("name", &self.name)
+            .field("arguments", &"[redacted]")
+            .finish()
+    }
 }
 
 impl ProviderMessage {
@@ -106,11 +115,21 @@ pub struct ModelToolDefinition {
     pub read_only: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ModelToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+}
+
+impl std::fmt::Debug for ModelToolCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelToolCall")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("arguments", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Provider-reported token usage for one request.

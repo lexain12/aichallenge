@@ -28,6 +28,25 @@ fn provider_controlled_ids_and_names_never_reach_error_formatting() {
     }
 }
 
+#[test]
+fn provider_message_and_execute_debug_redact_tool_arguments() {
+    let marker = "PLAINTEXT_TOOL_ARGUMENT_MARKER_6371";
+    let mut model_call = call("call-1");
+    model_call.arguments = format!("{{\"secret\":\"{marker}\"}}");
+    let provider_message = ProviderMessage::assistant_tool_calls(None, &[model_call.clone()]);
+    assert!(!format!("{provider_message:?}").contains(marker));
+    assert_eq!(
+        serde_json::to_value(&provider_message).unwrap()["tool_calls"][0]["function"]["arguments"],
+        model_call.arguments
+    );
+
+    let mut conversation = ToolConversation::new(base_messages(), definitions(), 8);
+    let step = conversation
+        .accept_assistant_turn(tool_turn(vec![model_call], None))
+        .unwrap();
+    assert!(!format!("{step:?}").contains(marker));
+}
+
 fn base_messages() -> Vec<ProviderMessage> {
     vec![
         ProviderMessage::system("Follow the user request."),

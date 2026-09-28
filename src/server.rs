@@ -39,6 +39,7 @@ use crate::{
             ConfirmationBroker, ConfirmationClock, ConfirmationError, ConfirmationFuture,
             ConfirmationRequest, ScheduleAction, SchedulePreview, SchedulerToolExecutor,
         },
+        time::TimeToolExecutor,
     },
 };
 
@@ -685,8 +686,12 @@ impl StdioServer {
             )
             .map_err(|_| ServerError::Protocol)?,
         );
-        let tools = CompositeToolExecutor::new(vec![self.dependencies.mcp.clone(), scheduler])
-            .map_err(|_| ServerError::ToolCatalog)?;
+        let time: Arc<dyn ToolExecutor> = Arc::new(TimeToolExecutor::new(
+            self.dependencies.settings.scheduler().timezone(),
+        ));
+        let tools =
+            CompositeToolExecutor::new(vec![self.dependencies.mcp.clone(), scheduler, time])
+                .map_err(|_| ServerError::ToolCatalog)?;
         let runner = AgentRunner::new(
             self.dependencies.provider.clone(),
             Arc::new(tools),

@@ -62,6 +62,7 @@ fn dump_export_and_history_cover_all_logical_state_in_stable_order() {
             server_name: "telegram".into(),
             tool_name: "lookup".into(),
             read_only: true,
+            arguments: "{\"chat_id\":\"private marker\"}".into(),
         })
         .unwrap();
     store
@@ -184,6 +185,7 @@ fn export_is_streamed_and_has_no_secret_or_raw_payload_fields() {
             server_name: "remote".into(),
             tool_name: "read".into(),
             read_only: true,
+            arguments: "{\"secret\":\"private marker\"}".into(),
         })
         .unwrap();
     store
@@ -193,6 +195,19 @@ fn export_is_streamed_and_has_no_secret_or_raw_payload_fields() {
         .complete_turn(turn.turn_id, "ordinary answer")
         .unwrap();
     let service = InspectionService::new(store);
+    let audit = all_items(&service, InspectQuery::Audit);
+    assert_eq!(audit.len(), 1);
+    assert_eq!(
+        audit[0]["arguments"],
+        serde_json::json!({"secret":"private marker"})
+    );
+    assert!(audit[0].get("call_id").is_none());
+    assert!(
+        !format!("{:?}", service.inspect(InspectQuery::Audit).unwrap()).contains("private marker")
+    );
+
+    let dump = all_items(&service, InspectQuery::Dump);
+    assert!(dump.iter().all(|item| item.get("arguments").is_none()));
 
     let mut writer = ShortWriteRecorder {
         bytes: Vec::new(),

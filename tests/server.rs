@@ -49,21 +49,31 @@ enum Reply {
 }
 struct FakeProvider {
     replies: Mutex<VecDeque<Reply>>,
+    tools_seen: Mutex<Vec<Vec<String>>>,
 }
 impl FakeProvider {
     fn new(replies: impl IntoIterator<Item = Reply>) -> Arc<Self> {
         Arc::new(Self {
             replies: Mutex::new(replies.into_iter().collect()),
+            tools_seen: Mutex::new(Vec::new()),
         })
+    }
+
+    fn tools_seen(&self) -> Vec<Vec<String>> {
+        self.tools_seen.lock().unwrap().clone()
     }
 }
 impl Provider for FakeProvider {
     fn stream_turn<'a>(
         &'a self,
         _messages: &'a [ProviderMessage],
-        _tools: &'a [ModelToolDefinition],
+        tools: &'a [ModelToolDefinition],
         sink: &'a mut (dyn FnMut(&str) -> io::Result<()> + Send),
     ) -> ProviderFuture<'a> {
+        self.tools_seen
+            .lock()
+            .unwrap()
+            .push(tools.iter().map(|tool| tool.name.clone()).collect());
         let reply = self
             .replies
             .lock()
@@ -333,6 +343,50 @@ async fn hello_precedes_requests() {
         session.event().await.event,
         ServerEvent::DialogList { complete: true, .. }
     ));
+}
+
+#[tokio::test]
+async fn interactive_catalog_advertises_and_dispatches_current_time() {
+    let provider = FakeProvider::new([
+        Reply::ToolCall(ModelToolCall {
+            id: "time-call".into(),
+            name: "time__get_current_time".into(),
+            arguments: "{}".into(),
+        }),
+        Reply::Final("done".into()),
+    ]);
+    let fixture = Fixture::new(provider.clone());
+    let dialog = fixture.store.create_dialog("chat").unwrap().id;
+    let store = fixture.store.clone();
+    let mut session = Session::start(fixture.server).await;
+    session.event().await;
+    session
+        .send(
+            req(),
+            ClientRequest::SendMessage {
+                dialog_id: dialog,
+                message: "What time is it?".into(),
+            },
+        )
+        .await;
+    loop {
+        match session.event().await.event {
+            ServerEvent::TurnCompleted { .. } => break,
+            ServerEvent::TurnFailed { .. } => panic!("time tool failed to dispatch"),
+            _ => {}
+        }
+    }
+    let catalogs = provider.tools_seen();
+    assert!(catalogs[0].contains(&"time__get_current_time".to_owned()));
+    assert!(catalogs[0].contains(&"cron__create".to_owned()));
+    let runs = store.list_tool_runs().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        (runs[0].server_name.as_str(), runs[0].tool_name.as_str()),
+        ("time", "get_current_time")
+    );
+    assert!(runs[0].read_only);
+    assert_eq!(runs[0].status, ToolRunStatus::Completed);
 }
 
 #[tokio::test]
@@ -1005,6 +1059,7 @@ fn restart_recovers_pending_turn_and_tools() {
             server_name: "mcp".into(),
             tool_name: "get".into(),
             read_only: true,
+            arguments: "{}".into(),
         })
         .unwrap();
     let lease = ProcessLease::acquire(&fixture.store).unwrap();

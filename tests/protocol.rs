@@ -26,6 +26,36 @@ fn job_id() -> JobId {
 }
 
 #[test]
+fn inspection_event_and_envelope_debug_hide_fragment_payloads() {
+    let marker = "PLAINTEXT_AUDIT_ARGUMENT_MARKER_6371";
+    let encoded = base64::engine::general_purpose::STANDARD.encode(marker);
+    let event = ServerEvent::InspectionResult {
+        kind: InspectKind::Audit,
+        sequence: 7,
+        items: vec![
+            json!({"record_fragment":{"data":encoded,"complete":true},"unsafe_preview":marker}),
+        ],
+        complete: false,
+    };
+    let envelope = ServerEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: request_id(),
+        event: event.clone(),
+    };
+    for rendered in [format!("{event:?}"), format!("{envelope:?}")] {
+        assert!(rendered.contains("Audit"));
+        assert!(rendered.contains("sequence: 7"));
+        assert!(rendered.contains("item_count: 1"));
+        assert!(!rendered.contains(marker));
+        assert!(!rendered.contains(&encoded));
+    }
+    assert_eq!(
+        serde_json::from_slice::<ServerEnvelope>(&serde_json::to_vec(&envelope).unwrap()).unwrap(),
+        envelope
+    );
+}
+
+#[test]
 fn round_trips_every_request_and_event() {
     let requests = [
         ClientRequest::ListDialogs,

@@ -209,6 +209,7 @@ The logical schema contains:
 - safe_error_code;
 - started_at;
 - finished_at.
+- arguments, a validated JSON object for new tool calls (null for migrated rows).
 
 ### messages
 
@@ -263,8 +264,9 @@ Foreign keys, ownership checks, uniqueness constraints, and transactions
 prevent cross-dialog linkage, duplicate call IDs within an owner, and partial
 commits.
 
-Tool arguments, raw MCP errors, provider error bodies, secrets, and
-credentials are never stored in tool_runs.
+Tool arguments are retained in tool_runs for `/audit` inspection. Raw MCP
+errors, provider error bodies, and tool results are not stored there. `/dump`
+and the logical export omit arguments.
 
 ## Inspection and export
 
@@ -429,7 +431,7 @@ Reuse and adapt:
   error conversion from mcp.rs;
 - Telegram MCP and its tests;
 - useful terminal block rendering that does not pull in old commands;
-- the principle of metadata-only tool audit.
+- the tool audit lifecycle and safe error codes.
 
 Replace with small Day 18 modules:
 
@@ -480,7 +482,7 @@ All default tests are deterministic and isolated.
 - cron-sync idempotency and managed-block isolation;
 - run claiming, overlap skipping, once_at at-most-once behavior, timeout, and
   missed execution;
-- safe audit rows without arguments or payloads;
+- audit rows with bounded JSON object arguments and without result payloads;
 - crash recovery of pending turns, runs, and tool calls.
 
 ### Integration tests

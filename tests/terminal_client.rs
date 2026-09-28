@@ -474,11 +474,52 @@ async fn confirmation_and_fragmented_inspection_use_originating_request() {
         ))
         .await
         .unwrap();
+    user.write_all(b"/audit\n").await.unwrap();
+    let audit = requests.read_request().await.unwrap().unwrap();
+    assert!(matches!(
+        audit.request,
+        ClientRequest::Inspect {
+            kind: InspectKind::Audit
+        }
+    ));
+    let mut audit_sequence = 0_u64;
+    for (index, record) in [
+        serde_json::json!({"record_type":"tool_run","id":23,"owner":{"kind":"interactive_turn","id":15},"server_name":"telegram","tool_name":"read_chat","read_only":true,"status":"completed","started_at":"2026-09-28T10:00:00Z","finished_at":"2026-09-28T10:00:01Z","safe_error_code":null,"arguments":{"chat_id":"private marker"}}),
+        serde_json::json!({"record_type":"tool_run","id":24,"owner":{"kind":"cron_run","id":9},"server_name":"telegram","tool_name":"list_chats","read_only":true,"status":"failed","started_at":"2026-09-28T10:01:00Z","finished_at":null,"safe_error_code":"tool_error","arguments":null}),
+    ].into_iter().enumerate() {
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let chunks: Vec<_> = if index == 0 { bytes.chunks(17).collect() } else { vec![bytes.as_slice()] };
+        for (fragment_sequence, chunk) in chunks.iter().enumerate() {
+            let fragment = serde_json::json!({"record_fragment": {"record_sequence": index, "fragment_sequence": fragment_sequence, "complete": fragment_sequence + 1 == chunks.len(), "encoding": "base64", "data": base64::engine::general_purpose::STANDARD.encode(chunk)}});
+            events.write_event(&envelope(audit.request_id, ServerEvent::InspectionResult { kind: InspectKind::Audit, sequence: audit_sequence, items: vec![fragment], complete: false })).await.unwrap();
+            audit_sequence += 1;
+        }
+    }
+    events
+        .write_event(&envelope(
+            audit.request_id,
+            ServerEvent::InspectionResult {
+                kind: InspectKind::Audit,
+                sequence: audit_sequence,
+                items: vec![],
+                complete: true,
+            },
+        ))
+        .await
+        .unwrap();
     user.write_all(b"/exit\n").await.unwrap();
     user.shutdown().await.unwrap();
     drop(events);
     assert_eq!(client.await.unwrap(), Ok(()));
     assert!(output_view.text().contains("\"record_type\":\"dialog\""));
+    let rendered = output_view.text();
+    assert!(rendered.contains("Tool #23: telegram.read_chat\nСтатус: completed\nРежим: read-only\nИсточник: interactive turn 15"));
+    assert!(rendered.contains("Аргументы:\n{\n  \"chat_id\": \"private marker\"\n}"));
+    assert!(rendered.contains("\n----\nTool #24: telegram.list_chats"));
+    assert_eq!(rendered.matches("Tool #23: telegram.read_chat").count(), 1);
+    assert_eq!(rendered.matches("\n----\n").count(), 1);
+    assert!(rendered.contains("Аргументы:\nне сохранены"));
+    assert!(!rendered.contains("call_id"));
     assert!(output_view.text().contains("[y/N]"));
 }
 

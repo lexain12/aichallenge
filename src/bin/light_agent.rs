@@ -17,8 +17,8 @@ use deepseek_cli::scheduler::{
 use deepseek_cli::server::{ServerDependencies, StdioServer};
 use deepseek_cli::settings::ServerSettings;
 use deepseek_cli::store::Store;
-use deepseek_cli::tools::ToolExecutor;
 use deepseek_cli::tools::mcp::McpRegistry;
+use deepseek_cli::tools::{ToolExecutor, cron_runtime_catalog};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
@@ -64,6 +64,7 @@ enum AppError {
     Store,
     Provider,
     Mcp,
+    ToolCatalog,
     Scheduler,
     Protocol,
     Inspection,
@@ -77,6 +78,7 @@ impl AppError {
             Self::Store => "store_error",
             Self::Provider => "provider_error",
             Self::Mcp => "mcp_error",
+            Self::ToolCatalog => "tool_catalog_error",
             Self::Scheduler => "scheduler_error",
             Self::Protocol => "protocol_error",
             Self::Inspection => "inspection_error",
@@ -354,12 +356,16 @@ async fn run_job(
     let lease = acquire_process_lease_until(&store, deadline, &cancellation).await?;
     let store = attach_runtime_owner_until(store, lease.clone(), deadline, &cancellation).await?;
     let (provider, mcp) = runtime_catalog_until(&settings, deadline, &cancellation).await?;
+    let tools: Arc<dyn ToolExecutor> = Arc::new(
+        cron_runtime_catalog(mcp, settings.scheduler().timezone())
+            .map_err(|_| AppError::ToolCatalog)?,
+    );
     let synchronizer = synchronizer(&settings, store.clone())?;
     let reconciler: Arc<dyn CronRunReconciler> = synchronizer;
     let service = CronAgentService::new(
         store,
         provider,
-        mcp,
+        tools,
         settings.cron_system_prompt(),
         settings.mcp().max_tool_rounds() as usize,
         settings.max_provider_request_bytes(),
@@ -432,4 +438,14 @@ fn db_shell(path: &Path) -> Result<(), AppError> {
     ReadonlyDbShell::new(path)
         .run(BufReader::new(stdin.lock()), stdout.lock())
         .map_err(|_| AppError::Inspection)
+}
+
+#[cfg(test)]
+mod catalog_error_tests {
+    use super::AppError;
+
+    #[test]
+    fn catalog_failure_has_its_own_safe_code() {
+        assert_eq!(AppError::ToolCatalog.code(), "tool_catalog_error");
+    }
 }

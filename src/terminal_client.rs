@@ -820,8 +820,19 @@ where
         ) => {
             let records = assembler.push(kind, sequence, items, complete)?;
             for record in records {
-                let mut line = serde_json::to_vec(&record).map_err(|_| ClientError::Protocol)?;
-                line.push(b'\n');
+                let line = if assembler.kind == InspectKind::Audit {
+                    let separator = if assembler.record_sequence > 1 {
+                        "----\n"
+                    } else {
+                        ""
+                    };
+                    format!("{separator}{}", render_audit_record(&record)?).into_bytes()
+                } else {
+                    let mut line =
+                        serde_json::to_vec(&record).map_err(|_| ClientError::Protocol)?;
+                    line.push(b'\n');
+                    line
+                };
                 output
                     .write_all(&line)
                     .await
@@ -886,6 +897,59 @@ where
         state.pending.remove(&request_id);
     }
     Ok(())
+}
+
+fn render_audit_record(record: &Value) -> Result<String, ClientError> {
+    let string = |key| {
+        record
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or(ClientError::Protocol)
+    };
+    let id = record
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or(ClientError::Protocol)?;
+    let owner = record.get("owner").ok_or(ClientError::Protocol)?;
+    let owner_kind = owner
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or(ClientError::Protocol)?;
+    let owner_id = owner
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or(ClientError::Protocol)?;
+    let source = match owner_kind {
+        "interactive_turn" => format!("interactive turn {owner_id}"),
+        "cron_run" => format!("cron run {owner_id}"),
+        _ => return Err(ClientError::Protocol),
+    };
+    let mode = if record
+        .get("read_only")
+        .and_then(Value::as_bool)
+        .ok_or(ClientError::Protocol)?
+    {
+        "read-only"
+    } else {
+        "write"
+    };
+    let optional = |key| record.get(key).and_then(Value::as_str).unwrap_or("—");
+    let arguments = match record.get("arguments") {
+        None | Some(Value::Null) => "не сохранены".to_owned(),
+        Some(value @ Value::Object(_)) => {
+            serde_json::to_string_pretty(value).map_err(|_| ClientError::Protocol)?
+        }
+        _ => return Err(ClientError::Protocol),
+    };
+    Ok(format!(
+        "Tool #{id}: {}.{}\nСтатус: {}\nРежим: {mode}\nИсточник: {source}\nНачало: {}\nЗавершение: {}\nОшибка: {}\nАргументы:\n{arguments}\n",
+        string("server_name")?,
+        string("tool_name")?,
+        string("status")?,
+        string("started_at")?,
+        optional("finished_at"),
+        optional("safe_error_code"),
+    ))
 }
 
 async fn render_next_confirmation<O: AsyncWrite + Unpin>(

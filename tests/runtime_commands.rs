@@ -582,6 +582,7 @@ fn one_live_runtime_owner_cannot_mutate_another_owners_active_work() {
             server_name: "fixture".into(),
             tool_name: "read".into(),
             read_only: true,
+            arguments: "{}".into(),
         }),
         Err(StoreError::InvalidOwner)
     );
@@ -592,6 +593,7 @@ fn one_live_runtime_owner_cannot_mutate_another_owners_active_work() {
             server_name: "fixture".into(),
             tool_name: "read".into(),
             read_only: true,
+            arguments: "{}".into(),
         })
         .unwrap();
     assert_eq!(
@@ -811,6 +813,7 @@ fn exclusive_startup_recovers_cron_run_and_tools_after_simulated_sigkill() {
                 server_name: "fixture".into(),
                 tool_name: call_id.into(),
                 read_only,
+                arguments: "{}".into(),
             })
             .unwrap();
     }

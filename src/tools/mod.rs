@@ -2,11 +2,13 @@
 pub mod conversation;
 pub mod mcp;
 pub mod scheduler;
+pub mod time;
 pub use conversation::{
     ConversationStep, DEFAULT_MAX_TOOL_ROUNDS, ToolConversation, ToolLoopError, ToolResultMessage,
 };
 
 use crate::provider::{ModelToolCall, ModelToolDefinition};
+use chrono_tz::Tz;
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use thiserror::Error;
 
@@ -109,6 +111,15 @@ impl CompositeToolExecutor {
             routes,
         })
     }
+}
+
+/// Catalog for scheduled runs: MCP plus the read-only time tool.
+pub fn cron_runtime_catalog(
+    mcp: Arc<dyn ToolExecutor>,
+    timezone: Tz,
+) -> Result<CompositeToolExecutor, ToolCatalogError> {
+    let time: Arc<dyn ToolExecutor> = Arc::new(time::TimeToolExecutor::new(timezone));
+    CompositeToolExecutor::new(vec![mcp, time])
 }
 
 impl ToolExecutor for CompositeToolExecutor {

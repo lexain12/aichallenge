@@ -26,6 +26,7 @@ fn v1_database_migrates_jobs_and_runs_without_losing_dialogs() {
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch(
         "DROP INDEX pending_tools_by_runtime_owner;
+         ALTER TABLE tool_runs DROP COLUMN arguments;
          ALTER TABLE tool_runs DROP COLUMN runtime_owner_id;
          DROP INDEX pending_turns_by_runtime_owner;
          ALTER TABLE turns DROP COLUMN runtime_owner_id;
@@ -46,7 +47,7 @@ fn v1_database_migrates_jobs_and_runs_without_losing_dialogs() {
             .query_row("SELECT version FROM schema_version", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     migrated.create_job(recurring(dialog)).unwrap();
 }
@@ -280,6 +281,7 @@ fn cron_tool_owner_requires_existing_run() {
         server_name: "telegram".into(),
         tool_name: "get_messages".into(),
         read_only: true,
+        arguments: "{}".into(),
     };
     store
         .start_tool_run(start(ToolOwner::CronRun(claim.run.id)))
@@ -331,6 +333,7 @@ fn cron_run_cannot_finish_while_its_tool_audit_is_pending() {
             server_name: "fixture".into(),
             tool_name: "read".into(),
             read_only: true,
+            arguments: "{}".into(),
         })
         .unwrap();
 
