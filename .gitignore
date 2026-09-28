@@ -19,3 +19,6 @@
 *.sqlite3-shm
 *.light-agent-export-*.part
 *.light-agent-crontab-*.part
+
+# Local operational state for the deployed Day 18 VM.
+/REMOTE_SERVER.local.md
